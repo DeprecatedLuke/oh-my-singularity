@@ -1,0 +1,43 @@
+# dependencies (bun install)
+node_modules
+
+# local bun install/cache dirs (used when BUN_INSTALL/BUN_TMPDIR are set)
+.bun-install
+.bun-tmp
+
+# output
+out
+dist
+*.tgz
+# patch/merge artifacts
+*.orig
+*.rej
+*.bak
+*.swp
+
+# code coverage
+coverage
+*.lcov
+
+# logs
+logs
+_.log
+report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
+
+# dotenv environment variable files
+.env
+.env.development.local
+.env.test.local
+.env.production.local
+.env.local
+
+# caches
+.eslintcache
+.cache
+*.tsbuildinfo
+
+# IntelliJ based IDEs
+.idea
+
+# Finder (MacOS) folder config
+.DS_Store

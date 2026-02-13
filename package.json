@@ -1,0 +1,36 @@
+{
+  "name": "oh-my-singularity",
+  "version": "0.0.3",
+  "module": "src/index.ts",
+  "type": "module",
+  "license": "GPL-3.0",
+  "bin": {
+    "oms": "src/index.ts"
+  },
+  "scripts": {
+    "start": "bun src/index.ts",
+    "dev": "bun --hot src/index.ts",
+    "build": "tsc -p tsconfig.json --noEmit",
+    "test": "bun test",
+    "perf:smoke": "bun test src/perf/perf-smoke.test.ts",
+    "check": "biome check src/ && bun run build",
+    "lint": "biome lint src/",
+    "fmt": "biome format --write src/",
+    "fix": "biome check --fix --unsafe src/"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.3.14",
+    "@types/bun": "latest",
+    "@types/node": "^22",
+    "knip": "^5.83.1",
+    "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "@xterm/headless": "^6.0.0",
+    "bun-pty": "^0.4.8",
+    "marked": "^17.0.2",
+    "terminal-kit": "^3.1.2",
+    "winston": "^3.18.1",
+    "winston-daily-rotate-file": "^5.0.0"
+  }
+}
