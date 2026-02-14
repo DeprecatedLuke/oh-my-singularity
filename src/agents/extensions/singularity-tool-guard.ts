@@ -1,39 +1,8 @@
 /**
- * Guard singularity tool access.
- *
- * Singularity is a requirements analyst / coordinator.
- * It may read/explore code for context and make trivial direct edits or write small files,
- * but must not implement multi-file features.
+ * Guard singularity tool access in non-interactive pipe mode.
  */
 
 import type { ExtensionAPI } from "./types";
-
-const ALLOWED = new Set([
-	"tasks",
-	"start_tasks",
-
-	"broadcast_to_workers",
-	"interrupt_agent",
-	"steer_agent",
-	"replace_agent",
-	"delete_task_issue",
-	"ask",
-	"exit_plan_mode",
-	// Codebase exploration + trivial direct edits.
-	"read",
-	"edit",
-	"write",
-	"grep",
-	"find",
-	"lsp",
-	// Analysis, research, coordination.
-	"bash",
-	"python",
-	"calc",
-	"fetch",
-	"web_search",
-	"task",
-]);
 
 const PIPE_MODE_BLOCKED = new Set(["ask"]);
 
@@ -48,13 +17,5 @@ export default async function singularityToolGuardExtension(api: ExtensionAPI): 
 				reason: `Tool '${toolName}' is disabled for singularity in pipe mode. Run in interactive mode for clarifications.`,
 			};
 		}
-		if (ALLOWED.has(toolName)) return;
-
-		return {
-			block: true,
-			reason:
-				`Tool '${toolName}' is disabled for singularity. ` +
-				"Create a tasks issue and let issuers/workers handle implementation.",
-		};
 	});
 }
