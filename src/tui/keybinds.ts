@@ -11,6 +11,7 @@ export type KeybindContext<TState> = {
 		toggleDoneAgents?: () => void;
 		toggleMouseCapture?: () => void;
 		toggleProfiling?: () => void;
+		toggleOmsMessages?: () => void;
 		toggleSettings?: () => void;
 	};
 };
@@ -47,6 +48,7 @@ export type OmsTuiUiState = {
 	loopPaused: boolean;
 	mouseCaptureEnabled: boolean;
 	profilingActive: boolean;
+	omsMessagesVisible: boolean;
 };
 
 export function registerOmsTuiKeybinds(dispatcher: KeybindDispatcher<OmsTuiUiState>): void {
@@ -100,6 +102,10 @@ export function registerOmsTuiKeybinds(dispatcher: KeybindDispatcher<OmsTuiUiSta
 	// Render profiling toggle
 	dispatcher.bind(["SHIFT_ALT_P", "ALT_SHIFT_P"], ctx => {
 		ctx.actions?.toggleProfiling?.();
+	});
+
+	dispatcher.bind(["SHIFT_ALT_L", "ALT_SHIFT_L"], ctx => {
+		ctx.actions?.toggleOmsMessages?.();
 	});
 
 	// Settings overlay toggle

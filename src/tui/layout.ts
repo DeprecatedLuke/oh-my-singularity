@@ -23,6 +23,8 @@ export type ComputeLayoutOptions = {
 
 	/** Height ratio (0..1) of the singularity area reserved for the OMS/system pane. Default: 0.30 */
 	systemHeightRatio?: number;
+	/** Height ratio (0..1) for the Selected Task pane (top-right). Default: 0.5 */
+	selectedHeightRatio?: number;
 
 	/** Minimum height of Tasks pane (rows). Default: 5 */
 	minTasksHeight?: number;
@@ -79,6 +81,9 @@ export function computeLayout(
 	}
 
 	const bottomHeight = Math.max(0, contentRows - tasksHeight);
+	const selectedRatioRaw = typeof opts.selectedHeightRatio === "number" ? opts.selectedHeightRatio : 0.5;
+	const selectedRatio = Math.max(0, Math.min(1, selectedRatioRaw));
+	const selectedHeight = clampInt(Math.round(contentRows * selectedRatio), 0, contentRows);
 
 	const minAgentsWidth = clampInt(opts.minAgentsWidth ?? 20, 0, columns);
 	const minCenterWidth = clampInt(opts.minCenterWidth ?? 30, 1, columns);
@@ -95,7 +100,7 @@ export function computeLayout(
 		x: centerWidth + 1,
 		y: 1,
 		width: agentsWidth,
-		height: tasksHeight,
+		height: selectedHeight,
 	};
 	// Split the bottom-left area into singularity (top) and system (bottom).
 	const systemRatioRaw = typeof opts.systemHeightRatio === "number" ? opts.systemHeightRatio : 0.3;
@@ -116,9 +121,9 @@ export function computeLayout(
 	};
 	const agents: Region = {
 		x: centerWidth + 1,
-		y: tasksHeight + 1,
+		y: selectedHeight + 1,
 		width: agentsWidth,
-		height: bottomHeight,
+		height: Math.max(0, contentRows - selectedHeight),
 	};
 	const statusBar: Region = {
 		x: 1,

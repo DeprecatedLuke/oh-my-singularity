@@ -411,6 +411,7 @@ export async function runTuiMode(opts: {
 		toggleDoneAgents: () => tasksPane.toggleShowDoneAgents(),
 		toggleMouseCapture: () => app.toggleMouseCapture(),
 		toggleProfiling: () => app.toggleProfiling(),
+		toggleOmsMessages: () => app.toggleOmsMessages(),
 		toggleSettings: () => app.toggleSettings(),
 	});
 
