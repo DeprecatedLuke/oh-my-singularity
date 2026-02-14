@@ -224,6 +224,46 @@ describe("AgentLoop delegation", () => {
 		const activeAgentIds = registry.getActiveByTask("task-1").map(agent => agent.id);
 		expect(activeAgentIds).toEqual([replacementWorkerId]);
 	});
+
+	test("spawnAgentBySingularity does not launch issuer while paused", async () => {
+		const { loop } = createLoopFixture();
+		(loop as unknown as { running: boolean; paused: boolean }).running = true;
+		(loop as unknown as { running: boolean; paused: boolean }).paused = true;
+		let showCalls = 0;
+		let runIssuerCalls = 0;
+
+		(
+			loop as unknown as {
+				tasksClient: {
+					show: (taskId: string) => Promise<{ id: string; title: string; status: string; issue_type: string }>;
+				};
+			}
+		).tasksClient.show = async (taskId: string) => {
+			showCalls += 1;
+			return {
+				id: taskId,
+				title: "Task 1",
+				status: "open",
+				issue_type: "task",
+			};
+		};
+
+		(
+			loop as unknown as {
+				pipelineManager: {
+					runIssuerForTask: (_task: unknown, _opts?: { kickoffMessage?: string }) => Promise<unknown>;
+				};
+			}
+		).pipelineManager.runIssuerForTask = async () => {
+			runIssuerCalls += 1;
+			return { start: false, reason: "paused test" };
+		};
+
+		await loop.spawnAgentBySingularity({ role: "issuer", taskId: "task-1" });
+
+		expect(showCalls).toBe(0);
+		expect(runIssuerCalls).toBe(0);
+	});
 	test("handleFinisherCloseTask validates task id, closes task, and aborts active finisher rpc", async () => {
 		const { loop, registry, calls } = createLoopFixture();
 		const abortCalls: string[] = [];
@@ -252,6 +292,65 @@ describe("AgentLoop delegation", () => {
 		expect(result.abortedFinisherCount).toBe(1);
 		expect(calls.close).toEqual([{ taskId: "task-1", reason: "all done" }]);
 		expect(abortCalls).toEqual(["finisher:task-1"]);
+	});
+
+	test("handleFinisherCloseTask closes task but skips dependent auto-spawn while paused", async () => {
+		const { loop, registry, calls } = createLoopFixture();
+		(loop as unknown as { paused: boolean }).paused = true;
+		const spawned: string[] = [];
+		const findCalls: string[] = [];
+		const abortCalls: string[] = [];
+
+		registry.register({
+			id: "finisher:task-a",
+			role: "finisher",
+			taskId: "task-a",
+			tasksAgentId: "agent-finisher-task-a",
+			status: "running",
+			usage: createEmptyAgentUsage(),
+			events: [],
+			spawnedAt: 1,
+			lastActivity: 2,
+			rpc: makeRpc({ abort: async () => abortCalls.push("finisher:task-a") }),
+		});
+
+		(
+			loop as unknown as {
+				scheduler: {
+					findTasksUnblockedBy: (taskId: string) => Promise<unknown[]>;
+					getInProgressTasksWithoutAgent: () => Promise<unknown[]>;
+					getNextTasks: () => Promise<unknown[]>;
+				};
+			}
+		).scheduler = {
+			findTasksUnblockedBy: async (taskId: string) => {
+				findCalls.push(taskId);
+				return [{ id: "task-b", issue_type: "task", depends_on_ids: ["task-a"] }];
+			},
+			getInProgressTasksWithoutAgent: async () => [],
+			getNextTasks: async () => [],
+		} as never;
+
+		(
+			loop as unknown as {
+				pipelineManager: {
+					availableWorkerSlots: () => number;
+					isPipelineInFlight: (_taskId: string) => boolean;
+					kickoffNewTaskPipeline: (task: { id: string }) => void;
+				};
+			}
+		).pipelineManager = {
+			availableWorkerSlots: () => 2,
+			isPipelineInFlight: () => false,
+			kickoffNewTaskPipeline: (task: { id: string }) => spawned.push(task.id),
+		} as never;
+
+		await loop.handleFinisherCloseTask({ taskId: "task-a", reason: "done" });
+
+		expect(calls.close).toEqual([{ taskId: "task-a", reason: "done" }]);
+		expect(findCalls).toEqual([]);
+		expect(spawned).toEqual([]);
+		expect(abortCalls).toEqual(["finisher:task-a"]);
 	});
 
 	test("handleFinisherCloseTask auto-spawns dependents when dependencies are resolved", async () => {

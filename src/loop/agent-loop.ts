@@ -352,7 +352,7 @@ export class AgentLoop {
 			});
 		}
 
-		if (taskClosed) {
+		if (taskClosed && !this.paused) {
 			try {
 				const unblockedDependents = await this.scheduler.findTasksUnblockedBy(taskId);
 				let autoSpawnedCount = 0;
@@ -526,6 +526,7 @@ export class AgentLoop {
 		context?: string;
 	}): Promise<void> {
 		if (!this.running) return;
+		if (this.paused) return;
 		const { role, taskId, context } = opts;
 		const ctx = context?.trim() || "";
 		const key = `${role}:${taskId}`;
