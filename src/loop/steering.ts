@@ -280,6 +280,7 @@ export class SteeringManager {
 	private readonly lastSteeringAtByWorker = new Map<string, number>();
 	private readonly finisherSpawningTasks = new Set<string>();
 	private broadcastInFlight: Promise<void> | null = null;
+	private readonly pendingInterruptKickoffByTask = new Map<string, string[]>();
 	private readonly registry: AgentRegistry;
 	private readonly spawner: AgentSpawner;
 	private readonly config: OmsConfig;
@@ -331,6 +332,21 @@ export class SteeringManager {
 		this.lastSteeringAtByWorker.delete(agentId);
 	}
 
+	hasPendingInterruptKickoff(taskId: string): boolean {
+		const normalizedTaskId = taskId.trim();
+		if (!normalizedTaskId) return false;
+		return (this.pendingInterruptKickoffByTask.get(normalizedTaskId)?.length ?? 0) > 0;
+	}
+
+	takePendingInterruptKickoff(taskId: string): string | null {
+		const normalizedTaskId = taskId.trim();
+		if (!normalizedTaskId) return null;
+		const pending = this.pendingInterruptKickoffByTask.get(normalizedTaskId);
+		if (!pending || pending.length === 0) return null;
+		this.pendingInterruptKickoffByTask.delete(normalizedTaskId);
+		return pending.join("\n\n");
+	}
+
 	async stopSteeringForFinisher(taskId: string): Promise<void> {
 		const activeForTask = this.registry.getActiveByTask(taskId);
 		const taskAgents = this.registry.getByTask(taskId);
@@ -377,7 +393,7 @@ export class SteeringManager {
 		if (!normalizedTaskId) return false;
 		const trimmed = message.trim();
 		if (!trimmed) return false;
-		const steerSummary = normalizeSummary(trimmed);
+		const steerSummary = `${normalizeSummary(trimmed)}\n`;
 		const targets = this.registry
 			.getActive()
 			.filter(agent => agent.taskId === normalizedTaskId && agent.role !== "finisher");
@@ -420,35 +436,79 @@ export class SteeringManager {
 		return true;
 	}
 
+	private queuePendingInterruptKickoff(taskId: string, kickoffMessage: string): void {
+		const existing = this.pendingInterruptKickoffByTask.get(taskId) ?? [];
+		existing.push(kickoffMessage);
+		this.pendingInterruptKickoffByTask.set(taskId, existing);
+	}
+
+	private async stopAgentGracefully(agent: AgentInfo, taskId: string): Promise<void> {
+		const current = this.registry.get(agent.id);
+		if (current) current.status = "stopped";
+		const rpc = agent.rpc;
+		if (rpc && rpc instanceof OmsRpcClient) {
+			let isStreaming = false;
+			try {
+				const state = await rpc.getState();
+				const stateRec = asRecord(state);
+				isStreaming = stateRec?.isStreaming === true;
+			} catch (err) {
+				logger.debug("loop/steering.ts: best-effort failure after await rpc.getState();", { err });
+			}
+
+			try {
+				await rpc.abort();
+			} catch (err) {
+				this.loopLog(`Interrupt: failed to abort ${agent.id}`, "warn", {
+					taskId,
+					agentId: agent.id,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
+
+			if (isStreaming) {
+				const pollIntervalMs = 500;
+				const timeoutMs = 10_000;
+				const startedAt = Date.now();
+
+				while (Date.now() - startedAt < timeoutMs) {
+					try {
+						const state = await rpc.getState();
+						const stateRec = asRecord(state);
+						if (stateRec?.isStreaming !== true) break;
+					} catch {
+						// Ignore state-check failures while waiting for graceful stop.
+					}
+
+					await Bun.sleep(pollIntervalMs);
+				}
+			}
+		}
+		await this.finishAgent(agent, "stopped");
+		this.onAgentStopped(agent.id);
+	}
 	async interruptAgent(taskId: string, message: string): Promise<boolean> {
 		const normalizedTaskId = taskId.trim();
 		if (!normalizedTaskId) return false;
 		const trimmed = message.trim();
-		const interruptSummary = normalizeSummary(trimmed);
-		const interruptMessage = trimmed ? `[URGENT INTERRUPT]\n\n${trimmed}` : "[URGENT INTERRUPT]";
-		const targets = this.registry
-			.getActive()
-			.filter(agent => agent.taskId === normalizedTaskId && agent.role !== "finisher");
+		const interruptMessage = trimmed ? `[URGENT MESSAGE]\n\n${trimmed}` : "[URGENT MESSAGE]";
+		const interruptSummary = `${normalizeSummary(trimmed || interruptMessage)}\n`;
+		const targets = this.registry.getActive().filter(agent => agent.taskId === normalizedTaskId);
 		if (targets.length === 0) {
-			this.loopLog(`Interrupt: no active agents for task ${normalizedTaskId}`, "warn", {
-				taskId: normalizedTaskId,
-			});
-			return false;
+			this.queuePendingInterruptKickoff(normalizedTaskId, interruptMessage);
+			this.loopLog(
+				`Interrupt: queued restart kickoff for task ${normalizedTaskId} (no active agents to stop)`,
+				"warn",
+				{
+					taskId: normalizedTaskId,
+					interruptSummary,
+				},
+			);
+			this.onDirty?.();
+			return true;
 		}
-
 		await Promise.all(
 			targets.map(async agent => {
-				const rpc = agent.rpc;
-				if (rpc && rpc instanceof OmsRpcClient) {
-					try {
-						await rpc.steer(interruptMessage);
-					} catch {
-						this.loopLog(`Interrupt: failed to deliver message to ${agent.id}`, "warn", {
-							taskId: normalizedTaskId,
-							agentId: agent.id,
-						});
-					}
-				}
 				this.registry.pushEvent(agent.id, {
 					type: "log",
 					ts: Date.now(),
@@ -456,17 +516,32 @@ export class SteeringManager {
 					message: interruptSummary
 						? `Interrupt from singularity: ${interruptSummary}`
 						: "Interrupt from singularity",
-					data: { taskId: normalizedTaskId, message: trimmed, force: true },
+					data: { taskId: normalizedTaskId, message: trimmed, graceful: true },
 				});
+				const rpc = agent.rpc;
+				if (rpc && rpc instanceof OmsRpcClient) {
+					try {
+						rpc.suppressNextAgentEnd();
+						await rpc.abortAndPrompt(interruptMessage);
+					} catch (err) {
+						this.loopLog(`Interrupt: abortAndPrompt failed for ${agent.id}, cleaning up`, "warn", {
+							taskId: normalizedTaskId,
+							agentId: agent.id,
+							error: err instanceof Error ? err.message : String(err),
+						});
+						await this.finishAgent(agent, "stopped");
+						this.onAgentStopped(agent.id);
+						this.queuePendingInterruptKickoff(normalizedTaskId, interruptMessage);
+					}
+				} else {
+					await this.stopAgentGracefully(agent, normalizedTaskId);
+					this.queuePendingInterruptKickoff(normalizedTaskId, interruptMessage);
+				}
 			}),
 		);
-
-		const targetIds = new Set(targets.map(agent => agent.id));
-		await this.stopAgentsMatching(agent => targetIds.has(agent.id));
-
-		this.loopLog(`Interrupt: force-stopped agents for task ${normalizedTaskId}`, "warn", {
+		this.loopLog(`Interrupt: abort+prompt delivered for task ${normalizedTaskId}`, "warn", {
 			taskId: normalizedTaskId,
-			agentIds: [...targetIds],
+			agentIds: targets.map(agent => agent.id),
 			interruptSummary,
 		});
 		this.onDirty?.();
@@ -817,13 +892,11 @@ export class SteeringManager {
 			if (typeof rawAction !== "string") return null;
 			const action = rawAction.trim().toLowerCase();
 			if (action === "start" || action === "skip" || action === "defer") return action;
-
 			// Backward-compatibility for any remaining steering-style output:
 			if (action === "steer") return "start";
 			if (action === "interrupt") return "defer";
 			return null;
 		};
-
 		let issuer: AgentInfo;
 		try {
 			issuer = await this.spawner.spawnIssuer(
@@ -860,7 +933,6 @@ export class SteeringManager {
 		} catch {
 			text = null;
 		}
-
 		await this.finishAgent(issuer, "done");
 		await this.logAgentFinished(issuer, text ?? "");
 		if (!text) return { action: "defer", message: null, reason: "resume issuer produced no output" };

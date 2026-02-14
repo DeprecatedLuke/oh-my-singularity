@@ -101,7 +101,6 @@ export class RpcHandlerManager {
 		this.logAgentFinished = opts.logAgentFinished;
 		this.writeAgentCrashLog = opts.writeAgentCrashLog;
 	}
-
 	private debounceRpcDirty(): void {
 		if (!this.onDirty) return;
 

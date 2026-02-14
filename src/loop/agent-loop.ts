@@ -82,7 +82,6 @@ export class AgentLoop {
 		const finishAgent = this.rpcHandlerManager.finishAgent.bind(this.rpcHandlerManager);
 		const logAgentStart = this.lifecycleHelpers.logAgentStart.bind(this.lifecycleHelpers);
 		const logAgentFinished = this.lifecycleHelpers.logAgentFinished.bind(this.lifecycleHelpers);
-
 		this.steeringManager = new SteeringManager({
 			registry: this.registry,
 			spawner: this.spawner,
@@ -120,7 +119,8 @@ export class AgentLoop {
 			finishAgent,
 			logAgentStart,
 			logAgentFinished,
-			runResumeSteering: taskId => this.steeringManager.runResumeSteering(taskId),
+			hasPendingInterruptKickoff: taskId => this.steeringManager.hasPendingInterruptKickoff(taskId),
+			takePendingInterruptKickoff: taskId => this.steeringManager.takePendingInterruptKickoff(taskId),
 			hasFinisherTakeover: taskId => this.steeringManager.hasFinisherTakeover(taskId),
 			spawnFinisherAfterStoppingSteering: (taskId, workerOutput) =>
 				this.steeringManager.spawnFinisherAfterStoppingSteering(taskId, workerOutput),
