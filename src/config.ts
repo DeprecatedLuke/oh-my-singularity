@@ -1,3 +1,5 @@
+// lifecycle-interrupt-advance-test
+// Defines OMS configuration types, defaults, and environment-variable loading/merge behavior for agent roles and runtime settings.
 import {
 	DEFAULT_LAYOUT_AGENTS_WIDTH_RATIO,
 	DEFAULT_LAYOUT_SYSTEM_HEIGHT_RATIO,
@@ -82,12 +84,12 @@ export const DEFAULT_CONFIG: OmsConfig = {
 			tools: WORKER_TOOLS,
 		},
 		finisher: {
-			model: "sonnet",
+			model: "codex-spark",
 			thinking: "medium",
 			tools: FINISHER_TOOLS,
 		},
 		steering: {
-			model: "sonnet",
+			model: "codex-spark",
 			thinking: "medium",
 		},
 	},
