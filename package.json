@@ -1,6 +1,6 @@
 {
   "name": "oh-my-singularity",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "module": "src/index.ts",
   "type": "module",
   "license": "GPL-3.0",
