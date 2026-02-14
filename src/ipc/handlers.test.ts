@@ -59,12 +59,29 @@ function createLoopStub(overrides: Record<string, unknown> = {}) {
 }
 
 describe("handleIpcMessage", () => {
-	test("tasks_request list delegates to tasks client with parsed args", async () => {
+	test("tasks_request list delegates to tasks client with parsed args and returns compact objects", async () => {
 		const listCalls: Array<readonly string[] | undefined> = [];
 		const tasksClient = {
 			list: async (args?: readonly string[]) => {
 				listCalls.push(args);
-				return [makeIssue("task-1")];
+				return [
+					makeIssue("task-1", {
+						assignee: "alice",
+						priority: 1,
+						depends_on_ids: ["task-2"],
+					}),
+					makeIssue("task-2", {
+						status: "closed",
+						priority: 4,
+						issue_type: "bug",
+						depends_on_ids: ["task-1", "task-3"],
+					}),
+					makeIssue("task-3", {
+						status: "done",
+						priority: 0,
+						issue_type: "agent",
+					}),
+				];
 			},
 		} as unknown as TaskStoreClient;
 		const registry = createRegistry(tasksClient);
@@ -82,8 +99,715 @@ describe("handleIpcMessage", () => {
 		})) as { ok: boolean; data?: unknown[] };
 
 		expect(response.ok).toBe(true);
-		expect(Array.isArray(response.data)).toBe(true);
+		expect(response.data).toEqual([
+			{
+				id: "task-1",
+				title: "Issue task-1",
+				status: "open",
+				priority: 1,
+				assignee: "alice",
+				dependency_count: 1,
+				issue_type: "task",
+			},
+			{
+				id: "task-2",
+				title: "Issue task-2",
+				status: "closed",
+				priority: 4,
+				assignee: null,
+				dependency_count: 2,
+				issue_type: "bug",
+			},
+			{
+				id: "task-3",
+				title: "Issue task-3",
+				status: "done",
+				priority: 0,
+				assignee: null,
+				dependency_count: 0,
+				issue_type: "agent",
+			},
+		]);
 		expect(listCalls[0]).toEqual(["--all", "--status", "open", "--type", "task", "--limit", "5"]);
+	});
+
+	test("tasks_request list excludes closed and terminal statuses, keeps blocked, and defaults dependency_count to zero", async () => {
+		const listCalls: Array<readonly string[] | undefined> = [];
+		const tasksClient = {
+			list: async (args?: readonly string[]) => {
+				listCalls.push(args);
+				return [
+					makeIssue("task-1", {
+						status: "open",
+						priority: 2,
+						depends_on_ids: ["task-2", "task-3"],
+					}),
+					makeIssue("task-2", {
+						status: "closed",
+						priority: 3,
+						assignee: "bob",
+						depends_on_ids: ["task-9"],
+					}),
+					makeIssue("task-3", {
+						status: "blocked",
+						priority: 0,
+						issue_type: "feature",
+					}),
+					makeIssue("task-4", {
+						status: "done",
+					}),
+					makeIssue("task-5", {
+						status: "dead",
+					}),
+				];
+			},
+		} as unknown as TaskStoreClient;
+		const registry = createRegistry(tasksClient);
+
+		const response = (await handleIpcMessage({
+			payload: { type: "tasks_request", action: "list", params: {} },
+			loop: null,
+			registry,
+			tasksClient,
+			systemAgentId: "system",
+		})) as { ok: boolean; data?: unknown[] };
+
+		expect(response.ok).toBe(true);
+		expect(response.data).toEqual([
+			{
+				id: "task-1",
+				title: "Issue task-1",
+				status: "open",
+				priority: 2,
+				assignee: null,
+				dependency_count: 2,
+				issue_type: "task",
+			},
+			{
+				id: "task-3",
+				title: "Issue task-3",
+				status: "blocked",
+				priority: 0,
+				assignee: null,
+				dependency_count: 0,
+				issue_type: "feature",
+			},
+		]);
+		expect((response.data ?? []).every(item => Object.keys(item as Record<string, unknown>).length === 7)).toBe(true);
+		expect(listCalls[0]).toEqual(["--status", "open", "--limit", "50"]);
+	});
+
+	test("tasks_request list respects explicit status without includeClosed", async () => {
+		const listCalls: Array<readonly string[] | undefined> = [];
+		const tasksClient = {
+			list: async (args?: readonly string[]) => {
+				listCalls.push(args);
+				return [
+					makeIssue("task-done", {
+						status: "done",
+					}),
+				];
+			},
+		} as unknown as TaskStoreClient;
+		const registry = createRegistry(tasksClient);
+
+		const response = (await handleIpcMessage({
+			payload: { type: "tasks_request", action: "list", params: { status: "done" } },
+			loop: null,
+			registry,
+			tasksClient,
+			systemAgentId: "system",
+		})) as { ok: boolean; data?: unknown[] };
+
+		expect(response.ok).toBe(true);
+		expect((response.data ?? []).map(item => (item as { status: string }).status)).toEqual(["done"]);
+		expect(listCalls[0]).toEqual(["--status", "done", "--limit", "50"]);
+	});
+
+	test("tasks_request list sorts by updated_at descending and treats invalid timestamps as oldest", async () => {
+		const tasksClient = {
+			list: async () => [
+				makeIssue("task-old", {
+					updated_at: "2026-01-01T00:00:01.000Z",
+				}),
+				makeIssue("task-invalid", {
+					updated_at: "not-a-date",
+				}),
+				makeIssue("task-new", {
+					updated_at: "2026-01-01T00:00:03.000Z",
+				}),
+				makeIssue("task-mid", {
+					updated_at: "2026-01-01T00:00:02.000Z",
+				}),
+			],
+		} as unknown as TaskStoreClient;
+		const registry = createRegistry(tasksClient);
+
+		const response = (await handleIpcMessage({
+			payload: { type: "tasks_request", action: "list", params: {} },
+			loop: null,
+			registry,
+			tasksClient,
+			systemAgentId: "system",
+		})) as { ok: boolean; data?: unknown[] };
+
+		expect(response.ok).toBe(true);
+		expect((response.data ?? []).map(item => (item as { id: string }).id)).toEqual([
+			"task-new",
+			"task-mid",
+			"task-old",
+			"task-invalid",
+		]);
+	});
+
+	test("tasks_request search sorts by updated_at descending and treats invalid timestamps as oldest", async () => {
+		const tasksClient = {
+			search: async () => [
+				makeIssue("task-old", {
+					updated_at: "2026-01-01T00:00:01.000Z",
+				}),
+				makeIssue("task-invalid", {
+					status: "blocked",
+					updated_at: "not-a-date",
+				}),
+				makeIssue("task-new", {
+					updated_at: "2026-01-01T00:00:03.000Z",
+				}),
+				makeIssue("task-mid", {
+					updated_at: "2026-01-01T00:00:02.000Z",
+				}),
+			],
+		} as unknown as TaskStoreClient;
+		const registry = createRegistry(tasksClient);
+
+		const response = (await handleIpcMessage({
+			payload: { type: "tasks_request", action: "search", params: { query: "alpha" } },
+			loop: null,
+			registry,
+			tasksClient,
+			systemAgentId: "system",
+		})) as { ok: boolean; data?: unknown[] };
+
+		expect(response.ok).toBe(true);
+		expect((response.data ?? []).map(item => (item as { id: string }).id)).toEqual([
+			"task-new",
+			"task-mid",
+			"task-old",
+			"task-invalid",
+		]);
+	});
+
+	test("tasks_request search defaults limit to 50 and forwards includeComments/status", async () => {
+		const searchCalls: Array<{ query: string; options: unknown }> = [];
+		const tasksClient = {
+			search: async (query: string, options?: unknown) => {
+				searchCalls.push({ query, options });
+				return [];
+			},
+		} as unknown as TaskStoreClient;
+		const registry = createRegistry(tasksClient);
+
+		const response = await handleIpcMessage({
+			payload: {
+				type: "tasks_request",
+				action: "search",
+				params: { query: "alpha", includeComments: true, status: "blocked" },
+			},
+			loop: null,
+			registry,
+			tasksClient,
+			systemAgentId: "system",
+		});
+
+		expect(response).toEqual({ ok: true, data: [] });
+		expect(searchCalls).toEqual([
+			{
+				query: "alpha",
+				options: {
+					includeComments: true,
+					status: "blocked",
+					limit: 50,
+				},
+			},
+		]);
+	});
+
+	test("tasks_request search defaults status to open when status is omitted", async () => {
+		const searchCalls: Array<{ query: string; options: unknown }> = [];
+		const tasksClient = {
+			search: async (query: string, options?: unknown) => {
+				searchCalls.push({ query, options });
+				return [];
+			},
+		} as unknown as TaskStoreClient;
+		const registry = createRegistry(tasksClient);
+
+		const response = await handleIpcMessage({
+			payload: { type: "tasks_request", action: "search", params: { query: "alpha" } },
+			loop: null,
+			registry,
+			tasksClient,
+			systemAgentId: "system",
+		});
+
+		expect(response).toEqual({ ok: true, data: [] });
+		expect(searchCalls).toEqual([
+			{
+				query: "alpha",
+				options: {
+					includeComments: false,
+					status: "open",
+					limit: 50,
+				},
+			},
+		]);
+	});
+
+	test("tasks_request search excludes closed and terminal statuses by default", async () => {
+		const tasksClient = {
+			search: async () => [
+				makeIssue("task-open", {
+					status: "open",
+					updated_at: "2026-01-01T00:00:08.000Z",
+				}),
+				makeIssue("task-blocked", {
+					status: "blocked",
+					updated_at: "2026-01-01T00:00:07.000Z",
+				}),
+				makeIssue("task-closed", {
+					status: "closed",
+					updated_at: "2026-01-01T00:00:06.000Z",
+				}),
+				makeIssue("task-done", {
+					status: "done",
+					updated_at: "2026-01-01T00:00:05.000Z",
+				}),
+				makeIssue("task-failed", {
+					status: "failed",
+					updated_at: "2026-01-01T00:00:04.000Z",
+				}),
+				makeIssue("task-dead", {
+					status: "dead",
+					updated_at: "2026-01-01T00:00:03.000Z",
+				}),
+			],
+		} as unknown as TaskStoreClient;
+		const registry = createRegistry(tasksClient);
+
+		const response = (await handleIpcMessage({
+			payload: { type: "tasks_request", action: "search", params: { query: "alpha" } },
+			loop: null,
+			registry,
+			tasksClient,
+			systemAgentId: "system",
+		})) as { ok: boolean; data?: unknown[] };
+
+		expect(response.ok).toBe(true);
+		expect((response.data ?? []).map(item => (item as { id: string }).id)).toEqual(["task-open", "task-blocked"]);
+	});
+
+	test("tasks_request search includeClosed=true bypasses closed/terminal filtering", async () => {
+		const tasksClient = {
+			search: async () => [
+				makeIssue("task-open", {
+					status: "open",
+					updated_at: "2026-01-01T00:00:08.000Z",
+				}),
+				makeIssue("task-blocked", {
+					status: "blocked",
+					updated_at: "2026-01-01T00:00:07.000Z",
+				}),
+				makeIssue("task-closed", {
+					status: "closed",
+					updated_at: "2026-01-01T00:00:06.000Z",
+				}),
+				makeIssue("task-done", {
+					status: "done",
+					updated_at: "2026-01-01T00:00:05.000Z",
+				}),
+				makeIssue("task-failed", {
+					status: "failed",
+					updated_at: "2026-01-01T00:00:04.000Z",
+				}),
+				makeIssue("task-dead", {
+					status: "dead",
+					updated_at: "2026-01-01T00:00:03.000Z",
+				}),
+			],
+		} as unknown as TaskStoreClient;
+		const registry = createRegistry(tasksClient);
+
+		const response = (await handleIpcMessage({
+			payload: {
+				type: "tasks_request",
+				action: "search",
+				params: { query: "alpha", includeClosed: true },
+			},
+			loop: null,
+			registry,
+			tasksClient,
+			systemAgentId: "system",
+		})) as { ok: boolean; data?: unknown[] };
+
+		expect(response.ok).toBe(true);
+		expect((response.data ?? []).map(item => (item as { id: string }).id)).toEqual([
+			"task-open",
+			"task-blocked",
+			"task-closed",
+			"task-done",
+			"task-failed",
+			"task-dead",
+		]);
+	});
+
+	test("tasks_request search respects explicit status without includeClosed", async () => {
+		const searchCalls: Array<{ query: string; options: unknown }> = [];
+		const tasksClient = {
+			search: async (query: string, options?: unknown) => {
+				searchCalls.push({ query, options });
+				return [
+					makeIssue("task-done", {
+						status: "done",
+					}),
+				];
+			},
+		} as unknown as TaskStoreClient;
+		const registry = createRegistry(tasksClient);
+
+		const response = (await handleIpcMessage({
+			payload: { type: "tasks_request", action: "search", params: { query: "alpha", status: "done" } },
+			loop: null,
+			registry,
+			tasksClient,
+			systemAgentId: "system",
+		})) as { ok: boolean; data?: unknown[] };
+
+		expect(response.ok).toBe(true);
+		expect((response.data ?? []).map(item => (item as { id: string }).id)).toEqual(["task-done"]);
+		expect(searchCalls).toEqual([
+			{
+				query: "alpha",
+				options: {
+					includeComments: false,
+					status: "done",
+					limit: 50,
+				},
+			},
+		]);
+	});
+
+	test("tasks_request ready returns compact 7-field objects", async () => {
+		const tasksClient = {
+			ready: async () => [
+				makeIssue("task-ready-1", {
+					priority: 1,
+					assignee: "alice",
+					depends_on_ids: ["task-x", "task-y"],
+					description: "Long text",
+					acceptance_criteria: "Accept",
+					comments: [
+						{
+							id: 1,
+							issue_id: "task-ready-1",
+							author: "alice",
+							text: "ready comment",
+							created_at: "2026-01-01T00:00:00.000Z",
+						},
+					],
+					close_reason: "done",
+					usage_totals: { input: 10, output: 4 },
+					metadata: { large: "payload" },
+				}),
+				makeIssue("task-ready-2", {
+					status: "blocked",
+					priority: 3,
+					assignee: null,
+					issue_type: "bug",
+					description: "Other long text",
+					acceptance_criteria: "Ship",
+					comments: [
+						{
+							id: 2,
+							issue_id: "task-ready-2",
+							author: "system",
+							text: "ready note",
+							created_at: "2026-01-01T00:00:00.000Z",
+						},
+					],
+					depends_on_ids: [],
+					close_reason: "blocked",
+					usage_totals: { input: 20, output: 8 },
+					metadata: { large: "blob" },
+				}),
+			],
+		} as unknown as TaskStoreClient;
+		const registry = createRegistry(tasksClient);
+
+		const response = (await handleIpcMessage({
+			payload: { type: "tasks_request", action: "ready", params: {} },
+			loop: null,
+			registry,
+			tasksClient,
+			systemAgentId: "system",
+		})) as { ok: boolean; data?: unknown[] };
+
+		expect(response.ok).toBe(true);
+		expect(response.data).toEqual([
+			{
+				id: "task-ready-1",
+				title: "Issue task-ready-1",
+				status: "open",
+				priority: 1,
+				assignee: "alice",
+				dependency_count: 2,
+				issue_type: "task",
+			},
+			{
+				id: "task-ready-2",
+				title: "Issue task-ready-2",
+				status: "blocked",
+				priority: 3,
+				assignee: null,
+				dependency_count: 0,
+				issue_type: "bug",
+			},
+		]);
+		expect((response.data ?? []).every(item => Object.keys(item as Record<string, unknown>).length === 7)).toBe(true);
+		for (const item of response.data ?? []) {
+			expect(item).not.toHaveProperty("description");
+			expect(item).not.toHaveProperty("acceptance_criteria");
+			expect(item).not.toHaveProperty("created_at");
+			expect(item).not.toHaveProperty("updated_at");
+			expect(item).not.toHaveProperty("comments");
+			expect(item).not.toHaveProperty("labels");
+			expect(item).not.toHaveProperty("depends_on_ids");
+			expect(item).not.toHaveProperty("close_reason");
+			expect(item).not.toHaveProperty("usage_totals");
+			expect(item).not.toHaveProperty("metadata");
+		}
+	});
+
+	test("tasks_request search returns compact 7-field objects without verbose fields", async () => {
+		const searchCalls: Array<{ query: string; options: unknown }> = [];
+		const tasksClient = {
+			search: async (query: string, options?: unknown) => {
+				searchCalls.push({ query, options });
+				return [
+					makeIssue("task-search-open", {
+						status: "open",
+						priority: 2,
+						assignee: null,
+						updated_at: "2026-01-01T00:00:01.000Z",
+						depends_on_ids: ["task-a", "task-b"],
+						description: "Long text",
+						acceptance_criteria: "Accept",
+						comments: [
+							{
+								id: 3,
+								issue_id: "task-search-open",
+								author: "alice",
+								text: "search open",
+								created_at: "2026-01-01T00:00:00.000Z",
+							},
+						],
+						close_reason: "none",
+						usage_totals: { input: 3, output: 1 },
+						metadata: { payload: "open" },
+					}),
+					makeIssue("task-search-closed", {
+						status: "closed",
+						priority: 4,
+						updated_at: "2026-01-01T00:00:04.000Z",
+						description: "Closed text",
+						acceptance_criteria: "Close",
+						comments: [],
+						close_reason: "done",
+						usage_totals: { input: 5, output: 2 },
+						metadata: { payload: "closed" },
+					}),
+					makeIssue("task-search-blocked", {
+						status: "blocked",
+						priority: 1,
+						assignee: "nina",
+						updated_at: "2026-01-01T00:00:03.000Z",
+						description: "Blocked text",
+						acceptance_criteria: "Block",
+						comments: [
+							{
+								id: 4,
+								issue_id: "task-search-blocked",
+								author: "nina",
+								text: "search blocked",
+								created_at: "2026-01-01T00:00:00.000Z",
+							},
+						],
+						depends_on_ids: ["task-c"],
+						close_reason: "waiting",
+						usage_totals: { input: 7, output: 3 },
+						metadata: { payload: "blocked" },
+					}),
+					makeIssue("task-search-done", {
+						status: "done",
+						updated_at: "2026-01-01T00:00:05.000Z",
+						description: "Done text",
+						acceptance_criteria: "Done",
+						comments: [],
+						close_reason: "done",
+						usage_totals: { input: 9, output: 4 },
+						metadata: { payload: "done" },
+					}),
+				];
+			},
+		} as unknown as TaskStoreClient;
+		const registry = createRegistry(tasksClient);
+
+		const response = (await handleIpcMessage({
+			payload: { type: "tasks_request", action: "search", params: { query: "test" } },
+			loop: null,
+			registry,
+			tasksClient,
+			systemAgentId: "system",
+		})) as { ok: boolean; data?: unknown[] };
+
+		expect(response.ok).toBe(true);
+		expect(response.data).toEqual([
+			{
+				id: "task-search-blocked",
+				title: "Issue task-search-blocked",
+				status: "blocked",
+				priority: 1,
+				assignee: "nina",
+				dependency_count: 1,
+				issue_type: "task",
+			},
+			{
+				id: "task-search-open",
+				title: "Issue task-search-open",
+				status: "open",
+				priority: 2,
+				assignee: null,
+				dependency_count: 2,
+				issue_type: "task",
+			},
+		]);
+		expect((response.data ?? []).every(item => Object.keys(item as Record<string, unknown>).length === 7)).toBe(true);
+		for (const item of response.data ?? []) {
+			expect(item).not.toHaveProperty("description");
+			expect(item).not.toHaveProperty("acceptance_criteria");
+			expect(item).not.toHaveProperty("created_at");
+			expect(item).not.toHaveProperty("updated_at");
+			expect(item).not.toHaveProperty("comments");
+			expect(item).not.toHaveProperty("labels");
+			expect(item).not.toHaveProperty("depends_on_ids");
+			expect(item).not.toHaveProperty("close_reason");
+			expect(item).not.toHaveProperty("usage_totals");
+			expect(item).not.toHaveProperty("metadata");
+		}
+		expect(searchCalls).toEqual([
+			{
+				query: "test",
+				options: {
+					includeComments: false,
+					status: "open",
+					limit: 50,
+				},
+			},
+		]);
+	});
+
+	test("tasks_request query returns compact 7-field objects without verbose fields", async () => {
+		const queryCalls: Array<{ query: string; args: readonly string[] | undefined }> = [];
+		const tasksClient = {
+			query: async (query: string, args?: readonly string[]) => {
+				queryCalls.push({ query, args });
+				return [
+					makeIssue("task-query-1", {
+						priority: 4,
+						assignee: null,
+						depends_on_ids: ["task-k", "task-l"],
+						description: "Query text",
+						acceptance_criteria: "Query accept",
+						comments: [
+							{
+								id: 5,
+								issue_id: "task-query-1",
+								author: "sam",
+								text: "query one",
+								created_at: "2026-01-01T00:00:00.000Z",
+							},
+						],
+						close_reason: "n/a",
+						usage_totals: { input: 12, output: 5 },
+						metadata: { payload: "query-1" },
+					}),
+					makeIssue("task-query-2", {
+						status: "closed",
+						priority: 0,
+						assignee: "sam",
+						description: "Query closed",
+						acceptance_criteria: "Query close",
+						comments: [
+							{
+								id: 6,
+								issue_id: "task-query-2",
+								author: "sam",
+								text: "query two",
+								created_at: "2026-01-01T00:00:00.000Z",
+							},
+						],
+						depends_on_ids: [],
+						close_reason: "done",
+						usage_totals: { input: 14, output: 6 },
+						metadata: { payload: "query-2" },
+					}),
+				];
+			},
+		} as unknown as TaskStoreClient;
+		const registry = createRegistry(tasksClient);
+
+		const response = (await handleIpcMessage({
+			payload: { type: "tasks_request", action: "query", params: { query: "status:open" } },
+			loop: null,
+			registry,
+			tasksClient,
+			systemAgentId: "system",
+		})) as { ok: boolean; data?: unknown[] };
+
+		expect(response.ok).toBe(true);
+		expect(response.data).toEqual([
+			{
+				id: "task-query-1",
+				title: "Issue task-query-1",
+				status: "open",
+				priority: 4,
+				assignee: null,
+				dependency_count: 2,
+				issue_type: "task",
+			},
+			{
+				id: "task-query-2",
+				title: "Issue task-query-2",
+				status: "closed",
+				priority: 0,
+				assignee: "sam",
+				dependency_count: 0,
+				issue_type: "task",
+			},
+		]);
+		expect((response.data ?? []).every(item => Object.keys(item as Record<string, unknown>).length === 7)).toBe(true);
+		for (const item of response.data ?? []) {
+			expect(item).not.toHaveProperty("description");
+			expect(item).not.toHaveProperty("acceptance_criteria");
+			expect(item).not.toHaveProperty("created_at");
+			expect(item).not.toHaveProperty("updated_at");
+			expect(item).not.toHaveProperty("comments");
+			expect(item).not.toHaveProperty("labels");
+			expect(item).not.toHaveProperty("depends_on_ids");
+			expect(item).not.toHaveProperty("close_reason");
+			expect(item).not.toHaveProperty("usage_totals");
+			expect(item).not.toHaveProperty("metadata");
+		}
+		expect(queryCalls).toEqual([{ query: "status:open", args: [] }]);
 	});
 
 	test("tasks_request returns validation errors for missing required params", async () => {
