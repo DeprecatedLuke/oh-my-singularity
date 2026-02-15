@@ -6,8 +6,8 @@
  * enforce task permissions via tool availability.
  */
 import net from "node:net";
+import { getCapabilities } from "../../core/capabilities";
 import { logger } from "../../utils";
-
 import type { ExtensionAPI, UnknownRecord } from "./types";
 
 type TasksExtensionOptions = {
@@ -93,13 +93,14 @@ export function makeTasksExtension(opts: TasksExtensionOptions) {
 				const action = typeof params?.action === "string" ? params.action : "";
 
 				if (!allowed.has(action)) {
-					const workerLifecycleAction =
-						(role === "worker" || role === "designer-worker") && (action === "close" || action === "update");
-					const singularityLifecycleAction = role === "singularity" && (action === "close" || action === "update");
-					const message = workerLifecycleAction
+					const caps = getCapabilities(role);
+					const isImplementer = caps.category === "implementer" && (action === "close" || action === "update");
+					const isOrchestratorAction =
+						caps.category === "orchestrator" && (action === "close" || action === "update");
+					const message = isImplementer
 						? `tasks: action not permitted: ${action} (role=${role}). ` +
 							"Workers must exit with a concise summary; finisher handles update/close."
-						: singularityLifecycleAction
+						: isOrchestratorAction
 							? `tasks: action not permitted: ${action} (role=${role}). ` +
 								"Singularity must not mutate issue lifecycle directly. Use broadcast_to_workers to coordinate, then let steering/finisher handle close/update."
 							: `tasks: action not permitted: ${action} (role=${role})`;

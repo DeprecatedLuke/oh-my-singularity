@@ -2,6 +2,7 @@ import type { AgentRegistry } from "../agents/registry";
 import { OmsRpcClient } from "../agents/rpc-wrapper";
 import type { AgentSpawner } from "../agents/spawner";
 import type { AgentInfo } from "../agents/types";
+import { getCapabilities } from "../core/capabilities";
 import { asRecord, logger } from "../utils";
 
 type LogLevel = "debug" | "info" | "warn" | "error";
@@ -108,7 +109,7 @@ export class ComplaintManager {
 
 		const candidates = this.registry
 			.getActiveByTask(complainantTaskId)
-			.filter(agent => agent.role === "worker" || agent.role === "designer-worker");
+			.filter(agent => getCapabilities(agent.role).category === "implementer");
 		if (candidates.length === 0) return null;
 		return candidates[0] ?? null;
 	}

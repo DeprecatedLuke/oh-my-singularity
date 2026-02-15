@@ -3,8 +3,13 @@ import { OmsRpcClient } from "../agents/rpc-wrapper";
 import type { AgentSpawner } from "../agents/spawner";
 import type { AgentInfo } from "../agents/types";
 import { DEFAULT_CONFIG, type OmsConfig } from "../config";
+import { getCapabilities } from "../core/capabilities";
+import { AutonomousWorkflowEngine } from "../engine/autonomous-workflow";
+import { InteractiveWorkflowEngine } from "../engine/interactive-workflow";
 import type { SessionLogWriter } from "../session-log-writer";
 import type { TaskStoreClient } from "../tasks/client";
+import type { WorkflowConfig } from "../types/workflow-config";
+import type { IWorkflowEngine } from "../types/workflow-engine";
 import { logger } from "../utils";
 import { ComplaintManager } from "./complaints";
 import { LifecycleHelpers } from "./lifecycle-helpers";
@@ -37,6 +42,8 @@ export class AgentLoop {
 	private readonly lifecycleHelpers: LifecycleHelpers;
 	private readonly rpcHandlerManager: RpcHandlerManager;
 	private readonly pipelineManager: PipelineManager;
+	#workflowConfig?: WorkflowConfig;
+	#workflowEngine: IWorkflowEngine;
 	private readonly spawnAgentInFlight = new Set<string>();
 
 	constructor(opts: {
@@ -45,6 +52,7 @@ export class AgentLoop {
 		scheduler: Scheduler;
 		spawner: AgentSpawner;
 		config?: OmsConfig;
+		workflowConfig?: WorkflowConfig;
 		onDirty?: () => void;
 		logAgentId?: string;
 		crashLogWriter?: SessionLogWriter;
@@ -54,6 +62,7 @@ export class AgentLoop {
 		this.scheduler = opts.scheduler;
 		this.spawner = opts.spawner;
 		this.config = opts.config ?? DEFAULT_CONFIG;
+		this.#workflowConfig = opts.workflowConfig;
 		this.onDirty = opts.onDirty;
 		this.logAgentId = opts.logAgentId;
 		this.lifecycleHelpers = new LifecycleHelpers({
@@ -127,6 +136,26 @@ export class AgentLoop {
 			isRunning: () => this.running,
 			isPaused: () => this.paused,
 		});
+
+		const autonomous = this.#workflowConfig?.autoProcessReadyTasks ?? true;
+		const WorkflowEngineClass = autonomous ? AutonomousWorkflowEngine : InteractiveWorkflowEngine;
+		this.#workflowEngine = new WorkflowEngineClass(
+			this.pipelineManager,
+			this.steeringManager,
+			this.registry,
+			this.tasksClient,
+			this.spawner,
+			attachRpcHandlers,
+			(startedBy: string, agent: AgentInfo, context?: string) =>
+				this.lifecycleHelpers.logAgentStart(startedBy, agent, context),
+		);
+	}
+
+	/**
+	 * Get the workflow engine instance (for extension access)
+	 */
+	getWorkflowEngine(): IWorkflowEngine {
+		return this.#workflowEngine;
 	}
 
 	private loopLog(message: string, level: "debug" | "info" | "warn" | "error" = "info", data?: unknown): void {
@@ -413,7 +442,9 @@ export class AgentLoop {
 			}
 		}
 
-		const finishers = this.registry.getActiveByTask(taskId).filter(a => a.role === "finisher");
+		const finishers = this.registry
+			.getActiveByTask(taskId)
+			.filter(a => getCapabilities(a.role).category === "verifier");
 		for (const finisher of finishers) {
 			const rpc = finisher.rpc;
 			if (rpc && rpc instanceof OmsRpcClient) {
@@ -570,88 +601,24 @@ export class AgentLoop {
 		}
 
 		try {
-			if (role === "finisher") {
-				const workerOutput = ctx || "[Spawned by singularity for lifecycle recovery]";
-				const finisher = await this.steeringManager.spawnFinisherAfterStoppingSteering(taskId, workerOutput);
-				this.rpcHandlerManager.attachRpcHandlers(finisher);
-				this.lifecycleHelpers.logAgentStart("singularity", finisher, ctx);
-			} else if (role === "issuer") {
-				const task = await this.tasksClient.show(taskId);
-				const result = await this.pipelineManager.runIssuerForTask(task, { kickoffMessage: ctx || undefined });
-				if (result.skip) {
-					const skipReason = result.reason || result.message || "No implementation work needed";
-					const finisherInput =
-						`[Issuer skip — no worker spawned]\n\n` +
-						`The issuer determined no implementation work is needed for this task.\n` +
-						`Reason: ${skipReason}`;
-					this.loopLog(`Singularity issuer skipped worker for ${taskId}: ${skipReason}`, "info", {
-						taskId,
-						reason: skipReason,
-					});
-
-					try {
-						const finisher = await this.steeringManager.spawnFinisherAfterStoppingSteering(taskId, finisherInput);
-						this.rpcHandlerManager.attachRpcHandlers(finisher);
-						this.lifecycleHelpers.logAgentStart("singularity", finisher, `skip: ${skipReason}`);
-					} catch (err) {
-						const msg = err instanceof Error ? err.message : String(err);
-						this.loopLog(`Finisher spawn failed (skip) for ${taskId}: ${msg}`, "warn", {
-							taskId,
-							error: msg,
-						});
-					}
-				} else if (!result.start) {
-					const reason = result.reason || "Issuer deferred start";
-					this.loopLog(`Singularity issuer deferred ${taskId}: ${reason}`, "warn", {
-						taskId,
-						reason,
-					});
-
-					try {
-						await this.tasksClient.updateStatus(taskId, "blocked");
-					} catch (err) {
-						this.loopLog(
-							`Failed to set blocked status for ${taskId}: ${err instanceof Error ? err.message : err}`,
-							"warn",
-							{ taskId },
-						);
-					}
-
-					try {
-						await this.tasksClient.comment(
-							taskId,
-							`Blocked by issuer (singularity spawn). ${reason}${result.message ? `\nmessage: ${result.message}` : ""}`,
-						);
-					} catch (err) {
-						logger.debug(
-							"loop/agent-loop.ts: failed to post blocked-task comment after spawn failure (non-fatal)",
-							{ err },
-						);
-					}
-				} else {
-					const kickoff = result.message ?? null;
-					const task2 = await this.tasksClient.show(taskId);
-					const worker = await this.pipelineManager.spawnTaskWorker(task2, {
-						claim: true,
-						kickoffMessage: kickoff,
-					});
-					this.lifecycleHelpers.logAgentStart("singularity", worker, kickoff ?? task2.title);
-				}
-			} else if (role === "worker") {
-				const task = await this.tasksClient.show(taskId);
-				const worker = await this.pipelineManager.spawnTaskWorker(task, {
-					claim: true,
-					kickoffMessage: ctx || undefined,
-				});
-				this.lifecycleHelpers.logAgentStart("singularity", worker, ctx);
-			}
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			this.loopLog(`replace_agent failed: ${role} for ${taskId}: ${message}`, "warn", {
-				taskId,
-				role,
-				error: message,
+			const task = await this.tasksClient.show(taskId);
+			const result = await this.#workflowEngine.dispatchAgent(role, task, {
+				context: ctx || undefined,
 			});
+
+			if (result.success && result.agent) {
+				// For agents returned directly (not via side effects), attach handlers and log
+				this.rpcHandlerManager.attachRpcHandlers(result.agent);
+				this.lifecycleHelpers.logAgentStart("singularity", result.agent, ctx);
+			}
+
+			if (!result.success) {
+				this.loopLog(`Dispatch failed for ${role} on ${taskId}: ${result.reason}`, "warn", {
+					role,
+					taskId,
+					reason: result.reason,
+				});
+			}
 		} finally {
 			this.spawnAgentInFlight.delete(key);
 			this.pipelineManager.removePipelineInFlight(taskId);

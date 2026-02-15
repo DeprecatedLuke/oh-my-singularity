@@ -20,7 +20,7 @@ type SettingRow = {
 	readOnly?: boolean;
 };
 
-const MODEL_OPTIONS = ["codex", "haiku", "sonnet", "opus"] as const;
+const MODEL_OPTIONS = ["haiku", "sonnet", "opus"] as const;
 const THINKING_OPTIONS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 const ROLE_ORDER: readonly Exclude<AgentRole, "singularity">[] = [
 	"worker",
@@ -250,6 +250,7 @@ export class SettingsPane {
 
 		for (const role of ROLE_ORDER) {
 			const roleCfg = this.#config.roles[role];
+			if (!roleCfg) continue;
 			rows.push({
 				label: `${roleLabel(role)} model`,
 				getValue: () => roleCfg.model,
@@ -261,6 +262,7 @@ export class SettingsPane {
 
 		for (const role of ROLE_ORDER) {
 			const roleCfg = this.#config.roles[role];
+			if (!roleCfg) continue;
 			rows.push({
 				label: `${roleLabel(role)} thinking`,
 				getValue: () => roleCfg.thinking,

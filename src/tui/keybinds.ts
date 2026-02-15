@@ -77,38 +77,38 @@ export function registerOmsTuiKeybinds(dispatcher: KeybindDispatcher<OmsTuiUiSta
 	});
 
 	// Stop controls
-	dispatcher.bind(["SHIFT_ALT_S", "ALT_SHIFT_S"], ctx => {
+	dispatcher.bind(["SHIFT_ALT_S", "ALT_SHIFT_S", "CTRL_SHIFT_S", "SHIFT_CTRL_S"], ctx => {
 		ctx.actions?.stopSelected?.();
 	});
 
-	dispatcher.bind(["SHIFT_ALT_X", "ALT_SHIFT_X"], ctx => {
+	dispatcher.bind(["SHIFT_ALT_X", "ALT_SHIFT_X", "CTRL_SHIFT_X", "SHIFT_CTRL_X"], ctx => {
 		ctx.actions?.stopAll?.();
 	});
 
-	dispatcher.bind(["SHIFT_ALT_C", "ALT_SHIFT_C"], ctx => {
+	dispatcher.bind(["SHIFT_ALT_C", "ALT_SHIFT_C", "CTRL_SHIFT_C", "SHIFT_CTRL_C"], ctx => {
 		ctx.actions?.toggleTasksClosed?.();
 	});
 
-	dispatcher.bind(["SHIFT_ALT_D", "ALT_SHIFT_D"], ctx => {
+	dispatcher.bind(["SHIFT_ALT_D", "ALT_SHIFT_D", "CTRL_SHIFT_D", "SHIFT_CTRL_D"], ctx => {
 		ctx.actions?.toggleDoneAgents?.();
 	});
 
-	dispatcher.bind(["SHIFT_ALT_M", "ALT_SHIFT_M"], ctx => {
+	dispatcher.bind(["SHIFT_ALT_M", "ALT_SHIFT_M", "CTRL_SHIFT_M", "SHIFT_CTRL_M"], ctx => {
 		ctx.actions?.toggleMouseCapture?.();
 	});
 
 	// Render profiling toggle
-	dispatcher.bind(["SHIFT_ALT_P", "ALT_SHIFT_P"], ctx => {
+	dispatcher.bind(["SHIFT_ALT_P", "ALT_SHIFT_P", "CTRL_SHIFT_P", "SHIFT_CTRL_P"], ctx => {
 		ctx.actions?.toggleProfiling?.();
 	});
 
 	// Settings overlay toggle
-	dispatcher.bind(["SHIFT_ALT_O", "ALT_SHIFT_O"], ctx => {
+	dispatcher.bind(["SHIFT_ALT_O", "ALT_SHIFT_O", "CTRL_SHIFT_O", "SHIFT_CTRL_O"], ctx => {
 		ctx.actions?.toggleSettings?.();
 	});
 
 	// Agent pane auto-switch toggle (kept, but moved off Shift+Alt+Up)
-	dispatcher.bind(["SHIFT_ALT_A", "ALT_SHIFT_A"], ctx => {
+	dispatcher.bind(["SHIFT_ALT_A", "ALT_SHIFT_A", "CTRL_SHIFT_A", "SHIFT_CTRL_A"], ctx => {
 		ctx.setState(prev => ({
 			...prev,
 			autoSwitchEnabled: !prev.autoSwitchEnabled,

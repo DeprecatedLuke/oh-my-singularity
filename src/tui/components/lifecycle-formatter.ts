@@ -1,4 +1,5 @@
 import { UI_AGENT_SUMMARY_MAX_CHARS } from "../../config/constants";
+import { getCapabilities } from "../../core/capabilities";
 import { asRecord, clipText, previewValue, squashWhitespace } from "../../utils";
 import { agentFg, BOLD, FG, lifecycleFg, RESET, UNBOLD } from "../colors";
 import { wrapLine } from "./text-formatter";
@@ -118,7 +119,7 @@ export function formatAgentLogSummary(
 	const taskId = detailValue(data?.taskId) || "(none)";
 	const dataAgentId = detailValue(data?.agentId);
 
-	if (lifecycle === "started" && (role === "issuer" || role === "steering")) {
+	if (lifecycle === "started" && getCapabilities(role).rendering === "decision") {
 		const started = parseStartedLifecycleMessage(safeMessage);
 		const agentId = started?.agentId || dataAgentId || `${role}:?`;
 		const context =
@@ -128,7 +129,7 @@ export function formatAgentLogSummary(
 		return `start ${agentId} for ${taskId} — ${context}`;
 	}
 
-	if (lifecycle === "finished" && (role === "issuer" || role === "steering")) {
+	if (lifecycle === "finished" && getCapabilities(role).rendering === "decision") {
 		const finished = parseFinishedLifecycleMessage(safeMessage);
 		const summary = finished?.summary || "";
 		const decision = parseSummaryRecord(summary);
@@ -143,7 +144,7 @@ export function formatAgentLogSummary(
 		return `${action} ${agentId} for ${decisionTask} — ${detailWithRaw}`;
 	}
 
-	if (lifecycle === "finished" && (role === "worker" || role === "designer-worker" || role === "finisher")) {
+	if (lifecycle === "finished" && getCapabilities(role).rendering === "implementation") {
 		const finished = parseFinishedLifecycleMessage(safeMessage);
 		const summary = finished?.summary || "";
 		const snippets = summarySnippets(summary, 3);

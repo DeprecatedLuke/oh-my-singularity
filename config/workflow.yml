@@ -1,0 +1,59 @@
+# Example OMS Workflow Configuration
+#
+# This file defines roles, extensions, and behavior for the OMS orchestration.
+# For detailed schema, see config/schema.yml.
+
+version: "1.0"
+profile: default
+
+# Role definitions (built-in and custom)
+roles:
+  # Built-in roles (can be customized here)
+  issuer:
+    category: scout
+    rendering: decision
+    canModifyFiles: false
+    canAdvanceLifecycle: true
+
+  worker:
+    category: implementer
+    rendering: implementation
+    canModifyFiles: true
+
+  designer-worker:
+    category: implementer
+    rendering: implementation
+    canModifyFiles: true
+
+  finisher:
+    category: verifier
+    rendering: implementation
+    canCloseTask: true
+
+  steering:
+    category: supervisor
+    rendering: decision
+
+  # Custom role example
+  code-reviewer:
+    category: verifier
+    rendering: implementation
+    canModifyFiles: false
+    canCloseTask: false
+    color: "blue"
+    extensions:
+      - code-reviewer-extension
+
+# Extension definitions (maps names to paths)
+extensions:
+  code-reviewer-extension:
+    path: ".oms/extensions/code-reviewer.ts"
+
+# Steering configuration
+steering:
+  enabled: true
+  intervalMs: 900000  # 15 minutes
+  roleId: steering
+
+# Auto-process ready tasks (set to false for interactive PM mode)
+autoProcessReadyTasks: true

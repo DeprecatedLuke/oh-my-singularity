@@ -7,9 +7,10 @@ import {
 	TIMEOUT_DEFAULT_POLL_MS,
 	TIMEOUT_STEERING_INTERVAL_MS,
 } from "./config/constants";
-export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+import type { AgentRole } from "./core/types";
 
-export type AgentRole = "singularity" | "issuer" | "worker" | "designer-worker" | "finisher" | "steering";
+export type { AgentRole } from "./core/types";
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
 type RoleKey = AgentRole | "orchestrator";
 
@@ -72,7 +73,7 @@ export const DEFAULT_CONFIG: OmsConfig = {
 			tools: ISSUER_TOOLS,
 		},
 		worker: {
-			model: "codex",
+			model: "sonnet",
 			thinking: "xhigh",
 			tools: WORKER_TOOLS,
 		},
@@ -203,10 +204,14 @@ export function mergeOmsConfig(base: OmsConfig, override: OmsConfigOverride): Om
 			const normalized = normalizeRoleKey(role);
 			if (!normalized) continue;
 
+			const filteredOverride: Partial<RoleConfig> = {};
+			if (roleOverride.model !== undefined) filteredOverride.model = roleOverride.model;
+			if (roleOverride.thinking !== undefined) filteredOverride.thinking = roleOverride.thinking;
+			if (roleOverride.tools !== undefined) filteredOverride.tools = roleOverride.tools;
 			mergedRoles[normalized] = {
 				...mergedRoles[normalized],
-				...roleOverride,
-			};
+				...filteredOverride,
+			} as RoleConfig;
 		}
 	}
 

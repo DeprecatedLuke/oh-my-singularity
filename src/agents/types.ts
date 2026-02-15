@@ -1,4 +1,6 @@
-export type AgentRole = "singularity" | "issuer" | "worker" | "designer-worker" | "finisher" | "steering";
+import type { AgentRole } from "../core/types";
+
+export type { AgentRole } from "../core/types";
 
 export type AgentStatus =
 	| "spawning"

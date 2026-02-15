@@ -26,8 +26,8 @@ export default async function replaceAgentExtension(api: ExtensionAPI): Promise<
 			"For tasks where you already know the implementation guidance, replace with a worker directly.",
 		parameters: Type.Object(
 			{
-				role: Type.Union([Type.Literal("finisher"), Type.Literal("issuer"), Type.Literal("worker")], {
-					description: "Agent role to replace",
+				role: Type.String({
+					description: "Agent role to replace (built-in or custom)",
 				}),
 				taskId: Type.String({
 					description: "Tasks issue ID to replace the agent for",
@@ -61,12 +61,12 @@ export default async function replaceAgentExtension(api: ExtensionAPI): Promise<
 			const taskId = typeof params?.taskId === "string" ? params.taskId.trim() : "";
 			const context = typeof params?.context === "string" ? params.context.trim() : "";
 
-			if (!role || !["finisher", "issuer", "worker"].includes(role)) {
+			if (!role) {
 				return {
 					content: [
 						{
 							type: "text",
-							text: "replace_agent: role must be one of: finisher, issuer, worker",
+							text: "replace_agent: role is required",
 						},
 					],
 				};

@@ -2,6 +2,7 @@ import type { AgentRegistry } from "../agents/registry";
 import { OmsRpcClient } from "../agents/rpc-wrapper";
 import type { AgentSpawner } from "../agents/spawner";
 import type { AgentInfo } from "../agents/types";
+import { getCapabilities } from "../core/capabilities";
 import type { TaskStoreClient } from "../tasks/client";
 import type { TaskIssue } from "../tasks/types";
 import { logger } from "../utils";
@@ -138,7 +139,7 @@ export class PipelineManager {
 		this.issuerLifecycleByTask.set(taskId, next);
 
 		// Issuer's job is done — abort it so it doesn't keep burning tokens
-		const issuers = this.registry.getActiveByTask(taskId).filter(a => a.role === "issuer");
+		const issuers = this.registry.getActiveByTask(taskId).filter(a => getCapabilities(a.role).category === "scout");
 		for (const iss of issuers) {
 			const rpc = iss.rpc;
 			if (rpc && rpc instanceof OmsRpcClient) {

@@ -2,6 +2,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_CONFIG, FINISHER_TOOLS, ISSUER_TOOLS, type OmsConfig, STEERING_TOOLS, WORKER_TOOLS } from "../config";
 import { AGENT_EXTENSION_FILENAMES } from "../config/constants";
+import { getCapabilities } from "../core/capabilities";
 import type { TaskStoreClient } from "../tasks/client";
 import { logger } from "../utils";
 import type { AgentRegistry } from "./registry";
@@ -184,9 +185,8 @@ export class AgentSpawner {
 		const active = this.registry.getByTask(taskId).filter(agent => isActiveStatus(agent.status));
 
 		if (role === "worker") {
-			return active.find(agent => agent.role === "worker" || agent.role === "designer-worker") ?? null;
+			return active.find(agent => getCapabilities(agent.role).category === "implementer") ?? null;
 		}
-
 		return active.find(agent => agent.role === role) ?? null;
 	}
 
