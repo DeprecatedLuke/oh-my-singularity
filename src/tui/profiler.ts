@@ -52,7 +52,7 @@ export class RenderProfiler {
 	#lagSamplesMs: number[] = [];
 	#lagSpikeCount = 0;
 	#lagExpectedTs = 0;
-	#lagTimer: ReturnType<typeof setTimeout> | null = null;
+	#lagTimer: NodeJS.Timeout | null = null;
 
 	// Per-frame scratch state
 	#frameStart = 0;
@@ -166,7 +166,7 @@ export class RenderProfiler {
 			this.#sampleEventLoopLag();
 		}, EVENT_LOOP_SAMPLE_INTERVAL_MS);
 
-		const timer = this.#lagTimer as ReturnType<typeof setTimeout> & { unref?: () => void };
+		const timer = this.#lagTimer as NodeJS.Timeout & { unref?: () => void };
 		if (typeof timer.unref === "function") timer.unref();
 	}
 
@@ -197,7 +197,7 @@ export class RenderProfiler {
 			this.#sampleEventLoopLag();
 		}, EVENT_LOOP_SAMPLE_INTERVAL_MS);
 
-		const timer = this.#lagTimer as ReturnType<typeof setTimeout> & { unref?: () => void };
+		const timer = this.#lagTimer as NodeJS.Timeout & { unref?: () => void };
 		if (typeof timer.unref === "function") timer.unref();
 	}
 	#endCurrentPhase(): void {

@@ -4,10 +4,12 @@ import path from "node:path";
 import type { AgentRegistry } from "../agents/registry";
 import type { AgentSpawner } from "../agents/spawner";
 import type { OmsConfig } from "../config";
+import { getCapabilities } from "../core/capabilities";
 import { handleIpcMessage } from "../ipc/handlers";
 import { startOmsSingularityIpcServer } from "../ipc/server";
 import { AgentLoop } from "../loop/agent-loop";
 import type { Scheduler } from "../loop/scheduler";
+import { loadWorkflowConfig } from "../orchestrator/config-loader";
 import type { SessionLogWriter } from "../session-log-writer";
 import { getSrcDir, probeExtensionLoad, resolveSingularityExtensionCandidates } from "../setup/extensions";
 import { setupShutdownHandlers } from "../shutdown";
@@ -21,6 +23,7 @@ import { SingularityPane } from "../tui/panes/singularity-pane";
 import { SystemPane } from "../tui/panes/system-pane";
 import { TasksDetailsPane } from "../tui/panes/tasks-details-pane";
 import { TasksPane } from "../tui/panes/tasks-pane";
+import type { WorkflowConfig } from "../types/workflow-config";
 import { logger } from "../utils";
 
 export async function runTuiMode(opts: {
@@ -104,7 +107,7 @@ export async function runTuiMode(opts: {
 		const readyTasks = opts.poller.readySnapshot.filter((i: any) => i.issue_type === "task").length;
 		const activeWorkers = opts.registry
 			.getActive()
-			.filter(a => a.role === "worker" || a.role === "designer-worker").length;
+			.filter(a => getCapabilities(a.role).category === "implementer").length;
 		const loopPaused = loop?.isPaused() ?? false;
 		if (lastWorkersCount === activeWorkers && lastReadyCount === readyTasks && lastLoopPaused === loopPaused) {
 			return;
@@ -260,7 +263,32 @@ export async function runTuiMode(opts: {
 	const centerCols = Math.max(1, layout.singularity.width - 2);
 	const centerRows = Math.max(1, layout.singularity.height - 2);
 
-	const singularityPromptPath = path.resolve(getSrcDir(), "agents", "prompts", "singularity.md");
+	// Load workflow configuration for prompt selection and engine mode
+	let workflowConfig: WorkflowConfig | undefined;
+	try {
+		const workflowConfigPath = path.join(opts.omsSessionDir, "../.oms");
+		workflowConfig = await loadWorkflowConfig(workflowConfigPath);
+		opts.registry.pushEvent(opts.systemAgentId, {
+			type: "log",
+			ts: Date.now(),
+			level: "debug",
+			message: "Loaded workflow configuration",
+			data: {
+				profile: workflowConfig?.profile,
+				autoProcessReadyTasks: workflowConfig?.autoProcessReadyTasks,
+			},
+		});
+	} catch (err) {
+		opts.registry.pushEvent(opts.systemAgentId, {
+			type: "log",
+			ts: Date.now(),
+			level: "warn",
+			message: `Failed to load workflow config, using defaults: ${err instanceof Error ? err.message : String(err)}`,
+		});
+	}
+
+	const promptFilename = workflowConfig?.autoProcessReadyTasks === false ? "singularity-pm.md" : "singularity.md";
+	const singularityPromptPath = path.resolve(getSrcDir(), "agents", "prompts", promptFilename);
 	const singularityAppendPrompt = fs.existsSync(singularityPromptPath) ? singularityPromptPath : undefined;
 	if (!singularityAppendPrompt) {
 		opts.registry.pushEvent(opts.systemAgentId, {
@@ -444,7 +472,6 @@ export async function runTuiMode(opts: {
 		});
 
 		singularityPane.start(singularityAppendPrompt);
-
 		// Agent loop
 		loop = new AgentLoop({
 			tasksClient: opts.tasksClient,
@@ -452,6 +479,7 @@ export async function runTuiMode(opts: {
 			scheduler: opts.scheduler,
 			spawner: opts.spawner,
 			config: opts.config,
+			workflowConfig,
 			onDirty: refreshCounts,
 			logAgentId: opts.systemAgentId,
 			crashLogWriter: opts.sessionLogWriter,

@@ -3,6 +3,7 @@ import { OmsRpcClient } from "../agents/rpc-wrapper";
 import type { AgentSpawner } from "../agents/spawner";
 import type { AgentInfo } from "../agents/types";
 import type { OmsConfig } from "../config";
+import { getCapabilities } from "../core/capabilities";
 import { asRecord, logger } from "../utils";
 
 type LogLevel = "debug" | "info" | "warn" | "error";
@@ -319,12 +320,12 @@ export class SteeringManager {
 	getActiveWorkerAgents(): AgentInfo[] {
 		return this.registry
 			.getActive()
-			.filter(a => (a.role === "worker" || a.role === "designer-worker") && !isTerminalStatus(a.status));
+			.filter(a => getCapabilities(a.role).category === "implementer" && !isTerminalStatus(a.status));
 	}
 
 	hasFinisherTakeover(taskId: string): boolean {
 		if (this.finisherSpawningTasks.has(taskId)) return true;
-		return this.registry.getActiveByTask(taskId).some(agent => agent.role === "finisher");
+		return this.registry.getActiveByTask(taskId).some(agent => getCapabilities(agent.role).category === "verifier");
 	}
 
 	onAgentStopped(agentId: string): void {
@@ -351,7 +352,7 @@ export class SteeringManager {
 		const activeForTask = this.registry.getActiveByTask(taskId);
 		const taskAgents = this.registry.getByTask(taskId);
 		const workerIds = taskAgents
-			.filter(agent => agent.role === "worker" || agent.role === "designer-worker")
+			.filter(agent => getCapabilities(agent.role).category === "implementer")
 			.map(agent => agent.id);
 		const inFlight = workerIds
 			.map(workerId => this.steeringInFlightByWorker.get(workerId))
@@ -360,8 +361,11 @@ export class SteeringManager {
 			this.steeringInFlightByWorker.delete(workerId);
 			this.lastSteeringAtByWorker.delete(workerId);
 		}
-		const steeringAgentIds = activeForTask.filter(agent => agent.role === "steering").map(agent => agent.id);
-		const isTaskSteering = (agent: AgentInfo) => agent.taskId === taskId && agent.role === "steering";
+		const steeringAgentIds = activeForTask
+			.filter(agent => getCapabilities(agent.role).category === "supervisor")
+			.map(agent => agent.id);
+		const isTaskSteering = (agent: AgentInfo) =>
+			agent.taskId === taskId && getCapabilities(agent.role).category === "supervisor";
 		await this.stopAgentsMatching(isTaskSteering);
 
 		if (inFlight.length > 0) {
@@ -371,6 +375,44 @@ export class SteeringManager {
 
 		if (steeringAgentIds.length > 0 || inFlight.length > 0) {
 			this.loopLog(`Stopped steering agent(s) for finisher takeover on ${taskId}`, "info", {
+				taskId,
+				stopped: steeringAgentIds,
+				inFlightWorkers: inFlight.length,
+			});
+		}
+	}
+
+	/**
+	 * Generalized method to stop all supervisor agents for a task
+	 * Used by WorkflowEngine.stopSupervisors()
+	 */
+	async stopSupervisors(taskId: string): Promise<void> {
+		const activeForTask = this.registry.getActiveByTask(taskId);
+		const taskAgents = this.registry.getByTask(taskId);
+		const workerIds = taskAgents
+			.filter(agent => getCapabilities(agent.role).category === "implementer")
+			.map(agent => agent.id);
+		const inFlight = workerIds
+			.map(workerId => this.steeringInFlightByWorker.get(workerId))
+			.filter((promise): promise is Promise<void> => !!promise);
+		for (const workerId of workerIds) {
+			this.steeringInFlightByWorker.delete(workerId);
+			this.lastSteeringAtByWorker.delete(workerId);
+		}
+		const steeringAgentIds = activeForTask
+			.filter(agent => getCapabilities(agent.role).category === "supervisor")
+			.map(agent => agent.id);
+		const isTaskSteering = (agent: AgentInfo) =>
+			agent.taskId === taskId && getCapabilities(agent.role).category === "supervisor";
+		await this.stopAgentsMatching(isTaskSteering);
+
+		if (inFlight.length > 0) {
+			await Promise.race([Promise.allSettled(inFlight), Bun.sleep(1_000)]);
+			await this.stopAgentsMatching(isTaskSteering);
+		}
+
+		if (steeringAgentIds.length > 0 || inFlight.length > 0) {
+			this.loopLog(`Stopped supervisor agent(s) for task ${taskId}`, "info", {
 				taskId,
 				stopped: steeringAgentIds,
 				inFlightWorkers: inFlight.length,
@@ -396,7 +438,7 @@ export class SteeringManager {
 		const steerSummary = `${normalizeSummary(trimmed)}\n`;
 		const targets = this.registry
 			.getActive()
-			.filter(agent => agent.taskId === normalizedTaskId && agent.role !== "finisher");
+			.filter(agent => agent.taskId === normalizedTaskId && getCapabilities(agent.role).category !== "verifier");
 		if (targets.length === 0) {
 			this.loopLog(`Steer: no active agents for task ${normalizedTaskId}`, "warn", {
 				taskId: normalizedTaskId,
@@ -491,9 +533,11 @@ export class SteeringManager {
 		const normalizedTaskId = taskId.trim();
 		if (!normalizedTaskId) return false;
 		const trimmed = message.trim();
-		const interruptMessage = trimmed ? `[URGENT MESSAGE]\n\n${trimmed}` : "[URGENT MESSAGE]";
-		const interruptSummary = `${normalizeSummary(trimmed || interruptMessage)}\n`;
-		const targets = this.registry.getActive().filter(agent => agent.taskId === normalizedTaskId);
+	const interruptMessage = trimmed ? `[URGENT MESSAGE]\n\n${trimmed}` : "[URGENT MESSAGE]";
+	const interruptSummary = `${normalizeSummary(trimmed || interruptMessage)}\n`;
+	const targets = this.registry
+		.getActive()
+		.filter(agent => agent.taskId === normalizedTaskId && getCapabilities(agent.role).category !== "verifier");
 		if (targets.length === 0) {
 			this.queuePendingInterruptKickoff(normalizedTaskId, interruptMessage);
 			this.loopLog(

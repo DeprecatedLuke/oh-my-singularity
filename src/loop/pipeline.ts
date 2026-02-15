@@ -2,6 +2,7 @@ import type { AgentRegistry } from "../agents/registry";
 import { OmsRpcClient } from "../agents/rpc-wrapper";
 import type { AgentSpawner } from "../agents/spawner";
 import type { AgentInfo } from "../agents/types";
+import { getCapabilities } from "../core/capabilities";
 import type { TaskStoreClient } from "../tasks/client";
 import type { TaskIssue } from "../tasks/types";
 import { logger } from "../utils";
@@ -140,12 +141,12 @@ export class PipelineManager {
 		};
 		this.issuerLifecycleByTask.set(taskId, next);
 
-		// Issuer's job is done — kill it so it doesn't keep burning tokens.
-		// abort() is insufficient here: the issuer is mid-tool-call (advance_lifecycle),
-		// so there is no active API stream to cancel. forceKill() terminates the
-		// process immediately, causing waitForAgentEnd to reject; the catch block
-		// in runIssuerForTask recovers via the recorded advance decision.
-		const issuers = this.registry.getActiveByTask(taskId).filter(a => a.role === "issuer");
+	// Issuer's job is done — kill it so it doesn't keep burning tokens.
+	// abort() is insufficient here: the issuer is mid-tool-call (advance_lifecycle),
+	// so there is no active API stream to cancel. forceKill() terminates the
+	// process immediately, causing waitForAgentEnd to reject; the catch block
+	// in runIssuerForTask recovers via the recorded advance decision.
+	const issuers = this.registry.getActiveByTask(taskId).filter(a => getCapabilities(a.role).category === "scout");
 		for (const iss of issuers) {
 			const rpc = iss.rpc;
 			if (rpc && rpc instanceof OmsRpcClient) {

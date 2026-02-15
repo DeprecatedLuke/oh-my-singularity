@@ -1,0 +1,121 @@
+# OMS Workflow Configuration Schema Reference
+
+# Top-level schema
+version: "1.0"  # Schema version (required)
+profile: "string"  # Profile name (required)
+roles:
+  <RoleId>:  # Map of role ID to configuration
+    category?: "orchestrator" | "scout" | "implementer" | "verifier" | "supervisor"
+    rendering?: "decision" | "implementation" | "default"
+    canModifyFiles?: boolean
+    canCloseTask?: boolean
+    canAdvanceLifecycle?: boolean
+    canSpawn?: RoleId[]  # Which roles this role can spawn
+    prompt?: string  # Path to custom prompt file
+    extensions?: string[]  # Extensions this role can use
+    color?: string  # Color for TUI rendering
+
+extensions?:
+  <ExtensionName>:
+    path: "string"  # Path to extension (built-in name, relative, or absolute)
+
+steering?:
+  enabled: boolean
+  intervalMs: number  # Milliseconds between steering checks (must be positive)
+  roleId: string  # Role ID that performs steering
+
+autoProcessReadyTasks?: boolean  # Default: true
+
+# Type Definitions
+
+# RoleId
+# - Built-in: "singularity", "issuer", "worker", "designer-worker", "finisher", "steering"
+# - Custom: Any non-empty string
+
+# RoleCategory
+# - "orchestrator": Can initiate workflows (e.g., singularity)
+# - "scout": Analyzes and plans (e.g., issuer)
+# - "implementer": Executes work (e.g., worker, designer-worker)
+# - "verifier": Reviews and closes tasks (e.g., finisher)
+# - "supervisor": Monitors and controls (e.g., steering)
+
+# RenderingStyle
+# - "decision": Shows action/reason (used by scouts, supervisors)
+# - "implementation": Shows change snippets (used by implementers, verifiers)
+# - "default": Shows raw message (used by custom roles without specific rendering)
+
+# Built-in Role Capabilities
+#
+# singularity:
+#   category: orchestrator
+#   rendering: default
+#   canModifyFiles: true
+#   canCloseTask: false
+#   canAdvanceLifecycle: false
+#   canSpawn: [all roles]
+#
+# issuer:
+#   category: scout
+#   rendering: decision
+#   canModifyFiles: false
+#   canCloseTask: false
+#   canAdvanceLifecycle: true
+#   canSpawn: []
+#
+# worker:
+#   category: implementer
+#   rendering: implementation
+#   canModifyFiles: true
+#   canCloseTask: false
+#   canAdvanceLifecycle: false
+#   canSpawn: []
+#
+# designer-worker:
+#   category: implementer
+#   rendering: implementation
+#   canModifyFiles: true
+#   canCloseTask: false
+#   canAdvanceLifecycle: false
+#   canSpawn: []
+#
+# finisher:
+#   category: verifier
+#   rendering: implementation
+#   canModifyFiles: false
+#   canCloseTask: true
+#   canAdvanceLifecycle: false
+#   canSpawn: []
+#
+# steering:
+#   category: supervisor
+#   rendering: decision
+#   canModifyFiles: false
+#   canCloseTask: false
+#   canAdvanceLifecycle: false
+#   canSpawn: []
+
+# Prompt Resolution Order
+#
+# 1. Config prompt field (absolute or relative to config)
+# 2. Built-in prompt at src/agents/prompts/{roleId}.md
+# 3. null (no prompt)
+
+# Extension Resolution Order
+#
+# 1. Built-in name: src/agents/extensions/{name}.ts
+# 2. Relative path: from project root
+# 3. Absolute path: used as-is
+# 4. Error: extension not found
+
+# Config Merge Order (later overrides earlier)
+#
+# 1. DEFAULT_CONFIG (hardcoded defaults)
+# 2. .oms/workflow.json (project-level)
+# 3. .oms/workflow.yml (project-level)
+# 4. Environment variables (OMS_WORKFLOW_* prefix)
+
+# Environment Variable Overrides
+#
+# OMS_WORKFLOW_PROFILE: Override profile name
+# OMS_WORKFLOW_AUTO_PROCESS: Override autoProcessReadyTasks ("true" or "false")
+# OMS_ROLE_PERMISSIONS_<ROLE>: JSON permissions for a role

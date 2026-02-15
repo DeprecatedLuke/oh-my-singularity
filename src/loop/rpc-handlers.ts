@@ -1,6 +1,7 @@
 import type { AgentRegistry } from "../agents/registry";
 import { OmsRpcClient } from "../agents/rpc-wrapper";
 import { type AgentInfo, createEmptyAgentUsage } from "../agents/types";
+import { getCapabilities } from "../core/capabilities";
 import type { TaskStoreClient } from "../tasks/client";
 import { asRecord, logger } from "../utils";
 import * as UsageTracking from "./usage";
@@ -236,7 +237,7 @@ export class RpcHandlerManager {
 			return;
 		}
 
-		if (agent.role === "worker" || agent.role === "designer-worker") {
+		if (getCapabilities(agent.role).category === "implementer") {
 			if (!agent.taskId) return;
 
 			const workerOutput = await this.getLastAssistantText(agent);
@@ -254,7 +255,7 @@ export class RpcHandlerManager {
 			return;
 		}
 
-		if (agent.role === "finisher") {
+		if (getCapabilities(agent.role).category === "verifier") {
 			const finisherOutput = await this.getLastAssistantText(agent);
 			await this.logAgentFinished(agent, finisherOutput);
 			await this.finishAgent(agent, "done");

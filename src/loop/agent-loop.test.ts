@@ -10,9 +10,11 @@ import { AgentLoop } from "./agent-loop";
 function makeRpc(overrides: Record<string, unknown> = {}): OmsRpcClient {
 	const rpc = Object.create(OmsRpcClient.prototype) as OmsRpcClient & Record<string, unknown>;
 	Object.assign(rpc, {
+		listeners: new Set(),
 		abort: async () => {},
 		stop: async () => {},
 		steer: async (_message: string) => {},
+		onEvent: (_listener: unknown) => () => {},
 		...overrides,
 	});
 	return rpc;

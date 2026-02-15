@@ -131,6 +131,41 @@ function regionContains(region: Region, x: number, y: number): boolean {
 	if (region.width <= 0 || region.height <= 0) return false;
 	return x >= region.x && x < region.x + region.width && y >= region.y && y < region.y + region.height;
 }
+/**
+ * Parse CSI u (fixterms) keyboard sequences from modern terminals like Ghostty.
+ * Format: \x1b[{keycode};{modifiers}u
+ * Modifiers: 1=base, 2=Shift, 3=Alt, 4=Shift+Alt, 5=Ctrl, 6=Ctrl+Shift, 7=Ctrl+Alt, 8=Ctrl+Shift+Alt
+ * We use modifiers-1 to get bits: bit0=Shift, bit1=Alt, bit2=Ctrl
+ */
+function parseCsiU(chunk: Buffer): { keyName: string } | null {
+	const str = chunk.toString("ascii", 0, Math.min(chunk.length, 20));
+	const match = str.match(/^\x1b\[(\d+);(\d+)u$/);
+	if (!match) return null;
+
+	const keycode = parseInt(match[1]!, 10);
+	const modifiersRaw = parseInt(match[2]!, 10);
+	const modifiers = modifiersRaw - 1; // CSI u adds 1 to all modifier values
+
+	// Extract modifier bits
+	const shift = !!(modifiers & 1);
+	const alt = !!(modifiers & 2);
+	const ctrl = !!(modifiers & 4);
+
+	// Convert keycode to character; CSI u sends lowercase letters
+	let char = String.fromCharCode(keycode);
+	if (char >= "a" && char <= "z") {
+		char = char.toUpperCase();
+	}
+
+	// Build key name: CTRL_SHIFT_ALT_A pattern
+	const parts: string[] = [];
+	if (ctrl) parts.push("CTRL");
+	if (shift) parts.push("SHIFT");
+	if (alt) parts.push("ALT");
+	parts.push(char);
+
+	return { keyName: parts.join("_") };
+}
 
 export class OmsTuiApp {
 	readonly #term: TerminalLike;
@@ -317,6 +352,22 @@ export class OmsTuiApp {
 		} catch {
 			// Never crash on resize; best-effort.
 		}
+	};
+	readonly #onUnknown = (chunk: Buffer) => {
+		if (!this.#running) return;
+
+		const parsed = parseCsiU(chunk);
+		if (!parsed) {
+			// Not a CSI u sequence - log for debugging
+			logger.debug("tui: unknown input sequence", {
+				bytes: [...chunk],
+				string: chunk.toString("utf-8"),
+			});
+			return;
+		}
+
+		// Dispatch CSI u key as if terminal-kit recognized it
+		this.#onKey(parsed.keyName, [parsed.keyName], { isCharacter: false, code: chunk });
 	};
 
 	constructor(
@@ -513,6 +564,7 @@ export class OmsTuiApp {
 		this.#term.on("key", this.#onKey);
 		this.#term.on("mouse", this.#onMouse);
 		this.#term.on("resize", this.#onResize);
+		this.#term.on("unknown", this.#onUnknown);
 
 		// Some environments miss resize events; poll size as a backstop.
 		if (!this.#sizePoller) {
@@ -567,6 +619,13 @@ export class OmsTuiApp {
 			detachListener(this.#term, "resize", this.#onResize);
 		} catch (err) {
 			logger.debug('tui/app.ts: best-effort failure after detachListener(this.#term, "resize", this.#onResize);', {
+				err,
+			});
+		}
+		try {
+			detachListener(this.#term, "unknown", this.#onUnknown);
+		} catch (err) {
+			logger.debug('tui/app.ts: best-effort failure after detachListener(this.#term, "unknown", this.#onUnknown);', {
 				err,
 			});
 		}

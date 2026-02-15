@@ -177,6 +177,9 @@ oms
 - Useful for development and testing the CLI as an installed package
 - To unlink later: `bun unlink` (from project directory) or `bun unlink -g oh-my-singularity` (from anywhere)
 
+**Note on Standalone Binaries:**
+Standalone binary compilation (via `bun build`) is not currently supported. OMS uses dynamic module imports (particularly `terminal-kit`) that cannot be bundled into a standalone executable. Always use the `bun link` symlink method for installation — this ensures the runtime can resolve all dependencies correctly.
+
 On first run, OMS creates:
 - `~/.oms/` — Global config directory
 - `~/.oms/sessions/<project>/` — ALL runtime data (tasks, logs, session artifacts, IPC socket)
@@ -189,6 +192,10 @@ On first run, OMS creates:
 
 **TUI Mode (default):**
 ```bash
+# Using the symlink (after 'bun link'):
+oms
+
+# Or run directly from source:
 bun src/index.ts
 # or
 bun start
@@ -196,18 +203,46 @@ bun start
 
 **Pipe Mode (single request, no TUI):**
 ```bash
+# Using the symlink (after 'bun link'):
+oms --pipe "Create a new authentication module with JWT support"
+
+# Or run directly from source:
 bun src/index.ts --pipe "Create a new authentication module with JWT support"
 ```
 
 ### TUI Navigation
+#### Mac/Ghostty Configuration
 
-**Keyboard: (Shift+Alt)**
-- **Arrow keys** — Navigate tasks/agents
-- **S** — Stop selected agent
-- **X** — Stop all agents
-- **C** — Toggle closed tasks visibility
-- **Q** — Exit OMS
+If you're using Ghostty on macOS and want Shift+Option shortcuts to work, add the following to `~/.config/ghostty/config`:
 
+```
+macos-option-as-alt = true
+```
+
+Without this, use the Ctrl+Shift alternatives listed below.
+
+#### Keyboard Shortcuts
+
+**Navigation & Control:**
+- **Shift+Alt+Up** — Select previous task
+- **Shift+Alt+Down** — Select next task
+- **Shift+Alt+Left** — Select previous agent
+- **Shift+Alt+Right** — Select next agent
+
+**Agent Control:**
+- **Shift+Alt+S** or **Shift+Ctrl+S** — Stop selected agent
+- **Shift+Alt+X** or **Shift+Ctrl+X** — Stop all agents
+
+**View Controls:**
+- **Shift+Alt+C** or **Shift+Ctrl+C** — Toggle closed tasks visibility
+- **Shift+Alt+D** or **Shift+Ctrl+D** — Toggle done agents visibility
+- **Shift+Alt+M** or **Shift+Ctrl+M** — Toggle mouse capture mode
+- **Shift+Alt+P** or **Shift+Ctrl+P** — Toggle render profiling
+- **Shift+Alt+O** or **Shift+Ctrl+O** — Toggle settings panel
+- **Shift+Alt+A** or **Shift+Ctrl+A** — Toggle auto-switch mode
+
+**Exit:**
+- **Shift+Alt+Q** or **Ctrl+Q** or **Ctrl+C** — Exit OMS
 **Mouse:**
 - Click to select tasks/agents
 - Scroll in any pane
@@ -334,6 +369,24 @@ export OMS_OMP_CLI=/usr/local/bin/omp
 Role suffixes: `SINGULARITY`, `ISSUER`, `WORKER`, `DESIGNER_WORKER`, `FINISHER`, `STEERING`
 
 ---
+
+## Workflow Modes
+
+OMS supports two workflow modes for processing tasks:
+
+**Autonomous Mode (Default)**
+- Tasks auto-process without human approval
+- Standard pipeline: Issuer → Worker → Finisher
+- Side effects execute immediately
+- No configuration needed — this is the current behavior
+
+**PM Mode (Interactive)**
+- Human approval required for task state changes
+- Singularity reviews side effects before execution
+- Side effects queued for approval/rejection
+- Enable with `autoProcessReadyTasks: false` in config
+
+See [Workflow Documentation](docs/workflows.md) for detailed guides and configuration examples.
 
 ## Development
 

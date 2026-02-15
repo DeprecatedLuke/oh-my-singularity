@@ -2,6 +2,7 @@ import type { AgentRegistry } from "../agents/registry";
 import { OmsRpcClient } from "../agents/rpc-wrapper";
 import type { AgentSpawner } from "../agents/spawner";
 import type { AgentInfo } from "../agents/types";
+import { getCapabilities } from "../core/capabilities";
 import { asRecord, logger } from "../utils";
 
 type LogLevel = "debug" | "info" | "warn" | "error";
@@ -108,7 +109,7 @@ export class ComplaintManager {
 
 		const candidates = this.registry
 			.getActiveByTask(complainantTaskId)
-			.filter(agent => agent.role === "worker" || agent.role === "designer-worker");
+			.filter(agent => getCapabilities(agent.role).category === "implementer");
 		if (candidates.length === 0) return null;
 		return candidates[0] ?? null;
 	}
@@ -314,7 +315,7 @@ export class ComplaintManager {
 
 		const frozenTargets = this.registry
 			.getActive()
-			.filter(agent => agent.taskId === freezeTaskId && agent.role !== "finisher")
+			.filter(agent => agent.taskId === freezeTaskId && getCapabilities(agent.role).category !== "verifier")
 			.map(agent => ({ agentId: agent.id, taskId: freezeTaskId }));
 		if (frozenTargets.length === 0) {
 			frozenTargets.push({ agentId: conflictingAgent.id, taskId: freezeTaskId });
