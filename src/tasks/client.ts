@@ -8,10 +8,10 @@ export interface TaskCreateInput {
 	labels?: string[];
 	assignee?: string | null;
 	depends_on?: string | string[];
+	references?: string | string[];
 }
 
 export interface TaskSearchInput {
-	includeComments?: boolean;
 	status?: string | null;
 	limit?: number;
 }
@@ -29,6 +29,7 @@ export interface TaskUpdateInput {
 	labels?: string[];
 	priority?: number;
 	assignee?: string | null;
+	references?: string | string[];
 }
 
 export interface TaskStoreEvent {
@@ -51,7 +52,7 @@ export interface TaskStoreClient {
 	claim(id: string): Promise<unknown>;
 	updateStatus(id: string, status: string): Promise<unknown>;
 	addLabel(id: string, label: string): Promise<unknown>;
-	comment(id: string, text: string): Promise<unknown>;
+	comment(id: string, text: string, actor?: string): Promise<unknown>;
 	comments(id: string): Promise<TaskComment[]>;
 	createAgent(name: string): Promise<string>;
 	setAgentState(id: string, state: string): Promise<unknown>;
@@ -153,12 +154,12 @@ export class TaskClient implements TaskStoreClient {
 		return this.cwd;
 	}
 
-	private buildCmd(args: readonly string[]): string[] {
-		return [this.tasksCli, ...(this.quiet ? ["--quiet"] : []), "--actor", this.actor, ...args];
+	private buildCmd(args: readonly string[], actor?: string): string[] {
+		return [this.tasksCli, ...(this.quiet ? ["--quiet"] : []), "--actor", actor?.trim() || this.actor, ...args];
 	}
 
-	private async run(args: readonly string[]): Promise<{ stdout: string; stderr: string }> {
-		const cmd = this.buildCmd(args);
+	private async run(args: readonly string[], actor?: string): Promise<{ stdout: string; stderr: string }> {
+		const cmd = this.buildCmd(args, actor);
 
 		let proc: Bun.Subprocess<"ignore", "pipe", "pipe">;
 		try {
@@ -200,8 +201,8 @@ export class TaskClient implements TaskStoreClient {
 		return { stdout, stderr };
 	}
 
-	private async runJson<T>(args: readonly string[]): Promise<T> {
-		const { stdout } = await this.run([...args, "--json"]);
+	private async runJson<T>(args: readonly string[], actor?: string): Promise<T> {
+		const { stdout } = await this.run([...args, "--json"], actor);
 		const text = stdout.trim();
 		if (!text) {
 			// Some commands may succeed but print nothing in JSON mode.
@@ -214,7 +215,7 @@ export class TaskClient implements TaskStoreClient {
 			const message = err instanceof Error ? err.message : String(err);
 			throw new Error(
 				`Failed to parse tasks JSON output.\n` +
-					`cmd: ${formatCmd(this.buildCmd([...args, "--json"]))}\n` +
+					`cmd: ${formatCmd(this.buildCmd([...args, "--json"], actor))}\n` +
 					`error: ${message}\n` +
 					`stdout (first 500 chars): ${text.slice(0, 500)}`,
 			);
@@ -274,6 +275,19 @@ export class TaskClient implements TaskStoreClient {
 				args.push("--depends-on", dependencyId);
 			}
 		}
+		if (typeof options?.references === "string") {
+			const referenceId = options.references.trim();
+			if (referenceId) args.push("--references", referenceId);
+		} else if (Array.isArray(options?.references)) {
+			const referenceIds = new Set<string>();
+			for (const reference of options.references) {
+				if (typeof reference !== "string") continue;
+				const referenceId = reference.trim();
+				if (!referenceId || referenceIds.has(referenceId)) continue;
+				referenceIds.add(referenceId);
+				args.push("--references", referenceId);
+			}
+		}
 		const { stdout } = await this.run(args);
 		const id = stdout.trim();
 		if (!id) {
@@ -304,13 +318,25 @@ export class TaskClient implements TaskStoreClient {
 			const labels = patch.labels.map(label => label.trim()).filter(Boolean);
 			if (labels.length > 0) args.push("--labels", labels.join(","));
 		}
+		if (typeof patch.references === "string") {
+			const referenceId = patch.references.trim();
+			if (referenceId) args.push("--references", referenceId);
+		} else if (Array.isArray(patch.references)) {
+			const referenceIds = new Set<string>();
+			for (const reference of patch.references) {
+				if (typeof reference !== "string") continue;
+				const referenceId = reference.trim();
+				if (!referenceId || referenceIds.has(referenceId)) continue;
+				referenceIds.add(referenceId);
+				args.push("--references", referenceId);
+			}
+		}
 		if (args.length === 2) return null;
 		return await this.runJson<unknown>(args);
 	}
 
 	async search(query: string, options?: TaskSearchInput): Promise<TaskIssue[]> {
 		const args = ["search", query];
-		if (options?.includeComments === true) args.push("--include-comments");
 		if (typeof options?.status === "string" && options.status.trim()) {
 			args.push("--status", options.status.trim());
 		}
@@ -338,8 +364,8 @@ export class TaskClient implements TaskStoreClient {
 		return await this.runJson<unknown>(args);
 	}
 
-	async comment(id: string, text: string): Promise<unknown> {
-		return await this.runJson<unknown>(["comments", "add", id, text]);
+	async comment(id: string, text: string, actor?: string): Promise<unknown> {
+		return await this.runJson<unknown>(["comments", "add", id, text], actor);
 	}
 
 	async comments(id: string): Promise<TaskComment[]> {

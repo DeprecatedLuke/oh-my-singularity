@@ -56,6 +56,62 @@ describe("JsonTaskStore CRUD", () => {
 		});
 	});
 
+	test("comment on closed task throws clear error", async () => {
+		await withStoreFixture(async ({ store }) => {
+			const created = await store.create("Closed comment target");
+			await store.close(created.id, "done");
+			await expect(store.comment(created.id, "this should fail")).rejects.toThrow(
+				/comment.*closed|closed.*comment/i,
+			);
+		});
+	});
+
+	test("update on closed task throws clear error", async () => {
+		await withStoreFixture(async ({ store }) => {
+			const created = await store.create("Closed update target");
+			await store.close(created.id, "done");
+			await expect(store.update(created.id, { priority: 1 })).rejects.toThrow(/update.*closed|closed.*update/i);
+		});
+	});
+
+	test("comment and update remain allowed on open and in_progress tasks", async () => {
+		await withStoreFixture(async ({ store }) => {
+			const openTask = await store.create("Open mutable task");
+			await expect(store.comment(openTask.id, "open comment")).resolves.toMatchObject({
+				issue_id: openTask.id,
+				text: "open comment",
+			});
+
+			const inProgressTask = await store.create("In-progress mutable task");
+			await store.update(inProgressTask.id, { status: "in_progress" });
+
+			const updatedInProgress = (await store.update(inProgressTask.id, {
+				priority: 1,
+			})) as { priority: number };
+			expect(updatedInProgress.priority).toBe(1);
+
+			await expect(store.comment(inProgressTask.id, "still commentable")).resolves.toMatchObject({
+				issue_id: inProgressTask.id,
+				text: "still commentable",
+			});
+		});
+	});
+
+	test("comment accepts actor override and preserves it in activity", async () => {
+		await withStoreFixture(async ({ store }) => {
+			const task = await store.create("Actor override task");
+			await store.comment(task.id, "singularity note", "oms-singularity");
+
+			const loaded = await store.show(task.id);
+			const latestComment = loaded.comments?.[loaded.comments.length - 1];
+			expect(latestComment?.author).toBe("oms-singularity");
+			expect(latestComment?.text).toBe("singularity note");
+
+			const activity = await store.activity({ limit: 10 });
+			const commentActivity = activity.find(event => event.type === "comment_add" && event.issue_id === task.id);
+			expect(commentActivity?.actor).toBe("oms-singularity");
+		});
+	});
 	test("list respects status/type/includeClosed filters", async () => {
 		await withStoreFixture(async ({ store }) => {
 			const openTask = await store.create("Open Task");
@@ -82,7 +138,7 @@ describe("JsonTaskStore CRUD", () => {
 			await store.create("Beta Task", "second fixture item");
 			await store.comment(alpha.id, "Needs alpha-specific follow-up");
 
-			const searchMatches = await store.search("alpha", { includeComments: true });
+			const searchMatches = await store.search("alpha");
 			expect(searchMatches.map(issue => issue.id)).toContain(alpha.id);
 
 			const queryMatches = await store.query("status=open alpha");
@@ -169,6 +225,32 @@ describe("JsonTaskStore CRUD", () => {
 			expect(dependencyIds).toContain(parentA.id);
 			expect(dependencyIds).toContain(parentB.id);
 			expect(dependencyIds).toHaveLength(2);
+		});
+	});
+
+	test("create stores informational references without dependency validation", async () => {
+		await withStoreFixture(async ({ store }) => {
+			const created = await store.create("Referenced task", null, undefined, {
+				references: ["task-old", " task-old ", "task-missing"],
+			});
+			expect(created.references).toEqual(["task-old", "task-missing"]);
+
+			const reloaded = await store.show(created.id);
+			expect(reloaded.references).toEqual(["task-old", "task-missing"]);
+		});
+	});
+
+	test("update mutates references only when explicitly provided", async () => {
+		await withStoreFixture(async ({ store }) => {
+			const created = await store.create("Reference updates", null, undefined, { references: ["task-a"] });
+			await store.update(created.id, { priority: 1 });
+			expect((await store.show(created.id)).references).toEqual(["task-a"]);
+
+			await store.update(created.id, { references: ["task-b", " task-b ", "task-c"] });
+			expect((await store.show(created.id)).references).toEqual(["task-b", "task-c"]);
+
+			await store.update(created.id, { references: [] });
+			expect((await store.show(created.id)).references).toEqual([]);
 		});
 	});
 

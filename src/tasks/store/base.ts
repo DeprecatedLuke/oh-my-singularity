@@ -193,12 +193,13 @@ export class JsonTaskStore implements TaskStoreClient {
 		issueId: string | null,
 		action: string,
 		work: () => Promise<T>,
-		opts?: { activityData?: Record<string, unknown>; skipActivity?: boolean },
+		opts?: { activityData?: Record<string, unknown>; skipActivity?: boolean; actor?: string },
 	): Promise<T> {
 		await this.ensureLoaded();
 		return await this.enqueueMutation(async () => {
 			const result = await work();
 			let activity: TaskActivityEvent | undefined;
+			const mutationActor = typeof opts?.actor === "string" && opts.actor.trim() ? opts.actor.trim() : this.actor;
 			const resultRecord =
 				result !== null && typeof result === "object" && !Array.isArray(result)
 					? (result as Record<string, unknown>)
@@ -250,7 +251,7 @@ export class JsonTaskStore implements TaskStoreClient {
 						action,
 						data: opts?.activityData,
 					},
-					this.actor,
+					mutationActor,
 				);
 			}
 			if (opts?.skipActivity) {
@@ -381,14 +382,15 @@ export class JsonTaskStore implements TaskStoreClient {
 		);
 	}
 
-	async comment(id: string, text: string): Promise<unknown> {
+	async comment(id: string, text: string, actor?: string): Promise<unknown> {
 		const normalizedText = text.trim();
+		const commentActor = typeof actor === "string" && actor.trim() ? actor.trim() : this.actor;
 		if (!normalizedText) return null;
 		return await this.mutate(
 			id,
 			"comment_add",
-			async () => addCommentToIssue(this.state, this.actor, id, normalizedText),
-			{ activityData: { text: normalizedText } },
+			async () => addCommentToIssue(this.state, commentActor, id, normalizedText),
+			{ activityData: { text: normalizedText }, actor: commentActor },
 		);
 	}
 
