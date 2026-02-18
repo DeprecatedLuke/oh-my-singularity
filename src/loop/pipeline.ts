@@ -48,11 +48,12 @@ export class PipelineManager {
 	) => Promise<void>;
 	private readonly logAgentStart: (startedBy: string, agent: AgentInfo, context?: string) => void;
 	private readonly logAgentFinished: (agent: AgentInfo, explicitText?: string) => Promise<void>;
-	private readonly runResumeSteering: (taskId: string) => Promise<ResumeDecision>;
 	private readonly hasFinisherTakeover: (taskId: string) => boolean;
 	private readonly spawnFinisherAfterStoppingSteering: (taskId: string, workerOutput: string) => Promise<AgentInfo>;
 	private readonly isRunning: () => boolean;
 	private readonly isPaused: () => boolean;
+	private readonly hasPendingInterruptKickoff: (taskId: string) => boolean;
+	private readonly takePendingInterruptKickoff: (taskId: string) => string | null;
 
 	private readonly pipelineInFlight = new Set<string>();
 	private readonly issuerLifecycleByTask = new Map<string, IssuerLifecycleAdvanceRecord>();
@@ -75,7 +76,8 @@ export class PipelineManager {
 		) => Promise<void>;
 		logAgentStart: (startedBy: string, agent: AgentInfo, context?: string) => void;
 		logAgentFinished: (agent: AgentInfo, explicitText?: string) => Promise<void>;
-		runResumeSteering: (taskId: string) => Promise<ResumeDecision>;
+		hasPendingInterruptKickoff: (taskId: string) => boolean;
+		takePendingInterruptKickoff: (taskId: string) => string | null;
 		hasFinisherTakeover: (taskId: string) => boolean;
 		spawnFinisherAfterStoppingSteering: (taskId: string, workerOutput: string) => Promise<AgentInfo>;
 		isRunning: () => boolean;
@@ -94,7 +96,8 @@ export class PipelineManager {
 		this.finishAgent = opts.finishAgent;
 		this.logAgentStart = opts.logAgentStart;
 		this.logAgentFinished = opts.logAgentFinished;
-		this.runResumeSteering = opts.runResumeSteering;
+		this.hasPendingInterruptKickoff = opts.hasPendingInterruptKickoff;
+		this.takePendingInterruptKickoff = opts.takePendingInterruptKickoff;
 		this.hasFinisherTakeover = opts.hasFinisherTakeover;
 		this.spawnFinisherAfterStoppingSteering = opts.spawnFinisherAfterStoppingSteering;
 		this.isRunning = opts.isRunning;
@@ -137,18 +140,24 @@ export class PipelineManager {
 		};
 		this.issuerLifecycleByTask.set(taskId, next);
 
-		// Issuer's job is done — abort it so it doesn't keep burning tokens
+		// Issuer's job is done — kill it so it doesn't keep burning tokens.
+		// abort() is insufficient here: the issuer is mid-tool-call (advance_lifecycle),
+		// so there is no active API stream to cancel. forceKill() terminates the
+		// process immediately, causing waitForAgentEnd to reject; the catch block
+		// in runIssuerForTask recovers via the recorded advance decision.
 		const issuers = this.registry.getActiveByTask(taskId).filter(a => a.role === "issuer");
 		for (const iss of issuers) {
 			const rpc = iss.rpc;
 			if (rpc && rpc instanceof OmsRpcClient) {
-				void rpc.abort().catch(err => {
-					this.loopLog("Failed to abort issuer RPC after lifecycle advance (non-fatal)", "debug", {
+				try {
+					rpc.forceKill();
+				} catch (err) {
+					this.loopLog("Failed to kill issuer RPC after lifecycle advance (non-fatal)", "debug", {
 						taskId,
 						issuerId: iss.id,
 						error: err instanceof Error ? err.message : String(err),
 					});
-				});
+				}
 			}
 		}
 
@@ -280,6 +289,18 @@ export class PipelineManager {
 			}
 			return lines.join("\n");
 		};
+		const buildResumeExecutionNudge = (): string => {
+			const lines = [
+				"[SYSTEM RESUME]",
+				"Your previous issuer process exited unexpectedly before lifecycle completion.",
+				'Resume this task and call `advance_lifecycle` exactly once with action="start", "skip", or "defer".',
+				"Then stop.",
+			];
+			if (kickoffMessage) {
+				lines.push("", "Original kickoff context:", kickoffMessage);
+			}
+			return lines.join("\n");
+		};
 		const runAttempt = async (
 			mode: "spawn" | "resume",
 			resumeSessionId?: string | null,
@@ -336,6 +357,18 @@ export class PipelineManager {
 			try {
 				await issuerRpc.waitForAgentEnd(180_000);
 			} catch {
+				const advance = this.takeIssuerLifecycleAdvance(task.id);
+				if (advance) {
+					let text: string | null = null;
+					try {
+						text = await issuerRpc.getLastAssistantText();
+					} catch {
+						text = null;
+					}
+					await this.finishAgent(issuer, "done");
+					await this.logAgentFinished(issuer, text ?? "");
+					return { ok: true, result: toIssuerResult(advance) };
+				}
 				const sessionId = captureSessionId();
 				await this.finishAgent(issuer, "dead");
 				return { ok: false, reason: "issuer died", sessionId, missingAdvanceTool: false };
@@ -373,6 +406,7 @@ export class PipelineManager {
 		const initialReason = initialAttempt.reason;
 		const initialSessionId = initialAttempt.sessionId;
 		const missingAdvanceNudge = buildMissingAdvanceNudge();
+		const resumeExecutionNudge = buildResumeExecutionNudge();
 		let resumeReason: string | null = null;
 		let resumeMissingAdvance = false;
 		if (initialSessionId) {
@@ -381,7 +415,7 @@ export class PipelineManager {
 				sessionId: initialSessionId,
 				reason: initialReason,
 			});
-			const resumeSteerMessage = initialAttempt.missingAdvanceTool ? missingAdvanceNudge : kickoffMessage || null;
+			const resumeSteerMessage = initialAttempt.missingAdvanceTool ? missingAdvanceNudge : resumeExecutionNudge;
 			const resumedAttempt = await runAttempt("resume", initialSessionId, resumeSteerMessage);
 			if (resumedAttempt.ok) return resumedAttempt.result;
 			resumeReason = resumedAttempt.reason;
@@ -490,7 +524,35 @@ export class PipelineManager {
 			taskId: task.id,
 		});
 
-		const resumeDecision = await this.runResumeSteering(task.id);
+		// Check for queued interrupt kickoff
+		const forcedKickoff = this.hasPendingInterruptKickoff(task.id) ? this.takePendingInterruptKickoff(task.id) : null;
+
+		if (forcedKickoff) {
+			this.loopLog(`Resume pipeline using queued interrupt kickoff for ${task.id}`, "info", {
+				taskId: task.id,
+			});
+		}
+
+		let resumeDecision: ResumeDecision;
+		if (forcedKickoff?.trim()) {
+			resumeDecision = {
+				action: "start",
+				message: forcedKickoff,
+				reason: "interrupt_agent queued restart",
+			};
+		} else {
+			const resumeIssuer = await this.runIssuerForTask(task, {
+				kickoffMessage:
+					"Task is already in_progress but has no active agent. " +
+					"Resume from current state and call `advance_lifecycle` exactly once with action start, skip, or defer.",
+			});
+			resumeDecision = {
+				action: resumeIssuer.start ? "start" : resumeIssuer.skip ? "skip" : "defer",
+				message: resumeIssuer.message,
+				reason: resumeIssuer.reason,
+			};
+		}
+
 		if (this.hasFinisherTakeover(task.id)) {
 			this.loopLog(`Resume pipeline skipped for ${task.id}: finisher takeover active`, "info", {
 				taskId: task.id,
@@ -498,7 +560,9 @@ export class PipelineManager {
 			return;
 		}
 		if (resumeDecision.action !== "start") {
-			const reason = resumeDecision.reason || "Resume restart deferred";
+			const reason =
+				resumeDecision.reason ||
+				(resumeDecision.action === "skip" ? "Resume issuer requested skip" : "Resume restart deferred");
 			try {
 				await this.tasksClient.updateStatus(task.id, "blocked");
 			} catch (err) {
@@ -514,7 +578,6 @@ export class PipelineManager {
 			} catch (err) {
 				logger.debug("loop/pipeline.ts: best-effort failure after tasksClient.comment() during resume", { err });
 			}
-
 			this.loopLog(`Resume deferred for ${task.id}: ${reason}`, "warn", {
 				taskId: task.id,
 				reason,
@@ -537,8 +600,10 @@ export class PipelineManager {
 			claim: false,
 			kickoffMessage: resumeDecision.message,
 		});
-		this.logAgentStart("OMS/system", worker, resumeDecision.message ?? "resume in-progress");
-		this.onDirty?.();
+		this.loopLog(`Spawned task worker ${worker.id} for resume pipeline ${task.id}`, "info", {
+			taskId: task.id,
+			agentId: worker.id,
+		});
 	}
 
 	private async runNewTaskPipeline(task: TaskIssue): Promise<void> {
