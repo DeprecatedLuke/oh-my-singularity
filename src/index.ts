@@ -62,7 +62,7 @@ async function main(opts: OmsLaunchOptions): Promise<void> {
 		client: tasksClient,
 		intervalMs: config.pollIntervalMs,
 		includeIssueList: true,
-		includeActivity: false,
+		includeActivity: true,
 		activityLimit: LIMIT_POLLER_ACTIVITY_DEFAULT,
 	});
 

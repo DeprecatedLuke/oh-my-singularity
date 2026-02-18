@@ -3,12 +3,13 @@ import type net from "node:net";
 import path from "node:path";
 import type { AgentRegistry } from "../agents/registry";
 import type { AgentSpawner } from "../agents/spawner";
-import type { OmsConfig } from "../config";
+import type { OmsConfig, OmsConfigOverride } from "../config";
 import { handleIpcMessage } from "../ipc/handlers";
 import { startOmsSingularityIpcServer } from "../ipc/server";
 import { AgentLoop } from "../loop/agent-loop";
 import type { Scheduler } from "../loop/scheduler";
 import type { SessionLogWriter } from "../session-log-writer";
+import { saveOmsConfigOverride } from "../setup/environment";
 import { getSrcDir, probeExtensionLoad, resolveSingularityExtensionCandidates } from "../setup/extensions";
 import { setupShutdownHandlers } from "../shutdown";
 import type { TaskStoreClient } from "../tasks/client";
@@ -21,7 +22,7 @@ import { SingularityPane } from "../tui/panes/singularity-pane";
 import { SystemPane } from "../tui/panes/system-pane";
 import { TasksDetailsPane } from "../tui/panes/tasks-details-pane";
 import { TasksPane } from "../tui/panes/tasks-pane";
-import { logger } from "../utils";
+import { asRecord, logger } from "../utils";
 
 export async function runTuiMode(opts: {
 	config: OmsConfig;
@@ -139,6 +140,18 @@ export async function runTuiMode(opts: {
 		scheduleCountsRefresh(false);
 	};
 
+	const projectConfigPath = path.join(opts.targetProjectPath, ".oms", "config.json");
+	let settingsSaveChain: Promise<void> = Promise.resolve();
+	const enqueueSettingsPersist = (override: OmsConfigOverride): void => {
+		settingsSaveChain = settingsSaveChain
+			.then(() => saveOmsConfigOverride(projectConfigPath, override))
+			.catch(error => {
+				logger.error("Failed to persist OMS config override", {
+					configPath: projectConfigPath,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
+	};
 	try {
 		singularityIpcServer = await startOmsSingularityIpcServer({
 			sockPath: opts.singularitySockPath,
@@ -321,6 +334,7 @@ export async function runTuiMode(opts: {
 		extensions: singularityExtensions,
 		env: {
 			OMS_SINGULARITY_SOCK: opts.singularitySockPath,
+			TASKS_ACTOR: "oms-singularity",
 		},
 		onDirty: () => app.requestRedraw(),
 	});
@@ -339,7 +353,7 @@ export async function runTuiMode(opts: {
 		registry: opts.registry,
 		onDirty: () => app.requestRedraw(),
 	});
-	const agentPane = new AgentPane({ registry: opts.registry, onDirty: refreshCounts });
+	const agentPane = new AgentPane({ registry: opts.registry, onDirty: () => app.requestRedraw() });
 	const systemPane = new SystemPane({
 		registry: opts.registry,
 		agentId: opts.systemAgentId,
@@ -360,6 +374,7 @@ export async function runTuiMode(opts: {
 			opts.poller.setIntervalMs(intervalMs);
 			loop?.setPollIntervalMs(intervalMs);
 		},
+		onConfigOverrideChanged: enqueueSettingsPersist,
 	});
 
 	const stopSelected = () => {
@@ -470,6 +485,26 @@ export async function runTuiMode(opts: {
 		});
 		opts.poller.on("issues-changed", () => {
 			scheduleCountsRefresh(false);
+		});
+		opts.poller.on("activity", activity => {
+			for (const event of activity) {
+				if (!event || event.type !== "comment_add") continue;
+				const taskId = typeof event.issue_id === "string" ? event.issue_id : "";
+				const eventData = asRecord(event.data);
+				const commentText = typeof eventData?.text === "string" ? eventData.text : "";
+				if (!taskId || !commentText) continue;
+				const activeAgents = opts.registry.getActiveByTask(taskId);
+				if (activeAgents.length === 0) continue;
+				const commentActor = typeof event.actor === "string" ? event.actor.trim() : "";
+				logger.debug("modes/tui.ts: comment_add actor check", {
+					taskId,
+					actor: commentActor || null,
+					activeAgentCount: activeAgents.length,
+					messageChars: commentText.length,
+				});
+				if (commentActor.startsWith("oms-") && commentActor !== "oms-singularity") continue;
+				void loop?.interruptAgent(taskId, commentText);
+			}
 		});
 		refreshCounts();
 	} catch (err) {

@@ -28,7 +28,7 @@ import type { TaskIssue } from "../tasks/types";
 import { asRecord, logger } from "../utils";
 
 const PIPE_SINGULARITY_FALLBACK_TOOLS =
-	"tasks,start_tasks,broadcast_to_workers,interrupt_agent,steer_agent,replace_agent,delete_task_issue,read,edit,grep,find,lsp,bash,python,calc,fetch,web_search";
+	"tasks,start_tasks,broadcast_to_workers,replace_agent,delete_task_issue,read,edit,grep,find,lsp,bash,python,calc,fetch,web_search";
 
 function normalizePipeSingularityTools(tools: string | undefined): string | undefined {
 	const base = typeof tools === "string" && tools.trim() ? tools : PIPE_SINGULARITY_FALLBACK_TOOLS;
@@ -512,6 +512,26 @@ export async function runPipeMode(opts: {
 
 		opts.poller.on("ready-changed", () => {
 			if (!loop?.isPaused()) loop?.wake();
+		});
+		opts.poller.on("activity", activity => {
+			for (const event of activity) {
+				if (!event || event.type !== "comment_add") continue;
+				const taskId = typeof event.issue_id === "string" ? event.issue_id : "";
+				const eventData = asRecord(event.data);
+				const commentText = typeof eventData?.text === "string" ? eventData.text : "";
+				if (!taskId || !commentText) continue;
+				const activeAgents = opts.registry.getActiveByTask(taskId);
+				if (activeAgents.length === 0) continue;
+				const commentActor = typeof event.actor === "string" ? event.actor.trim() : "";
+				logger.debug("modes/pipe.ts: comment_add actor check", {
+					taskId,
+					actor: commentActor || null,
+					activeAgentCount: activeAgents.length,
+					messageChars: commentText.length,
+				});
+				if (commentActor.startsWith("oms-") && commentActor !== "oms-singularity") continue;
+				void loop?.interruptAgent(taskId, commentText);
+			}
 		});
 
 		const baselineTasks = await opts.tasksClient.list(["--all", "--type", "task"]);
