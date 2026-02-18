@@ -26,6 +26,7 @@
     "typescript": "^5.7.0"
   },
   "dependencies": {
+    "@oh-my-pi/pi-natives": "latest",
     "@xterm/headless": "^6.0.0",
     "bun-pty": "^0.4.8",
     "marked": "^17.0.2",
