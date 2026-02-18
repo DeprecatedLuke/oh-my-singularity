@@ -251,6 +251,7 @@ export function normalizeIssue(raw: unknown): StoredIssue | null {
 	const comments = normalizeComments(raw.comments, id);
 	const dependsOnIds = new Set<string>(normalizeDependsOnIds(raw.depends_on_ids));
 	const dependencies = normalizeDependencies(raw.dependencies);
+	const references = normalizeDependsOnIds(raw.references);
 	for (const dependency of dependencies) {
 		if (dependency.id) dependsOnIds.add(dependency.id);
 	}
@@ -289,6 +290,7 @@ export function normalizeIssue(raw: unknown): StoredIssue | null {
 		created_at: createdAt,
 		updated_at: updatedAt,
 		comments,
+		references,
 		depends_on_ids: [...dependsOnIds],
 		dependencies,
 	};
@@ -353,6 +355,7 @@ export function cloneIssue(issue: StoredIssue): StoredIssue {
 		...issue,
 		labels: [...issue.labels],
 		comments: issue.comments.map(comment => ({ ...comment })),
+		references: normalizeDependsOnIds(issue.references),
 		depends_on_ids: [...issue.depends_on_ids],
 		dependencies: issue.dependencies.map(dep => ({ ...dep })),
 		slot_bindings: issue.slot_bindings ? { ...issue.slot_bindings } : undefined,
@@ -362,6 +365,7 @@ export function cloneIssue(issue: StoredIssue): StoredIssue {
 
 export function materializeIssue(issue: StoredIssue, state: StoreSnapshot): TaskIssue {
 	const out = cloneIssue(issue);
+	out.references = normalizeDependsOnIds(out.references);
 	const dependencyIds = new Set<string>();
 	for (const id of out.depends_on_ids) {
 		if (id !== out.id) dependencyIds.add(id);

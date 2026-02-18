@@ -55,6 +55,34 @@ function normalizeCreateDependsOn(value: TaskCreateInput["depends_on"]): string[
 	}
 	return dependsOn;
 }
+
+function normalizeCreateReferences(value: TaskCreateInput["references"]): string[] {
+	if (value === undefined) return [];
+	if (typeof value === "string") {
+		const reference = value.trim();
+		if (!reference) throw new Error("create has empty references entry");
+		return [reference];
+	}
+	if (!Array.isArray(value)) {
+		throw new Error("create has invalid references value");
+	}
+	const references: string[] = [];
+	const seen = new Set<string>();
+	for (const reference of value) {
+		if (typeof reference !== "string") {
+			throw new Error("create has invalid references entry");
+		}
+		const normalizedReference = reference.trim();
+		if (!normalizedReference) {
+			throw new Error("create has empty references entry");
+		}
+		if (seen.has(normalizedReference)) continue;
+		seen.add(normalizedReference);
+		references.push(normalizedReference);
+	}
+	return references;
+}
+
 export function createIssue(
 	state: StoreSnapshot,
 	actor: string,
@@ -67,6 +95,7 @@ export function createIssue(
 	const issueType = normalizeString(options?.type) ?? "task";
 	const normalizedLabels = normalizeLabels(options?.labels);
 	const dependsOn = normalizeCreateDependsOn(options?.depends_on);
+	const references = normalizeCreateReferences(options?.references);
 	if (issueType === "agent" && !normalizedLabels.includes("gt:agent")) {
 		normalizedLabels.push("gt:agent");
 	}
@@ -108,6 +137,7 @@ export function createIssue(
 		created_at: now,
 		updated_at: now,
 		comments: [],
+		references,
 		depends_on_ids: [],
 		dependencies: [],
 	};
@@ -299,6 +329,9 @@ export function createIssueBatch(
 
 export function updateIssue(state: StoreSnapshot, actor: string, id: string, patch: TaskUpdateInput): StoredIssue {
 	const issue = requireIssue(state, id);
+	if (normalizeToken(issue.status) === "closed") {
+		throw new Error(`Cannot update closed task ${issue.id}. Task is closed. Create a new task instead.`);
+	}
 	let changed = false;
 	const now = nowIso();
 
@@ -331,6 +364,11 @@ export function updateIssue(state: StoreSnapshot, actor: string, id: string, pat
 
 	if (Array.isArray(patch.labels)) {
 		issue.labels = normalizeLabels(patch.labels);
+		changed = true;
+	}
+
+	if (patch.references !== undefined) {
+		issue.references = normalizeCreateReferences(patch.references);
 		changed = true;
 	}
 
@@ -395,6 +433,9 @@ export function addLabelToIssue(state: StoreSnapshot, id: string, label: string)
 
 export function addCommentToIssue(state: StoreSnapshot, actor: string, id: string, text: string): TaskComment {
 	const issue = requireIssue(state, id);
+	if (normalizeToken(issue.status) === "closed") {
+		throw new Error(`Cannot add comment to closed task ${issue.id}. Task is closed. Create a new task instead.`);
+	}
 	const comment: TaskComment = {
 		id: state.nextCommentId++,
 		issue_id: issue.id,

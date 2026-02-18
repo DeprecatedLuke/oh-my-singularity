@@ -37,6 +37,7 @@ export interface TaskIssue {
 	updated_at: string;
 
 	comments?: TaskComment[];
+	references?: string[];
 
 	/** Task store adds fields over time; keep consumers tolerant. */
 	[key: string]: unknown;

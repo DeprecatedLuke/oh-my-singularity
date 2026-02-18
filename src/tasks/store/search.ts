@@ -39,7 +39,6 @@ export function searchIssues(issues: TaskIssue[], query: string, options?: TaskS
 	const text = query.trim().toLowerCase();
 	if (!text) return [];
 	const statusFilter = normalizeToken(options?.status ?? "all");
-	const includeComments = options?.includeComments === true;
 	const limit =
 		typeof options?.limit === "number" && Number.isFinite(options.limit) && options.limit > 0
 			? Math.trunc(options.limit)
@@ -54,7 +53,7 @@ export function searchIssues(issues: TaskIssue[], query: string, options?: TaskS
 
 	const matches = candidates.filter(issue => {
 		const parts = [issue.id, issue.title, issue.description ?? "", issue.acceptance_criteria ?? ""];
-		if (includeComments && Array.isArray(issue.comments)) {
+		if (Array.isArray(issue.comments)) {
 			for (const comment of issue.comments) {
 				if (typeof comment.text === "string") parts.push(comment.text);
 			}

@@ -102,6 +102,7 @@ export function ensureAgentIssue(state: StoreSnapshot, id: string, actor: string
 		created_at: now,
 		updated_at: now,
 		comments: [],
+		references: [],
 		depends_on_ids: [],
 		dependencies: [],
 		agent_state: "spawning",
