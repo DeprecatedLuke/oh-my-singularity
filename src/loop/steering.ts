@@ -378,10 +378,19 @@ export class SteeringManager {
 		}
 	}
 
-	async spawnFinisherAfterStoppingSteering(taskId: string, workerOutput: string): Promise<AgentInfo> {
+	async spawnFinisherAfterStoppingSteering(
+		taskId: string,
+		workerOutput: string,
+		resumeSessionId?: string,
+	): Promise<AgentInfo> {
+		const normalizedResumeSessionId =
+			typeof resumeSessionId === "string" && resumeSessionId.trim() ? resumeSessionId.trim() : undefined;
 		this.finisherSpawningTasks.add(taskId);
 		try {
 			await this.stopSteeringForFinisher(taskId);
+			if (normalizedResumeSessionId) {
+				return await this.spawner.spawnFinisherWithResume(taskId, normalizedResumeSessionId, workerOutput);
+			}
 			return await this.spawner.spawnFinisher(taskId, workerOutput);
 		} finally {
 			this.finisherSpawningTasks.delete(taskId);
@@ -599,7 +608,7 @@ export class SteeringManager {
 		}
 
 		try {
-			await steeringRpc.waitForAgentEnd(60_000);
+			await steeringRpc.waitForAgentEnd(300_000);
 		} catch {
 			await this.finishAgent(steering, "dead");
 			return;
@@ -803,7 +812,7 @@ export class SteeringManager {
 		});
 		let steeringWaitFailed = false;
 		try {
-			await steeringRpc.waitForAgentEnd(60_000);
+			await steeringRpc.waitForAgentEnd(300_000);
 		} catch {
 			steeringWaitFailed = true;
 		} finally {
@@ -922,7 +931,7 @@ export class SteeringManager {
 		}
 
 		try {
-			await issuerRpc.waitForAgentEnd(20_000);
+			await issuerRpc.waitForAgentEnd(100_000);
 		} catch {
 			await this.finishAgent(issuer, "dead");
 			return { action: "defer", message: null, reason: "resume issuer timed out" };

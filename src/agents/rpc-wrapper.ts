@@ -222,7 +222,7 @@ export class OmsRpcClient {
 		this.#suppressAgentEndCount += 1;
 	}
 
-	waitForAgentEnd(timeoutMs = 60_000): Promise<void> {
+	waitForAgentEnd(timeoutMs = 300_000): Promise<void> {
 		return new Promise((resolve, reject) => {
 			let settled = false;
 			let timer: Timer | null = null;

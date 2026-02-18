@@ -38,6 +38,118 @@ function buildEnv(extra: Record<string, string | undefined>): Record<string, str
 	return env;
 }
 
+async function formatParentTaskComments(tasksClient: TaskStoreClient, dependencyIds: string[]): Promise<string> {
+	const normalizedDependencyIds = [...new Set(dependencyIds.map(dependencyId => dependencyId.trim()).filter(Boolean))];
+	if (normalizedDependencyIds.length === 0) return "";
+
+	const dependencySections = (
+		await Promise.all(
+			normalizedDependencyIds.map(async dependencyId => {
+				try {
+					const comments = await tasksClient.comments(dependencyId);
+					if (!Array.isArray(comments) || comments.length === 0) return "";
+
+					const lines: string[] = [`**Dependency: ${dependencyId}**`];
+					for (const comment of comments) {
+						const author =
+							typeof comment.author === "string" && comment.author.trim() ? comment.author.trim() : "unknown";
+						const timestamp =
+							typeof comment.created_at === "string" && comment.created_at.trim()
+								? comment.created_at.trim()
+								: "unknown time";
+						const text = typeof comment.text === "string" ? comment.text.trim() : "";
+						if (!text) {
+							lines.push(`- ${author} (${timestamp}):`);
+							continue;
+						}
+
+						const textLines = text.replace(/\r\n?/g, "\n").split("\n");
+						const [firstLine = "", ...remainingLines] = textLines;
+						lines.push(`- ${author} (${timestamp}): ${firstLine}`);
+						for (const line of remainingLines) {
+							lines.push(`  ${line}`);
+						}
+					}
+
+					return lines.join("\n");
+				} catch (err) {
+					logger.debug("agents/spawner.ts: failed to fetch dependency comments for prompt context (non-fatal)", {
+						dependencyId,
+						err,
+					});
+					return "";
+				}
+			}),
+		)
+	).filter(Boolean);
+
+	if (dependencySections.length === 0) return "";
+	return ["## Parent Task Context", "", ...dependencySections].join("\n\n");
+}
+
+async function formatReferencedTaskComments(tasksClient: TaskStoreClient, referenceIds: string[]): Promise<string> {
+	const normalizedReferenceIds = [...new Set(referenceIds.map(referenceId => referenceId.trim()).filter(Boolean))];
+	if (normalizedReferenceIds.length === 0) return "";
+
+	const referenceSections = (
+		await Promise.all(
+			normalizedReferenceIds.map(async referenceId => {
+				try {
+					const [referencedIssue, comments] = await Promise.all([
+						tasksClient.show(referenceId),
+						tasksClient.comments(referenceId),
+					]);
+
+					const lines: string[] = [`**Reference: ${referenceId}**`];
+					const title = typeof referencedIssue.title === "string" ? referencedIssue.title.trim() : "";
+					if (title) lines.push(`Title: ${title}`);
+					const description =
+						typeof referencedIssue.description === "string" ? referencedIssue.description.trim() : "";
+					if (description) {
+						lines.push("Description:");
+						for (const line of description.replace(/\r\n?/g, "\n").split("\n")) {
+							lines.push(`  ${line}`);
+						}
+					}
+
+					if (!Array.isArray(comments) || comments.length === 0) return lines.join("\n");
+					for (const comment of comments) {
+						const author =
+							typeof comment.author === "string" && comment.author.trim() ? comment.author.trim() : "unknown";
+						const timestamp =
+							typeof comment.created_at === "string" && comment.created_at.trim()
+								? comment.created_at.trim()
+								: "unknown time";
+						const text = typeof comment.text === "string" ? comment.text.trim() : "";
+						if (!text) {
+							lines.push(`- ${author} (${timestamp}):`);
+							continue;
+						}
+
+						const textLines = text.replace(/\r\n?/g, "\n").split("\n");
+						const [firstLine = "", ...remainingLines] = textLines;
+						lines.push(`- ${author} (${timestamp}): ${firstLine}`);
+						for (const line of remainingLines) {
+							lines.push(`  ${line}`);
+						}
+					}
+
+					return lines.join("\n");
+				} catch (err) {
+					logger.debug("agents/spawner.ts: failed to fetch referenced task context for prompt (non-fatal)", {
+						referenceId,
+						err,
+					});
+					return "";
+				}
+			}),
+		)
+	).filter(Boolean);
+
+	if (referenceSections.length === 0) return "";
+	return ["## Referenced Task Context", "", ...referenceSections].join("\n\n");
+}
+
 function buildTaskPrompt(opts: {
 	role: AgentRole;
 	task: {
@@ -74,21 +186,6 @@ function buildTaskPrompt(opts: {
 	}
 
 	return lines.join("\n");
-}
-
-function createUserPromptEvent(promptText: string) {
-	return {
-		type: "rpc",
-		ts: Date.now(),
-		name: "message_end",
-		data: {
-			type: "message_end",
-			message: {
-				role: "user",
-				content: promptText,
-			},
-		},
-	};
 }
 
 function isActiveStatus(status: AgentInfo["status"]): boolean {
@@ -325,6 +422,32 @@ export class AgentSpawner {
 			rpc.start();
 
 			const task = await this.tasksClient.show(taskId);
+			const dependsOnIds = Array.isArray(task.depends_on_ids)
+				? task.depends_on_ids
+						.filter(
+							(dependencyId): dependencyId is string =>
+								typeof dependencyId === "string" && dependencyId.trim().length > 0,
+						)
+						.map(dependencyId => dependencyId.trim())
+				: [];
+			const parentComments = dependsOnIds.length
+				? await formatParentTaskComments(this.tasksClient, dependsOnIds)
+				: "";
+			const referenceIds = Array.isArray(task.references)
+				? task.references
+						.filter(
+							(referenceId): referenceId is string =>
+								typeof referenceId === "string" && referenceId.trim().length > 0,
+						)
+						.map(referenceId => referenceId.trim())
+				: [];
+			const referencedTaskComments = referenceIds.length
+				? await formatReferencedTaskComments(this.tasksClient, referenceIds)
+				: "";
+			const kickoffGuidance = opts?.kickoffMessage?.trim()
+				? `## Implementation Guidance\n\n${opts.kickoffMessage.trim()}`
+				: "";
+			const extra = [parentComments, referencedTaskComments, kickoffGuidance].filter(Boolean).join("\n\n");
 			const promptText = buildTaskPrompt({
 				role: kind,
 				task: {
@@ -335,15 +458,12 @@ export class AgentSpawner {
 					issueType: task.issue_type,
 					labels: task.labels,
 				},
-				extra: opts?.kickoffMessage?.trim()
-					? `## Implementation Guidance\n\n${opts.kickoffMessage.trim()}`
-					: undefined,
+				extra: extra || undefined,
 			});
 			await rpc.prompt(promptText);
 
-			await this.tasksClient.setSlot(tasksAgentId, "hook", taskId);
+			await this.tasksClient.setSlot(tasksAgentId, "callbackHandler", taskId);
 			await this.tasksClient.setAgentState(tasksAgentId, "working");
-
 			const info: AgentInfo = {
 				id: agentId,
 				role: kind,
@@ -359,9 +479,8 @@ export class AgentSpawner {
 				thinking: roleCfg.thinking,
 				sessionId: this.getAgentSessionId(rpc),
 			};
-
 			this.registry.register(info);
-			this.registry.pushEvent(agentId, createUserPromptEvent(promptText));
+			this.registry.pushEvent(info.id, { type: "initial_prompt", text: promptText, ts: Date.now() });
 			return info;
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
@@ -414,7 +533,23 @@ export class AgentSpawner {
 			return await this.spawnFinisherInternal(taskId, workerOutput);
 		});
 	}
-	private async spawnFinisherInternal(taskId: string, workerOutput: string): Promise<AgentInfo> {
+
+	async spawnFinisherWithResume(taskId: string, sessionId: string, kickoffMessage?: string): Promise<AgentInfo> {
+		return await this.withSpawnGuard("finisher", taskId, async () => {
+			return await this.spawnFinisherInternal(taskId, "", sessionId, kickoffMessage);
+		});
+	}
+
+	private async spawnFinisherInternal(
+		taskId: string,
+		workerOutput: string,
+		resumeSessionId?: string,
+		kickoffMessage?: string,
+	): Promise<AgentInfo> {
+		const normalizedResumeSessionId =
+			typeof resumeSessionId === "string" && resumeSessionId.trim() ? resumeSessionId.trim() : undefined;
+		const normalizedKickoffMessage =
+			typeof kickoffMessage === "string" && kickoffMessage.trim() ? kickoffMessage.trim() : "";
 		const spawnedAt = Date.now();
 		const tasksAgentId = await this.tasksClient.createAgent(`finisher-${taskId}`);
 		await this.tasksClient.setAgentState(tasksAgentId, "spawning");
@@ -427,6 +562,7 @@ export class AgentSpawner {
 			roleCfg.thinking,
 			...(roleCfg.model ? ["--model", roleCfg.model] : []),
 			"--no-pty",
+			...(normalizedResumeSessionId ? ["--resume", normalizedResumeSessionId] : []),
 			"--extension",
 			this.ompCrashLoggerExtensionPath,
 			"--extension",
@@ -457,32 +593,42 @@ export class AgentSpawner {
 			rpc.start();
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
+			const action = normalizedResumeSessionId ? "resume" : "spawn";
 			await this.tasksClient.comment(
 				taskId,
-				`Failed to spawn finisher RPC agent for task ${taskId}.\n` +
+				`Failed to ${action} finisher RPC agent for task ${taskId}.\n` +
 					`tasksAgentId: ${tasksAgentId}\n` +
+					`sessionId: ${normalizedResumeSessionId ?? "(none)"}\n` +
 					`error: ${message}`,
 			);
 			await this.tasksClient.setAgentState(tasksAgentId, "failed");
 			throw err;
 		}
 
-		const task = await this.tasksClient.show(taskId);
-		const finisherExtra = `Implementation output:\n\n${workerOutput?.trim() ? workerOutput.trim() : "(none)"}`;
-		const promptText = buildTaskPrompt({
-			role: "finisher",
-			task: {
-				id: task.id,
-				title: task.title,
-				description: task.description,
-				acceptance: task.acceptance_criteria,
-				issueType: task.issue_type,
-				labels: task.labels,
-			},
-			extra: finisherExtra,
-		});
-		await rpc.prompt(promptText);
-		await this.tasksClient.setSlot(tasksAgentId, "hook", taskId);
+		let promptText: string | null = null;
+		if (normalizedResumeSessionId) {
+			if (normalizedKickoffMessage) {
+				promptText = normalizedKickoffMessage;
+				await rpc.prompt(promptText);
+			}
+		} else {
+			const task = await this.tasksClient.show(taskId);
+			const finisherExtra = `Implementation output:\n\n${workerOutput?.trim() ? workerOutput.trim() : "(none)"}`;
+			promptText = buildTaskPrompt({
+				role: "finisher",
+				task: {
+					id: task.id,
+					title: task.title,
+					description: task.description,
+					acceptance: task.acceptance_criteria,
+					issueType: task.issue_type,
+					labels: task.labels,
+				},
+				extra: finisherExtra,
+			});
+			await rpc.prompt(promptText);
+		}
+		await this.tasksClient.setSlot(tasksAgentId, "callbackHandler", taskId);
 		await this.tasksClient.setAgentState(tasksAgentId, "working");
 		const info: AgentInfo = {
 			id: agentId,
@@ -497,10 +643,12 @@ export class AgentSpawner {
 			rpc,
 			model: roleCfg.model,
 			thinking: roleCfg.thinking,
-			sessionId: this.getAgentSessionId(rpc),
+			sessionId: this.getAgentSessionId(rpc) ?? normalizedResumeSessionId,
 		};
 		this.registry.register(info);
-		this.registry.pushEvent(agentId, createUserPromptEvent(promptText));
+		if (promptText) {
+			this.registry.pushEvent(info.id, { type: "initial_prompt", text: promptText, ts: Date.now() });
+		}
 		return info;
 	}
 
@@ -588,6 +736,30 @@ export class AgentSpawner {
 			}
 		} else {
 			const task = await this.tasksClient.show(taskId);
+			const dependsOnIds = Array.isArray(task.depends_on_ids)
+				? task.depends_on_ids
+						.filter(
+							(dependencyId): dependencyId is string =>
+								typeof dependencyId === "string" && dependencyId.trim().length > 0,
+						)
+						.map(dependencyId => dependencyId.trim())
+				: [];
+			const parentComments = dependsOnIds.length
+				? await formatParentTaskComments(this.tasksClient, dependsOnIds)
+				: "";
+			const referenceIds = Array.isArray(task.references)
+				? task.references
+						.filter(
+							(referenceId): referenceId is string =>
+								typeof referenceId === "string" && referenceId.trim().length > 0,
+						)
+						.map(referenceId => referenceId.trim())
+				: [];
+			const referencedTaskComments = referenceIds.length
+				? await formatReferencedTaskComments(this.tasksClient, referenceIds)
+				: "";
+			const kickoffContext = kickoffMessage?.trim() ? `## Kickoff Context\n\n${kickoffMessage.trim()}` : "";
+			const extra = [parentComments, referencedTaskComments, kickoffContext].filter(Boolean).join("\n\n");
 			promptText = buildTaskPrompt({
 				role: "issuer",
 				task: {
@@ -598,11 +770,11 @@ export class AgentSpawner {
 					issueType: task.issue_type,
 					labels: task.labels,
 				},
-				extra: kickoffMessage?.trim() ? `## Kickoff Context\n\n${kickoffMessage.trim()}` : undefined,
+				extra: extra || undefined,
 			});
 			await rpc.prompt(promptText);
 		}
-		await this.tasksClient.setSlot(tasksAgentId, "hook", taskId);
+		await this.tasksClient.setSlot(tasksAgentId, "callbackHandler", taskId);
 		await this.tasksClient.setAgentState(tasksAgentId, "working");
 		const info: AgentInfo = {
 			id: agentId,
@@ -620,7 +792,9 @@ export class AgentSpawner {
 			sessionId: this.getAgentSessionId(rpc) ?? normalizedResumeSessionId,
 		};
 		this.registry.register(info);
-		if (promptText) this.registry.pushEvent(agentId, createUserPromptEvent(promptText));
+		if (promptText?.trim()) {
+			this.registry.pushEvent(info.id, { type: "initial_prompt", text: promptText, ts: Date.now() });
+		}
 		return info;
 	}
 
@@ -718,7 +892,7 @@ export class AgentSpawner {
 		};
 
 		this.registry.register(info);
-		this.registry.pushEvent(agentId, createUserPromptEvent(promptText));
+		this.registry.pushEvent(info.id, { type: "initial_prompt", text: promptText, ts: Date.now() });
 		return info;
 	}
 
@@ -833,7 +1007,7 @@ export class AgentSpawner {
 		};
 
 		this.registry.register(info);
-		this.registry.pushEvent(agentId, createUserPromptEvent(promptText));
+		this.registry.pushEvent(info.id, { type: "initial_prompt", text: promptText, ts: Date.now() });
 		return info;
 	}
 
@@ -924,7 +1098,7 @@ export class AgentSpawner {
 		};
 
 		this.registry.register(info);
-		this.registry.pushEvent(agentId, createUserPromptEvent(promptText));
+		this.registry.pushEvent(info.id, { type: "initial_prompt", text: promptText, ts: Date.now() });
 		return info;
 	}
 }

@@ -6,6 +6,21 @@ import { asRecord, logger } from "../utils";
 import * as UsageTracking from "./usage";
 
 type LogLevel = "debug" | "info" | "warn" | "error";
+type FinisherLifecycleAdvanceRecord = {
+	taskId: string;
+	action: "worker" | "issuer" | "defer";
+	message: string | null;
+	reason: string | null;
+	agentId: string | null;
+	ts: number;
+};
+
+type FinisherCloseRecord = {
+	taskId: string;
+	reason: string | null;
+	agentId: string | null;
+	ts: number;
+};
 
 function isTerminalStatus(status: string | undefined): boolean {
 	return status === "done" || status === "aborted" || status === "stopped" || status === "dead";
@@ -59,11 +74,22 @@ export class RpcHandlerManager {
 		files?: string[];
 		cause?: string;
 	}) => Promise<Record<string, unknown>>;
-	private readonly spawnFinisherAfterStoppingSteering: (taskId: string, workerOutput: string) => Promise<AgentInfo>;
+	private readonly spawnFinisherAfterStoppingSteering: (
+		taskId: string,
+		workerOutput: string,
+		resumeSessionId?: string,
+	) => Promise<AgentInfo>;
 	private readonly getLastAssistantText: (agent: AgentInfo) => Promise<string>;
 	private readonly logAgentStart: (startedBy: string, agent: AgentInfo, context?: string) => void;
 	private readonly logAgentFinished: (agent: AgentInfo, explicitText?: string) => Promise<void>;
 	private readonly writeAgentCrashLog: (agent: AgentInfo, reason: string, event?: unknown) => void;
+	private readonly takeFinisherLifecycleAdvance: (taskId: string) => FinisherLifecycleAdvanceRecord | null;
+	private readonly takeFinisherCloseRecord: (taskId: string) => FinisherCloseRecord | null;
+	private readonly spawnWorkerFromFinisherAdvance: (
+		taskId: string,
+		kickoffMessage?: string | null,
+	) => Promise<AgentInfo>;
+	private readonly kickoffIssuerFromFinisherAdvance: (taskId: string, kickoffMessage?: string | null) => Promise<void>;
 
 	private readonly rpcHandlersAttached = new Set<string>();
 
@@ -81,11 +107,19 @@ export class RpcHandlerManager {
 			files?: string[];
 			cause?: string;
 		}) => Promise<Record<string, unknown>>;
-		spawnFinisherAfterStoppingSteering: (taskId: string, workerOutput: string) => Promise<AgentInfo>;
+		spawnFinisherAfterStoppingSteering: (
+			taskId: string,
+			workerOutput: string,
+			resumeSessionId?: string,
+		) => Promise<AgentInfo>;
 		getLastAssistantText: (agent: AgentInfo) => Promise<string>;
 		logAgentStart: (startedBy: string, agent: AgentInfo, context?: string) => void;
 		logAgentFinished: (agent: AgentInfo, explicitText?: string) => Promise<void>;
 		writeAgentCrashLog: (agent: AgentInfo, reason: string, event?: unknown) => void;
+		takeFinisherLifecycleAdvance: (taskId: string) => FinisherLifecycleAdvanceRecord | null;
+		takeFinisherCloseRecord: (taskId: string) => FinisherCloseRecord | null;
+		spawnWorkerFromFinisherAdvance: (taskId: string, kickoffMessage?: string | null) => Promise<AgentInfo>;
+		kickoffIssuerFromFinisherAdvance: (taskId: string, kickoffMessage?: string | null) => Promise<void>;
 	}) {
 		this.registry = opts.registry;
 		this.tasksClient = opts.tasksClient;
@@ -100,6 +134,10 @@ export class RpcHandlerManager {
 		this.logAgentStart = opts.logAgentStart;
 		this.logAgentFinished = opts.logAgentFinished;
 		this.writeAgentCrashLog = opts.writeAgentCrashLog;
+		this.takeFinisherLifecycleAdvance = opts.takeFinisherLifecycleAdvance;
+		this.takeFinisherCloseRecord = opts.takeFinisherCloseRecord;
+		this.spawnWorkerFromFinisherAdvance = opts.spawnWorkerFromFinisherAdvance;
+		this.kickoffIssuerFromFinisherAdvance = opts.kickoffIssuerFromFinisherAdvance;
 	}
 	private debounceRpcDirty(): void {
 		if (!this.onDirty) return;
@@ -255,11 +293,233 @@ export class RpcHandlerManager {
 		}
 
 		if (agent.role === "finisher") {
+			const taskId = typeof agent.taskId === "string" ? agent.taskId.trim() : "";
 			const finisherOutput = await this.getLastAssistantText(agent);
+			const finisherSessionId =
+				typeof current?.sessionId === "string" && current.sessionId.trim()
+					? current.sessionId.trim()
+					: typeof agent.sessionId === "string" && agent.sessionId.trim()
+						? agent.sessionId.trim()
+						: undefined;
 			await this.logAgentFinished(agent, finisherOutput);
 			await this.finishAgent(agent, "done");
+			if (!taskId) {
+				this.wake();
+				return;
+			}
+			const advance = this.takeFinisherLifecycleAdvance(taskId);
+			const closeRecord = this.takeFinisherCloseRecord(taskId);
+			const closeTs = closeRecord?.ts ?? -1;
+			const advanceTs = advance?.ts ?? -1;
+			if (closeRecord && closeTs >= advanceTs) {
+				this.loopLog(`Finisher exit for ${taskId}: close marker consumed`, "info", {
+					taskId,
+					agentId: closeRecord.agentId,
+				});
+				this.wake();
+				return;
+			}
+			if (advance) {
+				if (advance.action === "worker") {
+					try {
+						const worker = await this.spawnWorkerFromFinisherAdvance(taskId, advance.message);
+						this.logAgentStart(agent.id, worker, advance.message ?? undefined);
+						this.loopLog(`Finisher lifecycle advanced ${taskId} to worker`, "info", {
+							taskId,
+							reason: advance.reason,
+						});
+					} catch (err) {
+						this.loopLog(
+							`Finisher lifecycle worker spawn failed for ${taskId}: ${err instanceof Error ? err.message : String(err)}`,
+							"warn",
+							{ taskId },
+						);
+					}
+					this.wake();
+					return;
+				}
+				if (advance.action === "issuer") {
+					try {
+						await this.kickoffIssuerFromFinisherAdvance(taskId, advance.message);
+						this.loopLog(`Finisher lifecycle advanced ${taskId} to issuer`, "info", {
+							taskId,
+							reason: advance.reason,
+						});
+					} catch (err) {
+						this.loopLog(
+							`Finisher lifecycle issuer kickoff failed for ${taskId}: ${err instanceof Error ? err.message : String(err)}`,
+							"warn",
+							{ taskId },
+						);
+					}
+					this.wake();
+					return;
+				}
+				const deferReason = advance.reason || "Deferred by finisher";
+				await this.blockTaskFromFinisherAdvance(taskId, deferReason, advance.message);
+				this.wake();
+				return;
+			}
+
+			try {
+				const recoveryContext = finisherSessionId
+					? await this.buildFinisherResumeKickoffContext(taskId, finisherOutput, finisherSessionId)
+					: this.buildFinisherRecoveryContext(finisherOutput);
+				const finisher = await this.spawnFinisherAfterStoppingSteering(taskId, recoveryContext, finisherSessionId);
+				this.attachRpcHandlers(finisher);
+				this.logAgentStart(agent.id, finisher, "finisher retry: exited without close_task or advance_lifecycle");
+				this.loopLog(`Finisher exited without lifecycle signal for ${taskId}; respawned finisher`, "warn", {
+					taskId,
+				});
+			} catch (err) {
+				this.loopLog(
+					`Finisher sticky respawn failed for ${taskId}: ${err instanceof Error ? err.message : String(err)}`,
+					"warn",
+					{ taskId },
+				);
+			}
 			this.wake();
+			return;
 		}
+	}
+
+	private async blockTaskFromFinisherAdvance(taskId: string, reason: string, message: string | null): Promise<void> {
+		try {
+			await this.tasksClient.updateStatus(taskId, "blocked");
+		} catch (err) {
+			this.loopLog(
+				`Failed to set blocked status for ${taskId}: ${err instanceof Error ? err.message : String(err)}`,
+				"warn",
+				{ taskId },
+			);
+		}
+
+		try {
+			await this.tasksClient.comment(
+				taskId,
+				`Blocked by finisher advance_lifecycle. ${reason}${message ? `\nmessage: ${message}` : ""}`,
+			);
+		} catch (err) {
+			logger.debug("loop/rpc-handlers.ts: failed to post finisher defer comment (non-fatal)", { err });
+		}
+
+		this.loopLog(`Finisher lifecycle deferred ${taskId}: ${reason}`, "warn", {
+			taskId,
+			reason,
+		});
+	}
+
+	private async buildFinisherResumeKickoffContext(
+		taskId: string,
+		previousOutput: string,
+		finisherSessionId: string,
+	): Promise<string> {
+		const taskLookup = (await this.tasksClient.show(taskId).catch(() => null)) as Record<string, unknown> | null;
+		const task =
+			taskLookup ??
+			({
+				id: taskId,
+				title: taskId,
+				status: "unknown",
+				issue_type: "task",
+				labels: [],
+			} as Record<string, unknown>);
+
+		const lines = [
+			"[SYSTEM RESUME]",
+			"Your previous finisher process exited without calling close_task or advance_lifecycle.",
+			"Continue from the previous session history for this task.",
+			`Session: ${finisherSessionId}`,
+			"If complete, call close_task.",
+			"If more work is needed, call advance_lifecycle with action worker, issuer, or defer.",
+			"Then stop.",
+		];
+
+		const status = typeof task.status === "string" && task.status.trim() ? task.status.trim() : "unknown";
+		const assignee = typeof task.assignee === "string" && task.assignee.trim() ? task.assignee.trim() : "unassigned";
+		const priority =
+			typeof task.priority === "number" && Number.isFinite(task.priority) ? `${task.priority}` : "unknown";
+		const title = typeof task.title === "string" && task.title.trim() ? task.title.trim() : taskId;
+		const issueType =
+			typeof task.issue_type === "string" && task.issue_type.trim() ? task.issue_type.trim() : "unknown";
+		const labelsRaw = Array.isArray(task.labels)
+			? task.labels.map(label => (typeof label === "string" ? label.trim() : "")).filter(Boolean)
+			: [];
+
+		lines.push(
+			"",
+			"Task state:",
+			`- id: ${taskId}`,
+			`- title: ${title}`,
+			`- status: ${status}`,
+			`- assignee: ${assignee}`,
+			`- priority: ${priority}`,
+			`- issue_type: ${issueType}`,
+		);
+		if (labelsRaw.length > 0) {
+			lines.push(`- labels: ${labelsRaw.join(", ")}`);
+		}
+
+		let comments: unknown[] = [];
+		if (Array.isArray(task.comments)) {
+			comments = task.comments;
+		} else {
+			comments = await this.tasksClient.comments(taskId).catch(() => []);
+		}
+
+		const formattedComments = comments
+			.map(entry => asRecord(entry))
+			.filter((entry): entry is Record<string, unknown> => !!entry)
+			.map(entry => {
+				const author = typeof entry.author === "string" && entry.author.trim() ? entry.author.trim() : "unknown";
+				const createdAt =
+					typeof entry.created_at === "string" && entry.created_at.trim() ? entry.created_at.trim() : "unknown";
+				const text = typeof entry.text === "string" && entry.text.trim() ? entry.text.trim() : "";
+				return { author, createdAt, text };
+			})
+			.filter(entry => entry.text || entry.author !== "unknown");
+
+		const finisherComments = formattedComments.filter(entry => entry.author.toLowerCase().includes("finisher"));
+		const commentTrail = (finisherComments.length > 0 ? finisherComments : formattedComments)
+			.slice(-6)
+			.flatMap(entry => {
+				const commentLines: string[] = [`- ${entry.author} (${entry.createdAt}):`];
+				if (!entry.text) return commentLines;
+				for (const line of entry.text.replace(/\r\n?/g, "\n").split("\n")) {
+					commentLines.push(`  ${line}`);
+				}
+				return commentLines;
+			});
+
+		if (commentTrail.length > 0) {
+			lines.push("", "Recent task comments:");
+			for (const line of commentTrail) {
+				lines.push(line);
+			}
+		}
+
+		const trimmedOutput = previousOutput.trim();
+		if (trimmedOutput) {
+			lines.push("", "Previous finisher output:", trimmedOutput);
+		}
+
+		return lines.join("\n");
+	}
+
+	private buildFinisherRecoveryContext(previousOutput: string): string {
+		const lines = [
+			"[SYSTEM RECOVERY]",
+			"Your previous finisher process exited without calling close_task or advance_lifecycle.",
+			"Resume lifecycle handling for this task.",
+			"If complete, call close_task.",
+			"If more work is needed, call advance_lifecycle with action worker, issuer, or defer.",
+			"Then stop.",
+		];
+		const trimmedOutput = previousOutput.trim();
+		if (trimmedOutput) {
+			lines.push("", "Previous finisher output:", trimmedOutput);
+		}
+		return lines.join("\n");
 	}
 
 	private async onRpcExit(agent: AgentInfo, event: unknown): Promise<void> {
