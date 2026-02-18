@@ -5,7 +5,7 @@
  * The outer harness can load different extension modules per agent role to
  * enforce task permissions via tool availability.
  */
-import net from "node:net";
+
 import { truncateToWidth } from "@oh-my-pi/pi-natives";
 import type { TaskComment, TaskIssue } from "../../tasks/types";
 import { sanitizeRenderableText, wrapLine } from "../../tui/components/text-formatter";
@@ -19,7 +19,7 @@ import {
 	TASK_LIST_ACTIONS,
 	TASK_SINGLE_ACTIONS,
 } from "../../tui/components/tool-renderer";
-import { logger } from "../../utils";
+import { ipcError, requireSockPath, sendIpc } from "./ipc-client";
 import { renderToolCall, renderToolResult } from "./tool-renderers";
 import type {
 	ExtensionAPI,
@@ -154,10 +154,7 @@ export function makeTasksExtension(opts: TasksExtensionOptions) {
 					throw new Error(message);
 				}
 
-				const sockPath = process.env.OMS_SINGULARITY_SOCK ?? "";
-				if (!sockPath.trim()) {
-					throw new Error("tasks: OMS socket not configured (OMS_SINGULARITY_SOCK is empty).");
-				}
+				const sockPath = requireSockPath();
 
 				const actor = process.env.TASKS_ACTOR ?? `oms-${role}`;
 				const defaultTaskId =
@@ -166,7 +163,7 @@ export function makeTasksExtension(opts: TasksExtensionOptions) {
 						: null;
 
 				try {
-					const response = await sendRequest(
+					const response = await sendIpc(
 						sockPath,
 						{
 							type: "tasks_request",
@@ -179,20 +176,13 @@ export function makeTasksExtension(opts: TasksExtensionOptions) {
 						30_000,
 					);
 
-					if (!response || response.ok !== true) {
-						const message =
-							typeof response?.error === "string" && response.error.trim()
-								? response.error.trim()
-								: "tasks request failed";
-						throw new Error(`tasks: ${message}`);
-					}
-
+					const error = ipcError(response, "tasks request failed");
+					if (error) throw new Error(`tasks: ${error}`);
 					const payload = response.data ?? null;
 					const text =
 						payload === null
 							? `tasks ${action}: ok (no output)`
 							: `tasks ${action}: ok\n${JSON.stringify(payload, null, 2)}`;
-
 					return {
 						content: [{ type: "text", text }],
 						details: payload,
@@ -691,58 +681,6 @@ function padInline(text: string, width: number): string {
 function formatPriority(value: unknown): string {
 	if (typeof value !== "number" || !Number.isFinite(value)) return "?";
 	return String(Math.trunc(value));
-}
-function sendRequest(sockPath: string, payload: unknown, timeoutMs = 1500): Promise<UnknownRecord> {
-	return new Promise((resolve, reject) => {
-		let settled = false;
-		let responseText = "";
-
-		const client = net.createConnection({ path: sockPath }, () => {
-			client.write(`${JSON.stringify(payload)}\n`);
-		});
-
-		client.setEncoding("utf8");
-		client.on("data", chunk => {
-			responseText += chunk;
-		});
-
-		const timeout = setTimeout(() => {
-			if (settled) return;
-			settled = true;
-			try {
-				client.destroy();
-			} catch (err) {
-				logger.debug("agents/extensions/tasks-tool.ts: best-effort failure after client.destroy();", { err });
-			}
-			reject(new Error(`Timeout connecting to ${sockPath}`));
-		}, timeoutMs);
-
-		client.on("error", err => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-			reject(err);
-		});
-
-		client.on("close", () => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-
-			const trimmed = responseText.trim();
-			if (!trimmed || trimmed === "ok") {
-				resolve({ ok: true, data: null });
-				return;
-			}
-
-			try {
-				const parsed = JSON.parse(trimmed);
-				resolve(toRecord(parsed, { ok: true, data: parsed }));
-			} catch {
-				resolve({ ok: true, data: trimmed });
-			}
-		});
-	});
 }
 
 function toRecord(value: unknown, fallback: UnknownRecord): UnknownRecord {

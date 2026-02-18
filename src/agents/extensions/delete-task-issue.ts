@@ -1,5 +1,4 @@
-import net from "node:net";
-import { logger } from "../../utils";
+import { requireSockPath, sendIpc } from "./ipc-client";
 import { renderToolCall, renderToolResult } from "./tool-renderers";
 import type { ExtensionAPI, UnknownRecord } from "./types";
 
@@ -43,10 +42,7 @@ export default async function deleteTaskIssueExtension(api: ExtensionAPI): Promi
 		},
 		renderResult: (result, options, theme) => renderToolResult("Delete Task Issue", result, options, theme),
 		execute: async (_toolCallId, params) => {
-			const sockPath = process.env.OMS_SINGULARITY_SOCK ?? "";
-			if (!sockPath.trim()) {
-				throw new Error("OMS socket not configured (OMS_SINGULARITY_SOCK is empty).");
-			}
+			const sockPath = requireSockPath();
 
 			const id = typeof params?.id === "string" ? params.id.trim() : "";
 			if (!id) {
@@ -63,7 +59,7 @@ export default async function deleteTaskIssueExtension(api: ExtensionAPI): Promi
 			}
 
 			try {
-				await sendRequest(
+				await sendIpc(
 					sockPath,
 					{
 						type: "stop_agents_for_task",
@@ -130,7 +126,7 @@ export default async function deleteTaskIssueExtension(api: ExtensionAPI): Promi
 }
 
 async function sendTasksRequest(sockPath: string, payload: UnknownRecord): Promise<TasksRequestResult> {
-	const response = await sendRequest(
+	const response = await sendIpc(
 		sockPath,
 		{
 			type: "tasks_request",
@@ -157,64 +153,4 @@ async function sendTasksRequest(sockPath: string, payload: UnknownRecord): Promi
 		error: null,
 		response,
 	};
-}
-
-function sendRequest(sockPath: string, payload: unknown, timeoutMs = 1500): Promise<UnknownRecord> {
-	return new Promise((resolve, reject) => {
-		let settled = false;
-		let responseText = "";
-
-		const client = net.createConnection({ path: sockPath }, () => {
-			client.write(`${JSON.stringify(payload)}\n`);
-		});
-
-		client.setEncoding("utf8");
-		client.on("data", chunk => {
-			responseText += chunk;
-		});
-
-		const timeout = setTimeout(() => {
-			if (settled) return;
-			settled = true;
-			try {
-				client.destroy();
-			} catch (err) {
-				logger.debug("agents/extensions/delete-task-issue.ts: best-effort failure after client.destroy();", {
-					err,
-				});
-			}
-			reject(new Error(`Timeout connecting to ${sockPath}`));
-		}, timeoutMs);
-
-		client.on("error", err => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-			reject(err);
-		});
-
-		client.on("close", () => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-
-			const trimmed = responseText.trim();
-			if (!trimmed || trimmed === "ok") {
-				resolve({ ok: true, data: null });
-				return;
-			}
-
-			try {
-				const parsed = JSON.parse(trimmed);
-				resolve(asUnknownRecord(parsed, { ok: true, data: parsed }));
-			} catch {
-				resolve({ ok: true, data: trimmed });
-			}
-		});
-	});
-}
-
-function asUnknownRecord(value: unknown, fallback: UnknownRecord): UnknownRecord {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return fallback;
-	return value as UnknownRecord;
 }

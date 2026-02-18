@@ -96,7 +96,11 @@ export class PipelineManager {
 		hasPendingInterruptKickoff: (taskId: string) => boolean;
 		takePendingInterruptKickoff: (taskId: string) => string | null;
 		hasFinisherTakeover: (taskId: string) => boolean;
-		spawnFinisherAfterStoppingSteering: (taskId: string, workerOutput: string) => Promise<AgentInfo>;
+		spawnFinisherAfterStoppingSteering: (
+			taskId: string,
+			workerOutput: string,
+			resumeSessionId?: string,
+		) => Promise<AgentInfo>;
 		isRunning: () => boolean;
 		isPaused: () => boolean;
 	}) {

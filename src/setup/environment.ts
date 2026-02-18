@@ -90,8 +90,8 @@ function mergeOmsConfigOverrides(base: OmsConfigOverride, patch: OmsConfigOverri
 	}
 
 	if (roles && Object.keys(roles).length > 0) {
-		const mergedRoles: NonNullable<OmsConfigOverride["roles"]> = { ...(merged.roles ?? {}) };
-		for (const roleKey of Object.keys(roles)) {
+		const mergedRoles = { ...(merged.roles ?? {}) } as NonNullable<OmsConfigOverride["roles"]>;
+		for (const roleKey of Object.keys(roles) as Array<keyof typeof roles>) {
 			const rolePatch = roles[roleKey];
 			if (!rolePatch) continue;
 			mergedRoles[roleKey] = { ...(mergedRoles[roleKey] ?? {}), ...rolePatch };

@@ -1,7 +1,6 @@
-import net from "node:net";
-import { logger } from "../../utils";
+import { ipcError, requireSockPath, sendIpc } from "./ipc-client";
 import { renderToolCall, renderToolResult } from "./tool-renderers";
-import type { ExtensionAPI, UnknownRecord } from "./types";
+import type { ExtensionAPI } from "./types";
 
 /**
  * OMS extension for steering agents.
@@ -25,10 +24,7 @@ export default async function readTaskMessageHistoryExtension(api: ExtensionAPI)
 		mergeCallAndResult: true,
 		renderCall: (_args, theme, options) => renderToolCall("List Task Agents", ["no args"], theme, options),
 		execute: async () => {
-			const sockPath = process.env.OMS_SINGULARITY_SOCK ?? "";
-			if (!sockPath.trim()) {
-				throw new Error("OMS socket not configured (OMS_SINGULARITY_SOCK is empty).");
-			}
+			const sockPath = requireSockPath();
 
 			const taskId = normalizeEnv(process.env.OMS_TASK_ID);
 			if (!taskId) {
@@ -36,7 +32,7 @@ export default async function readTaskMessageHistoryExtension(api: ExtensionAPI)
 			}
 
 			try {
-				const response = await sendRequest(
+				const response = await sendIpc(
 					sockPath,
 					{
 						type: "list_task_agents",
@@ -45,16 +41,8 @@ export default async function readTaskMessageHistoryExtension(api: ExtensionAPI)
 					},
 					15_000,
 				);
-				const responseRecord = asRecord(response);
-				if (responseRecord?.ok === false) {
-					const error =
-						typeof responseRecord.error === "string" && responseRecord.error.trim()
-							? responseRecord.error.trim()
-							: typeof responseRecord.summary === "string" && responseRecord.summary.trim()
-								? responseRecord.summary.trim()
-								: "list_task_agents failed";
-					throw new Error(error);
-				}
+				const error = ipcError(response, "list_task_agents failed");
+				if (error) throw new Error(error);
 				return {
 					content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
 					details: response,
@@ -92,10 +80,7 @@ export default async function readTaskMessageHistoryExtension(api: ExtensionAPI)
 			return renderToolCall("Read Message History", details, theme, options);
 		},
 		execute: async (_toolCallId, params) => {
-			const sockPath = process.env.OMS_SINGULARITY_SOCK ?? "";
-			if (!sockPath.trim()) {
-				throw new Error("OMS socket not configured (OMS_SINGULARITY_SOCK is empty).");
-			}
+			const sockPath = requireSockPath();
 
 			const taskId = normalizeEnv(process.env.OMS_TASK_ID);
 			if (!taskId) {
@@ -111,7 +96,7 @@ export default async function readTaskMessageHistoryExtension(api: ExtensionAPI)
 			const limit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.min(200, Math.trunc(parsedLimit)) : 40;
 
 			try {
-				const response = await sendRequest(
+				const response = await sendIpc(
 					sockPath,
 					{
 						type: "read_message_history",
@@ -122,16 +107,8 @@ export default async function readTaskMessageHistoryExtension(api: ExtensionAPI)
 					},
 					20_000,
 				);
-				const responseRecord = asRecord(response);
-				if (responseRecord?.ok === false) {
-					const error =
-						typeof responseRecord.error === "string" && responseRecord.error.trim()
-							? responseRecord.error.trim()
-							: typeof responseRecord.summary === "string" && responseRecord.summary.trim()
-								? responseRecord.summary.trim()
-								: "read_message_history failed";
-					throw new Error(error);
-				}
+				const error = ipcError(response, "read_message_history failed");
+				if (error) throw new Error(error);
 				return {
 					content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
 					details: response,
@@ -148,70 +125,4 @@ function normalizeEnv(value: string | undefined): string | undefined {
 	if (typeof value !== "string") return undefined;
 	const trimmed = value.trim();
 	return trimmed || undefined;
-}
-
-function sendRequest(sockPath: string, payload: unknown, timeoutMs = 1_500): Promise<UnknownRecord> {
-	return new Promise((resolve, reject) => {
-		let settled = false;
-		let responseText = "";
-
-		const client = net.createConnection({ path: sockPath }, () => {
-			client.write(`${JSON.stringify(payload)}\n`);
-			client.end();
-		});
-
-		client.setEncoding("utf8");
-		client.on("data", chunk => {
-			responseText += chunk;
-		});
-
-		const timeout = setTimeout(() => {
-			if (settled) return;
-			settled = true;
-			try {
-				client.destroy();
-			} catch (err) {
-				logger.debug(
-					"agents/extensions/read-task-message-history.ts: best-effort failure after client.destroy();",
-					{ err },
-				);
-			}
-			reject(new Error(`Timeout connecting to ${sockPath}`));
-		}, timeoutMs);
-
-		client.on("error", err => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-			reject(err);
-		});
-
-		client.on("close", () => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-
-			const trimmed = responseText.trim();
-			if (!trimmed || trimmed === "ok") {
-				resolve({ ok: true });
-				return;
-			}
-
-			try {
-				const parsed = JSON.parse(trimmed);
-				if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-					resolve({ ok: true, data: parsed });
-					return;
-				}
-				resolve(parsed as UnknownRecord);
-			} catch {
-				resolve({ ok: true, text: trimmed });
-			}
-		});
-	});
-}
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-	return value as Record<string, unknown>;
 }

@@ -1,9 +1,8 @@
-import net from "node:net";
-import { logger } from "../../utils";
+import { ipcError, requireSockPath, sendIpc } from "./ipc-client";
 
 import { makeTasksExtension } from "./tasks-tool";
 import { renderToolCall, renderToolResult } from "./tool-renderers";
-import type { ExtensionAPI, UnknownRecord } from "./types";
+import type { ExtensionAPI } from "./types";
 
 const registerFinisherTasksTool = makeTasksExtension({
 	role: "finisher",
@@ -25,7 +24,7 @@ const registerFinisherTasksTool = makeTasksExtension({
 export default async function tasksFinisherExtension(api: ExtensionAPI): Promise<void> {
 	await registerFinisherTasksTool(api);
 	const { Type } = api.typebox;
-	const sockPath = process.env.OMS_SINGULARITY_SOCK ?? "";
+	const sockPath = requireSockPath();
 	const taskId = normalizeEnv(process.env.OMS_TASK_ID);
 
 	api.registerTool({
@@ -54,9 +53,6 @@ export default async function tasksFinisherExtension(api: ExtensionAPI): Promise
 			if (!effectiveReason) {
 				throw new Error("close_task: reason is required");
 			}
-			if (!sockPath.trim()) {
-				throw new Error("close_task: OMS socket not configured (OMS_SINGULARITY_SOCK is empty).");
-			}
 			const agentId = normalizeEnv(process.env.OMS_AGENT_ID);
 			const payload = {
 				type: "finisher_close_task",
@@ -67,14 +63,9 @@ export default async function tasksFinisherExtension(api: ExtensionAPI): Promise
 			};
 
 			try {
-				const response = await sendRequest(sockPath, payload, 30_000);
-				if (!response || response.ok !== true) {
-					const errMsg =
-						typeof response?.error === "string" && response.error.trim()
-							? response.error.trim()
-							: "failed to notify OMS";
-					throw new Error(`close_task: ${errMsg}`);
-				}
+				const response = await sendIpc(sockPath, payload, 30_000);
+				const error = ipcError(response, "close_task failed");
+				if (error) throw new Error(`close_task: ${error}`);
 				const summary =
 					typeof response.summary === "string" && response.summary.trim()
 						? response.summary.trim()
@@ -131,9 +122,6 @@ export default async function tasksFinisherExtension(api: ExtensionAPI): Promise
 			);
 		},
 		execute: async (_toolCallId, params) => {
-			if (!sockPath.trim()) {
-				throw new Error("advance_lifecycle: OMS socket not configured (OMS_SINGULARITY_SOCK is empty).");
-			}
 			if (!taskId) {
 				throw new Error("advance_lifecycle: OMS_TASK_ID is missing");
 			}
@@ -155,14 +143,9 @@ export default async function tasksFinisherExtension(api: ExtensionAPI): Promise
 			};
 
 			try {
-				const response = await sendRequest(sockPath, payload, 30_000);
-				if (!response || response.ok !== true) {
-					const errMsg =
-						typeof response?.error === "string" && response.error.trim()
-							? response.error.trim()
-							: "failed to record lifecycle decision";
-					throw new Error(`advance_lifecycle: ${errMsg}`);
-				}
+				const response = await sendIpc(sockPath, payload, 30_000);
+				const error = ipcError(response, "failed to record lifecycle decision");
+				if (error) throw new Error(`advance_lifecycle: ${error}`);
 				const summary =
 					typeof response.summary === "string" && response.summary.trim()
 						? response.summary.trim()
@@ -183,62 +166,4 @@ function normalizeEnv(value: string | undefined): string | undefined {
 	if (typeof value !== "string") return undefined;
 	const trimmed = value.trim();
 	return trimmed || undefined;
-}
-
-function sendRequest(sockPath: string, payload: unknown, timeoutMs = 1_500): Promise<UnknownRecord> {
-	return new Promise((resolve, reject) => {
-		let settled = false;
-		let responseText = "";
-
-		const client = net.createConnection({ path: sockPath }, () => {
-			client.write(`${JSON.stringify(payload)}\n`);
-			client.end();
-		});
-
-		client.setEncoding("utf8");
-		client.on("data", chunk => {
-			responseText += chunk;
-		});
-
-		const timeout = setTimeout(() => {
-			if (settled) return;
-			settled = true;
-			try {
-				client.destroy();
-			} catch (err) {
-				logger.debug("agents/extensions/tasks-finisher.ts: best-effort failure after client.destroy();", { err });
-			}
-			reject(new Error(`Timeout connecting to ${sockPath}`));
-		}, timeoutMs);
-
-		client.on("error", err => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-			reject(err);
-		});
-
-		client.on("close", () => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-
-			const trimmed = responseText.trim();
-			if (!trimmed || trimmed === "ok") {
-				resolve({ ok: true });
-				return;
-			}
-
-			try {
-				const parsed = JSON.parse(trimmed);
-				if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-					resolve({ ok: true, data: parsed });
-					return;
-				}
-				resolve(parsed as UnknownRecord);
-			} catch {
-				resolve({ ok: true, text: trimmed });
-			}
-		});
-	});
 }

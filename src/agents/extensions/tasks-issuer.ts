@@ -1,9 +1,8 @@
-import net from "node:net";
-import { logger } from "../../utils";
+import { requireSockPath, sendIpc } from "./ipc-client";
 
 import { makeTasksExtension } from "./tasks-tool";
 import { renderToolCall, renderToolResult } from "./tool-renderers";
-import type { ExtensionAPI, UnknownRecord } from "./types";
+import type { ExtensionAPI } from "./types";
 
 const registerIssuerTasksTool = makeTasksExtension({
 	role: "issuer",
@@ -13,7 +12,7 @@ const registerIssuerTasksTool = makeTasksExtension({
 export default async function tasksIssuerExtension(api: ExtensionAPI): Promise<void> {
 	await registerIssuerTasksTool(api);
 	const { Type } = api.typebox;
-	const sockPath = process.env.OMS_SINGULARITY_SOCK ?? "";
+	const sockPath = requireSockPath();
 	const taskId = normalizeEnv(process.env.OMS_TASK_ID);
 
 	api.registerTool({
@@ -57,9 +56,6 @@ export default async function tasksIssuerExtension(api: ExtensionAPI): Promise<v
 			);
 		},
 		execute: async (_toolCallId, params) => {
-			if (!sockPath.trim()) {
-				throw new Error("advance_lifecycle: OMS socket not configured (OMS_SINGULARITY_SOCK is empty).");
-			}
 			if (!taskId) {
 				throw new Error("advance_lifecycle: OMS_TASK_ID is missing");
 			}
@@ -81,7 +77,7 @@ export default async function tasksIssuerExtension(api: ExtensionAPI): Promise<v
 			};
 
 			try {
-				const response = await sendRequest(sockPath, payload, 30_000);
+				const response = await sendIpc(sockPath, payload, 30_000);
 				if (!response || response.ok !== true) {
 					const errMsg =
 						typeof response?.error === "string" && response.error.trim()
@@ -109,62 +105,4 @@ function normalizeEnv(value: string | undefined): string | undefined {
 	if (typeof value !== "string") return undefined;
 	const trimmed = value.trim();
 	return trimmed || undefined;
-}
-
-function sendRequest(sockPath: string, payload: unknown, timeoutMs = 1_500): Promise<UnknownRecord> {
-	return new Promise((resolve, reject) => {
-		let settled = false;
-		let responseText = "";
-
-		const client = net.createConnection({ path: sockPath }, () => {
-			client.write(`${JSON.stringify(payload)}\n`);
-			client.end();
-		});
-
-		client.setEncoding("utf8");
-		client.on("data", chunk => {
-			responseText += chunk;
-		});
-
-		const timeout = setTimeout(() => {
-			if (settled) return;
-			settled = true;
-			try {
-				client.destroy();
-			} catch (err) {
-				logger.debug("agents/extensions/tasks-issuer.ts: best-effort failure after client.destroy();", { err });
-			}
-			reject(new Error(`Timeout connecting to ${sockPath}`));
-		}, timeoutMs);
-
-		client.on("error", err => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-			reject(err);
-		});
-
-		client.on("close", () => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-
-			const trimmed = responseText.trim();
-			if (!trimmed || trimmed === "ok") {
-				resolve({ ok: true });
-				return;
-			}
-
-			try {
-				const parsed = JSON.parse(trimmed);
-				if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-					resolve({ ok: true, data: parsed });
-					return;
-				}
-				resolve(parsed as UnknownRecord);
-			} catch {
-				resolve({ ok: true, text: trimmed });
-			}
-		});
-	});
 }

@@ -1,5 +1,4 @@
-import net from "node:net";
-import { logger } from "../../utils";
+import { requireSockPath, sendIpc } from "./ipc-client";
 
 import { asRecord, type ExtensionAPI, type UnknownRecord } from "./types";
 
@@ -36,13 +35,8 @@ export default async function tasksCommandExtension(api: ExtensionAPI): Promise<
 				return;
 			}
 
-			const sockPath = process.env.OMS_SINGULARITY_SOCK ?? "";
-			if (!sockPath.trim()) {
-				await emitCommandOutput(context, "tasks: OMS socket not configured (OMS_SINGULARITY_SOCK is empty).");
-				return;
-			}
-
 			try {
+				const sockPath = requireSockPath();
 				switch (subcommand) {
 					case "list": {
 						await emitCommandOutput(context, await runList(sockPath));
@@ -320,7 +314,7 @@ async function runShow(sockPath: string, id: string): Promise<string> {
 }
 
 async function runStart(sockPath: string): Promise<string> {
-	const response = await sendRequest(
+	const response = await sendIpc(
 		sockPath,
 		{
 			type: "start_tasks",
@@ -358,7 +352,7 @@ async function runStop(sockPath: string, taskId: string): Promise<string> {
 		return `No active agents found for task ${taskId}.`;
 	}
 
-	const response = await sendRequest(
+	const response = await sendIpc(
 		sockPath,
 		{
 			type: "interrupt_agent",
@@ -379,7 +373,7 @@ async function runStop(sockPath: string, taskId: string): Promise<string> {
 }
 
 async function runDelete(sockPath: string, id: string): Promise<string> {
-	const stopResponse = await sendRequest(
+	const stopResponse = await sendIpc(
 		sockPath,
 		{
 			type: "stop_agents_for_task",
@@ -421,7 +415,7 @@ async function getActiveAgentsForTask(
 	sockPath: string,
 	taskId: string,
 ): Promise<{ ok: true; agents: string[] } | { ok: false; error: string | null }> {
-	const response = await sendRequest(
+	const response = await sendIpc(
 		sockPath,
 		{
 			type: "list_task_agents",
@@ -449,7 +443,7 @@ async function getActiveAgentsForTask(
 
 async function sendTasksRequest(sockPath: string, payload: UnknownRecord): Promise<TasksRequestResult> {
 	const actor = process.env.TASKS_ACTOR ?? "oms-singularity";
-	const response = await sendRequest(
+	const response = await sendIpc(
 		sockPath,
 		{
 			type: "tasks_request",
@@ -487,63 +481,4 @@ function toRecordArray(value: unknown): UnknownRecord[] {
 		if (rec) out.push(rec);
 	}
 	return out;
-}
-
-function sendRequest(sockPath: string, payload: unknown, timeoutMs = 1500): Promise<UnknownRecord> {
-	const { promise, resolve, reject } = Promise.withResolvers<UnknownRecord>();
-	let settled = false;
-	let responseText = "";
-
-	const client = net.createConnection({ path: sockPath }, () => {
-		client.write(`${JSON.stringify(payload)}\n`);
-	});
-
-	client.setEncoding("utf8");
-	client.on("data", chunk => {
-		responseText += chunk;
-	});
-
-	const timeout: NodeJS.Timeout = setTimeout(() => {
-		if (settled) return;
-		settled = true;
-		try {
-			client.destroy();
-		} catch (err) {
-			logger.debug("agents/extensions/tasks-command.ts: best-effort failure after client.destroy();", { err });
-		}
-		reject(new Error(`Timeout connecting to ${sockPath}`));
-	}, timeoutMs);
-
-	client.on("error", err => {
-		if (settled) return;
-		settled = true;
-		clearTimeout(timeout);
-		reject(err);
-	});
-
-	client.on("close", () => {
-		if (settled) return;
-		settled = true;
-		clearTimeout(timeout);
-
-		const trimmed = responseText.trim();
-		if (!trimmed || trimmed === "ok") {
-			resolve({ ok: true, data: null });
-			return;
-		}
-
-		try {
-			const parsed = JSON.parse(trimmed);
-			resolve(asUnknownRecord(parsed, { ok: true, data: parsed }));
-		} catch {
-			resolve({ ok: true, data: trimmed });
-		}
-	});
-
-	return promise;
-}
-
-function asUnknownRecord(value: unknown, fallback: UnknownRecord): UnknownRecord {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return fallback;
-	return value as UnknownRecord;
 }

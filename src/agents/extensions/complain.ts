@@ -1,5 +1,4 @@
-import net from "node:net";
-import { logger } from "../../utils";
+import { ipcError, requireSockPath, sendIpc } from "./ipc-client";
 import { renderToolCall, renderToolResult } from "./tool-renderers";
 import type { ExtensionAPI, UnknownRecord } from "./types";
 
@@ -47,10 +46,7 @@ export default async function complainExtension(api: ExtensionAPI): Promise<void
 		},
 		renderResult: (result, options, theme) => renderToolResult("Complain", result, options, theme),
 		execute: async (_toolCallId, params) => {
-			const sockPath = process.env.OMS_SINGULARITY_SOCK ?? "";
-			if (!sockPath.trim()) {
-				throw new Error("OMS socket not configured (OMS_SINGULARITY_SOCK is empty).");
-			}
+			const sockPath = requireSockPath();
 
 			const files = normalizeFiles(params?.files);
 			const reason = typeof params?.reason === "string" ? params.reason.trim() : "";
@@ -72,17 +68,9 @@ export default async function complainExtension(api: ExtensionAPI): Promise<void
 			};
 
 			try {
-				const response = await sendRequest(sockPath, payload, 120_000);
-				const responseRecord = asRecord(response);
-				if (responseRecord?.ok === false) {
-					const error =
-						typeof responseRecord.error === "string" && responseRecord.error.trim()
-							? responseRecord.error.trim()
-							: typeof responseRecord.summary === "string" && responseRecord.summary.trim()
-								? responseRecord.summary.trim()
-								: "complain failed";
-					throw new Error(error);
-				}
+				const response = await sendIpc(sockPath, payload, 120_000);
+				const error = ipcError(response, "complain failed");
+				if (error) throw new Error(error);
 				const text = formatResponseText(response, "complain");
 				return {
 					content: [{ type: "text", text }],
@@ -121,10 +109,7 @@ export default async function complainExtension(api: ExtensionAPI): Promise<void
 		},
 		renderResult: (result, options, theme) => renderToolResult("Revoke Complaint", result, options, theme),
 		execute: async (_toolCallId, params) => {
-			const sockPath = process.env.OMS_SINGULARITY_SOCK ?? "";
-			if (!sockPath.trim()) {
-				throw new Error("OMS socket not configured (OMS_SINGULARITY_SOCK is empty).");
-			}
+			const sockPath = requireSockPath();
 
 			const files = normalizeFiles(params?.files);
 			const payload: UnknownRecord = {
@@ -136,17 +121,9 @@ export default async function complainExtension(api: ExtensionAPI): Promise<void
 			};
 
 			try {
-				const response = await sendRequest(sockPath, payload, 30_000);
-				const responseRecord = asRecord(response);
-				if (responseRecord?.ok === false) {
-					const error =
-						typeof responseRecord.error === "string" && responseRecord.error.trim()
-							? responseRecord.error.trim()
-							: typeof responseRecord.summary === "string" && responseRecord.summary.trim()
-								? responseRecord.summary.trim()
-								: "revoke_complaint failed";
-					throw new Error(error);
-				}
+				const response = await sendIpc(sockPath, payload, 30_000);
+				const error = ipcError(response, "revoke_complaint failed");
+				if (error) throw new Error(error);
 				const text = formatResponseText(response, "revoke_complaint");
 				return {
 					content: [{ type: "text", text }],
@@ -187,62 +164,4 @@ function formatResponseText(response: unknown, toolName: string): string {
 	if (summary) return summary;
 
 	return `${toolName} response:\n${JSON.stringify(response, null, 2)}`;
-}
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-	return value as Record<string, unknown>;
-}
-
-function sendRequest(sockPath: string, payload: unknown, timeoutMs = 1_500): Promise<unknown> {
-	return new Promise((resolve, reject) => {
-		let settled = false;
-		let responseText = "";
-
-		const client = net.createConnection({ path: sockPath }, () => {
-			client.write(`${JSON.stringify(payload)}\n`);
-			client.end();
-		});
-
-		client.setEncoding("utf8");
-		client.on("data", chunk => {
-			responseText += chunk;
-		});
-
-		const timeout = setTimeout(() => {
-			if (settled) return;
-			settled = true;
-			try {
-				client.destroy();
-			} catch (err) {
-				logger.debug("agents/extensions/complain.ts: best-effort failure after client.destroy();", { err });
-			}
-			reject(new Error(`Timeout connecting to ${sockPath}`));
-		}, timeoutMs);
-
-		client.on("error", err => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-			reject(err);
-		});
-
-		client.on("close", () => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-
-			const trimmed = responseText.trim();
-			if (!trimmed || trimmed === "ok") {
-				resolve({ ok: true });
-				return;
-			}
-
-			try {
-				resolve(JSON.parse(trimmed));
-			} catch {
-				resolve({ ok: true, text: trimmed });
-			}
-		});
-	});
 }

@@ -1,7 +1,6 @@
-import net from "node:net";
-import { logger } from "../../utils";
+import { ipcError, requireSockPath, sendIpc } from "./ipc-client";
 import { renderToolCall, renderToolResult } from "./tool-renderers";
-import type { ExtensionAPI, UnknownRecord } from "./types";
+import type { ExtensionAPI } from "./types";
 /**
  * OMS extension for omp.
  *
@@ -47,10 +46,7 @@ export default async function omsStartTasksExtension(api: ExtensionAPI): Promise
 			};
 		},
 		execute: async (_toolCallId, params) => {
-			const sockPath = process.env.OMS_SINGULARITY_SOCK ?? "";
-			if (!sockPath.trim()) {
-				throw new Error("OMS start-tasks socket not configured (OMS_SINGULARITY_SOCK is empty).");
-			}
+			const sockPath = requireSockPath();
 			const count = typeof params?.count === "number" ? params.count : undefined;
 			try {
 				await startTasksWithCount(sockPath, count);
@@ -65,10 +61,7 @@ export default async function omsStartTasksExtension(api: ExtensionAPI): Promise
 	api.registerCommand?.("start", {
 		description: "Trigger OMS to check for ready tasks and start issuers immediately.",
 		handler: async (_context: unknown) => {
-			const sockPath = process.env.OMS_SINGULARITY_SOCK ?? "";
-			if (!sockPath.trim()) {
-				throw new Error("OMS start-tasks socket not configured (OMS_SINGULARITY_SOCK is empty).");
-			}
+			const sockPath = requireSockPath();
 
 			try {
 				await startTasksWithCount(sockPath);
@@ -85,74 +78,7 @@ async function startTasksWithCount(sockPath: string, count?: number): Promise<vo
 		count,
 		ts: Date.now(),
 	};
-	const response = await sendStartTasks(sockPath, JSON.stringify(payload));
-	const responseRecord = asRecord(response);
-	if (responseRecord?.ok === false) {
-		const error =
-			typeof responseRecord.error === "string" && responseRecord.error.trim()
-				? responseRecord.error.trim()
-				: typeof responseRecord.summary === "string" && responseRecord.summary.trim()
-					? responseRecord.summary.trim()
-					: "start_tasks failed";
-		throw new Error(error);
-	}
-}
-
-function sendStartTasks(sockPath: string, payload: string, timeoutMs = 1500): Promise<UnknownRecord> {
-	const { promise, resolve, reject } = Promise.withResolvers<UnknownRecord>();
-	let settled = false;
-	let responseText = "";
-	const client = net.createConnection({ path: sockPath }, () => {
-		client.write(`${payload}\n`);
-		client.end();
-	});
-	const timeout = setTimeout(() => {
-		if (settled) return;
-		settled = true;
-		try {
-			client.destroy();
-		} catch (err) {
-			logger.debug("agents/extensions/start-tasks.ts: best-effort failure after client.destroy();", { err });
-		}
-		reject(new Error(`Timeout connecting to ${sockPath}`));
-	}, timeoutMs);
-	client.setEncoding("utf8");
-	client.on("data", chunk => {
-		responseText += chunk;
-	});
-	client.on("error", err => {
-		if (settled) return;
-		settled = true;
-		clearTimeout(timeout);
-		reject(err);
-	});
-	client.on("close", () => {
-		if (settled) return;
-		settled = true;
-		clearTimeout(timeout);
-
-		const trimmed = responseText.trim();
-		if (!trimmed || trimmed === "ok") {
-			resolve({ ok: true });
-			return;
-		}
-
-		try {
-			const parsed = JSON.parse(trimmed);
-			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-				resolve({ ok: true, data: parsed });
-				return;
-			}
-			resolve(parsed as UnknownRecord);
-		} catch {
-			resolve({ ok: true, text: trimmed });
-		}
-	});
-
-	return promise;
-}
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-	return value as Record<string, unknown>;
+	const response = await sendIpc(sockPath, payload);
+	const error = ipcError(response, "start_tasks failed");
+	if (error) throw new Error(error);
 }
