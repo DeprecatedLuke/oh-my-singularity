@@ -48,7 +48,7 @@ Comment when you:
 </instruction>
 
 <procedure>
-1. Inspect task context with `tasks show` and `tasks comments`.
+1. Read the task context provided in your initial prompt (task ID, title, description, comments, implementation guidance are already included — do NOT call `tasks show` or `tasks comments` again).
 2. Add discovery comment with concrete file/component findings.
 3. Implement the assigned design-heavy scope.
 4. Add approach/decision comment when you choose direction or abandon an approach.

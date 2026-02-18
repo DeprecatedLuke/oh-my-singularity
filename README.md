@@ -123,8 +123,8 @@ Extensions are TypeScript files in `src/agents/extensions/` that inject custom t
 - `tasks-worker.ts` — Worker-scoped tasks API (read + comment)
 - `broadcast-to-workers.ts` — Broadcast messages to relevant workers
 - `complain.ts` — Report file conflicts to OMS
-- `interrupt-agent.ts` — Stop a running agent (singularity/finisher only)
-- `steer-agent.ts` — Manual steering control (singularity only)
+- `interrupt-agent.ts` — Stop a running task agent and queue an interrupt message
+- `steer-agent.ts` — Send targeted wait/redirect guidance to a running task agent
 
 Extensions export an `init(api: ExtensionAPI)` function that registers tools and hooks. See `src/agents/extensions/types.ts` for API details.
 
@@ -524,12 +524,11 @@ Steering runs every 15 minutes (configurable via `steeringIntervalMs`).
 
 **Actions:**
 - **continue** — Worker is on track
-- **redirect** — Send corrective guidance (via `steer_agent` tool)
-- **interrupt** — Stop worker, reassign task
+- **redirect** — Post corrective guidance on the task issue via `tasks comment_add`
+- **interrupt** — Post urgent stop/replan guidance via `tasks comment_add` (active-task comments trigger interrupt delivery)
 
-Singularity can manually steer via:
-- `steer_agent` — Send guidance to running agent
-- `interrupt_agent` — Stop agent immediately
+Singularity can manually coordinate via:
+- `tasks comment_add` — Send guidance to running agents through task issue comments
 - `replace_agent` — Stop agent and spawn replacement
 
 ### Extensions and Tools
@@ -576,7 +575,7 @@ Extensions can:
 **Agent stuck in "running" state:**
 - Check system pane logs (`~/.oms/sessions/<project>/logs/oms-*.log`)
 - Use singularity to steer: "Evaluate worker X and redirect if stuck"
-- Manual interrupt: "Interrupt agent Y and reassign task Z"
+- Manual correction: "Post stop/replan guidance as a task comment for worker Y, or replace worker Y and reassign task Z"
 
 **Socket errors on startup:**
 ```

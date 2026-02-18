@@ -410,7 +410,14 @@ describe("handleIpcMessage", () => {
 		})) as { ok: boolean; data?: unknown[] };
 
 		expect(response.ok).toBe(true);
-		expect((response.data ?? []).map(item => (item as { id: string }).id)).toEqual(["task-open", "task-blocked", "task-closed", "task-done", "task-failed", "task-dead"]);
+		expect((response.data ?? []).map(item => (item as { id: string }).id)).toEqual([
+			"task-open",
+			"task-blocked",
+			"task-closed",
+			"task-done",
+			"task-failed",
+			"task-dead",
+		]);
 	});
 
 	test("tasks_request search includeClosed=true still returns closed and terminal statuses", async () => {
