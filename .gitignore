@@ -1,5 +1,6 @@
 # dependencies (bun install)
 node_modules
+.oms
 
 # local bun install/cache dirs (used when BUN_INSTALL/BUN_TMPDIR are set)
 .bun-install

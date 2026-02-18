@@ -56,6 +56,7 @@ Default configuration used: Codex (xhigh) for workers, Opus (xhigh) for designer
 - **Issuer** — Pre-implementation scout. Explores the codebase and prior art, then decides *start*, *defer*, or *skip* with actionable guidance for the worker.
 - **Worker** — Implements code, tests, docs for a single task. Leaves a knowledge trail via comments. Broadcasts when changes affect parallel workers.
 - **Designer-Worker** — Same as worker but specialized for UI/UX/visual tasks.
+- **Fast-Worker** — Lightweight agent for trivial (`tiny` scope) tasks. Uses a fast model (default: codex-spark) and skips the issuer step. Can escalate to the full lifecycle if the task turns out to be more complex than expected.
 - **Finisher** — Post-implementation cleanup. Reviews worker output, stops leftover agents, closes/updates issues, creates follow-ups. Owns all lifecycle mutations.
 - **Steering** — Periodic supervisor. Evaluates running work and decides *continue*, *redirect*, or *interrupt*. Broadcast-steering variant evaluates multiple workers at once.
 
@@ -63,37 +64,89 @@ Default configuration used: Codex (xhigh) for workers, Opus (xhigh) for designer
 
 ```
 ┌──────────────┐
-│ Singularity  │  User request → create task issue (status: open)
+│ Singularity  │  User request → create task issue (status: open, scope: S)
 └──────┬───────┘
        │
-       ▼
-┌──────────────┐
-│   Issuer     │  Explore codebase → decide: start | defer | skip
-└──────┬───────┘
+       ├──(scope: tiny)────────────────────────┐
+       │                                       │
+       │                                       ▼
+       │                              ┌──────────────────┐
+       │                              │ Fast-Worker      │  Quick fix (codex-spark)
+       │                              └────────┬─────────┘
+       │                                       │
+       │                            ┌──(ok)────┴──(too complex)──┐
+       │                            │                            │
+       │                            ▼                            ▼
+       │                      ┌──────────┐              Escalate → Issuer
+       │                      │ Finisher │              (full lifecycle)
+       │                      └──────────┘
        │
-       ├──(start)─────────────────────────────────┐
-       │                                          ▼
-       │                                 ┌──────────────────┐
-       │                                 │ Worker           │  Implement + comment trail
-       │                                 │ or               │  (status: in_progress)
-       │                                 │ Designer-Worker  │
-       │                                 └──────┬───────────┘
-       │                                        │
-       ├──(defer)───────────────────────────────┤
-       │   → status: blocked                    │
-       │   → comment with reason                │
-       │                                        ▼
-       │                                 ┌──────────────┐
-       └──(skip)────────────────────────▶│  Finisher    │  Review → close/update
-                                         │              │  → stop agents
-                                         └──────────────┘
-
-        ↕ Periodic (every 15min)
+       ├──(scope: small..xlarge)───────────────┐
+       │                                       │
+       │                                       ▼
+       │                              ┌──────────────────┐
+       │                              │ Issuer           │  Explore → start | defer | skip
+       │                              └────────┬─────────┘
+       │                                       │
+       │         ┌──(start)────────────────────┤
+       │         │                             ├──(defer) → blocked + comment
+       │         ▼                             │
+       │  ┌──────────────────┐                 │
+       │  │ Worker           │  Implement      │
+       │  │ or               │  (in_progress)  │
+       │  │ Designer-Worker  │                 │
+       │  └──────┬───────────┘                 │
+       │         │                             │
+       │         ▼                             │
+       │  ┌──────────────┐                     │
+       │  │  Finisher    │◀────(skip)──────────┘
+       │  │              │  Review → close/update → stop agents
+       │  └──────────────┘
+       │
+       ↕ Periodic (every 15min)
 ┌──────────────────────┐
 │ Steering             │  Evaluate workers → continue | redirect | interrupt
 │ or                   │
 │ Broadcast-Steering   │
 └──────────────────────┘
+```
+
+### Replicas
+
+Replicas give each parallel worker its own isolated copy of the working tree (the replicated root), eliminating file-level conflicts between workers implementing different features simultaneously. When a worker finishes, its changes are queued for the **merger** — a singleton agent that sequentially integrates each replica back into the main working tree.
+
+Replicas can be toggled on/off in the settings pane. When off, all workers share the working tree directly (label-based conflict prevention still applies).
+
+```
+   Task A            Task B             Task C
+      │                 │                  │
+      ▼                 ▼                  ▼
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│ Replica Root │  │ Replica Root │  │ Replica Root │  Isolated copies
+│ + Worker     │  │ + Worker     │  │ + Worker     │
+└──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+       │                 │                 │
+       │ (finish)        │ (finish)        │ (finish)
+       ▼                 ▼                 ▼
+  ┌────────────────────────────────────────────────┐
+  │                 Merger Queue                   │
+  │   Queued in completion order, processed FIFO   │
+  └───────────────────────┬────────────────────────┘
+                          │
+                          ▼
+              ┌──────────────────────┐
+              │ Merger (singleton)   │  Integrates replica → main tree
+              │ one at a time        │  sequentially
+              └──────────────────────┘
+```
+
+### Fast-Path Workers
+
+Tasks with `scope: tiny` bypass the full issuer→worker pipeline. Instead, OMS spawns a **fast-worker** directly - a lightweight agent using a cheaper, faster model (default: codex-spark).
+
+If the fast-worker determines the task is too complex for a quick fix, it **escalates**: exits and kicks off the standard issuer→worker lifecycle. This gives trivial changes (constant tweaks, typo fixes, config updates) a sub-minute path while preserving the full pipeline for real work.
+
+Scope levels: `tiny` | `small` | `medium` | `large` | `xlarge`. Only `tiny` uses the fast path; all others go through the normal pipeline.
 
 **Resume Flow** — When tasks are in_progress but have no active agents:
 
