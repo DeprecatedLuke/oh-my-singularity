@@ -11,7 +11,7 @@ import {
 import type { TaskStoreClient } from "../../tasks/client";
 import type { TaskIssue } from "../../tasks/types";
 import { asRecord } from "../../utils";
-import { clipAnsi, visibleWidth } from "../colors";
+import { BOLD, clipAnsi, FG, RESET, visibleWidth } from "../colors";
 import { renderMarkdownLines } from "../components/markdown";
 import { formatTokens } from "../utils/format";
 import type { TasksPane } from "./tasks-pane";
@@ -131,11 +131,15 @@ export class TasksDetailsPane {
 			const issue = this.#selectedIssue;
 			lines.push(issue.id);
 			lines.push(issue.title);
-			lines.push(`status: ${formatIssueStatus(issue.status)}  prio: ${String(issue.priority ?? "?")}`);
-			const assignee = issue.assignee ? `assignee: ${issue.assignee}` : "assignee: (none)";
-			lines.push(assignee);
+			const statusLabel = formatMetadataLabel("status:");
+			const priorityLabel = formatMetadataLabel("prio:");
+			lines.push(
+				`${statusLabel} ${formatIssueStatusStyled(issue.status)}  ${priorityLabel} ${formatIssuePriority(issue.priority)}`,
+			);
+			const assignee = issue.assignee ? issue.assignee : "(none)";
+			lines.push(`${formatMetadataLabel("assignee:")} ${assignee}`);
 			if (issue.labels?.length) {
-				lines.push(`labels: ${issue.labels.join(", ")}`);
+				lines.push(`${formatMetadataLabel("labels:")} ${issue.labels.join(", ")}`);
 			}
 			const liveAgents = this.#registry?.getByTask(issue.id) ?? [];
 			const persistedAgents = this.#selectedPersistedAgents;
@@ -156,13 +160,13 @@ export class TasksDetailsPane {
 			const agentLines = buildAgentBreakdownLines(liveAgents, persistedAgents);
 			if (agentLines.length > 0) {
 				lines.push("");
-				lines.push("── Agents ──");
+				lines.push(formatSectionHeader("── Agents ──"));
 				lines.push(...agentLines);
 			}
 			const desc = typeof issue.description === "string" ? issue.description.trim() : "";
 			if (desc) {
 				lines.push("");
-				lines.push("── Description ──");
+				lines.push(formatSectionHeader("── Description ──"));
 				for (const line of renderMarkdownLines(desc, width)) {
 					lines.push(line);
 				}
@@ -170,7 +174,7 @@ export class TasksDetailsPane {
 			const ac = typeof issue.acceptance_criteria === "string" ? issue.acceptance_criteria.trim() : "";
 			if (ac) {
 				lines.push("");
-				lines.push("── Acceptance Criteria ──");
+				lines.push(formatSectionHeader("── Acceptance Criteria ──"));
 				for (const line of renderMarkdownLines(ac, width)) {
 					lines.push(line);
 				}
@@ -179,10 +183,10 @@ export class TasksDetailsPane {
 			const comments = Array.isArray(issue.comments) ? issue.comments : [];
 			if (comments.length === 0) {
 				lines.push("");
-				lines.push("comments: (none)");
+				lines.push(formatSectionHeader("comments: (none)"));
 			} else {
 				lines.push("");
-				lines.push(`comments: ${comments.length}`);
+				lines.push(formatSectionHeader(`comments: ${comments.length}`));
 				const recent = comments.slice(-Math.min(10, comments.length));
 				for (const c of recent) {
 					const when = typeof c.created_at === "string" ? renderRelativeTime(c.created_at) : "";
@@ -326,6 +330,59 @@ function renderRelativeTime(iso: string): string {
 
 function formatIssueStatus(status: unknown): string {
 	return typeof status === "string" ? status : "(unknown)";
+}
+
+function formatIssueStatusStyled(status: unknown): string {
+	return `${issueStatusColor(status)}${formatIssueStatus(status)}${RESET}`;
+}
+
+function issueStatusColor(status: unknown): string {
+	const normalized = typeof status === "string" ? status.trim().toLowerCase() : "";
+	switch (normalized) {
+		case "closed":
+		case "done":
+		case "complete":
+		case "completed":
+			return FG.success;
+		case "in_progress":
+		case "in-progress":
+		case "running":
+		case "working":
+		case "started":
+			return FG.warning;
+		case "blocked":
+		case "dead":
+		case "failed":
+		case "aborted":
+		case "stuck":
+			return FG.error;
+		case "deferred":
+		case "paused":
+			return FG.warning;
+		case "open":
+			return FG.border;
+		default:
+			return FG.muted;
+	}
+}
+
+function formatIssuePriority(priority: unknown): string {
+	const text = priority == null ? "?" : String(priority);
+	if (typeof priority !== "number" || !Number.isFinite(priority)) {
+		return `${FG.muted}${text}${RESET}`;
+	}
+	if (priority <= 0) return `${BOLD}${FG.error}${text}${RESET}`;
+	if (priority <= 1) return `${BOLD}${FG.warning}${text}${RESET}`;
+	if (priority <= 2) return `${FG.accent}${text}${RESET}`;
+	return `${FG.dim}${text}${RESET}`;
+}
+
+function formatSectionHeader(value: string): string {
+	return `${BOLD}${FG.accent}${value}${RESET}`;
+}
+
+function formatMetadataLabel(label: string): string {
+	return `${FG.dim}${label}${RESET}`;
 }
 
 function taskIssueSnapshotKey(issue: TaskIssue): string {
