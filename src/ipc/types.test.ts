@@ -103,6 +103,41 @@ describe("parseIPCMessage", () => {
 		});
 	});
 
+	describe("finisher_advance_lifecycle", () => {
+		test("parses required lifecycle fields and validates action values", () => {
+			const message = expectParseOk({
+				type: "finisher_advance_lifecycle",
+				taskId: "task-1",
+				action: "worker",
+				message: "resume implementation",
+				reason: "needs code changes",
+				agentId: "fin-1",
+			});
+			expect(message).toEqual({
+				type: "finisher_advance_lifecycle",
+				taskId: "task-1",
+				action: "worker",
+				message: "resume implementation",
+				reason: "needs code changes",
+				agentId: "fin-1",
+			});
+		});
+
+		test("rejects unsupported action", () => {
+			expectParseError(
+				{
+					type: "finisher_advance_lifecycle",
+					taskId: "task-1",
+					action: "start",
+					message: "go",
+					reason: "nope",
+					agentId: "fin-1",
+				},
+				/"action" must be one of worker, issuer, defer/,
+			);
+		});
+	});
+
 	test("parses finisher_close_task and rejects non-string reason", () => {
 		expect(
 			expectParseOk({ type: "finisher_close_task", taskId: "task-1", reason: "done", agentId: "fin-1" }),

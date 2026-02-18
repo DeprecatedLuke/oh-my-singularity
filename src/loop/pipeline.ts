@@ -23,6 +23,21 @@ type IssuerLifecycleAdvanceRecord = {
 	agentId: string | null;
 	ts: number;
 };
+type FinisherLifecycleAction = "worker" | "issuer" | "defer";
+type FinisherLifecycleAdvanceRecord = {
+	taskId: string;
+	action: FinisherLifecycleAction;
+	message: string | null;
+	reason: string | null;
+	agentId: string | null;
+	ts: number;
+};
+type FinisherCloseRecord = {
+	taskId: string;
+	reason: string | null;
+	agentId: string | null;
+	ts: number;
+};
 
 function isDesignTask(issue: TaskIssue): boolean {
 	const labels = Array.isArray(issue.labels) ? issue.labels : [];
@@ -57,6 +72,8 @@ export class PipelineManager {
 
 	private readonly pipelineInFlight = new Set<string>();
 	private readonly issuerLifecycleByTask = new Map<string, IssuerLifecycleAdvanceRecord>();
+	private readonly finisherLifecycleByTask = new Map<string, FinisherLifecycleAdvanceRecord>();
+	private readonly finisherCloseByTask = new Map<string, FinisherCloseRecord>();
 
 	constructor(opts: {
 		tasksClient: TaskStoreClient;
@@ -184,6 +201,111 @@ export class PipelineManager {
 			reason: next.reason,
 			agentId: next.agentId,
 		};
+	}
+
+	advanceFinisherLifecycle(opts: {
+		taskId?: string;
+		action?: string;
+		message?: string;
+		reason?: string;
+		agentId?: string;
+	}): Record<string, unknown> {
+		const taskId = typeof opts.taskId === "string" ? opts.taskId.trim() : "";
+		if (!taskId) {
+			return { ok: false, summary: "advance_lifecycle rejected: taskId is required" };
+		}
+
+		const rawAction = typeof opts.action === "string" ? opts.action.trim().toLowerCase() : "";
+		const action: FinisherLifecycleAction | null =
+			rawAction === "worker" || rawAction === "issuer" || rawAction === "defer" ? rawAction : null;
+		if (!action) {
+			return {
+				ok: false,
+				summary: `advance_lifecycle rejected: unsupported action '${rawAction || "(empty)"}'`,
+			};
+		}
+
+		const message = typeof opts.message === "string" ? opts.message.trim() : "";
+		const reason = typeof opts.reason === "string" ? opts.reason.trim() : "";
+		const agentId = typeof opts.agentId === "string" ? opts.agentId.trim() : "";
+		const current = this.finisherLifecycleByTask.get(taskId);
+		const next: FinisherLifecycleAdvanceRecord = {
+			taskId,
+			action,
+			message: message || null,
+			reason: reason || null,
+			agentId: agentId || null,
+			ts: Date.now(),
+		};
+		this.finisherLifecycleByTask.set(taskId, next);
+
+		const finishers = this.registry.getActiveByTask(taskId).filter(a => a.role === "finisher");
+		for (const finisher of finishers) {
+			const rpc = finisher.rpc;
+			if (rpc && rpc instanceof OmsRpcClient) {
+				try {
+					rpc.forceKill();
+				} catch (err) {
+					this.loopLog("Failed to kill finisher RPC after lifecycle advance (non-fatal)", "debug", {
+						taskId,
+						finisherId: finisher.id,
+						error: err instanceof Error ? err.message : String(err),
+					});
+				}
+			}
+		}
+
+		this.loopLog(
+			current
+				? `Finisher lifecycle decision updated for ${taskId}: ${current.action} -> ${action}`
+				: `Finisher lifecycle decision recorded for ${taskId}: ${action}`,
+			current ? "warn" : "info",
+			{
+				taskId,
+				action,
+				reason: next.reason,
+				message: next.message,
+				agentId: next.agentId,
+			},
+		);
+
+		return {
+			ok: true,
+			summary: `advance_lifecycle recorded for ${taskId}: ${action}`,
+			taskId,
+			action,
+			message: next.message,
+			reason: next.reason,
+			agentId: next.agentId,
+		};
+	}
+
+	recordFinisherClose(opts: { taskId?: string; reason?: string; agentId?: string }): FinisherCloseRecord | null {
+		const taskId = typeof opts.taskId === "string" ? opts.taskId.trim() : "";
+		if (!taskId) return null;
+
+		const reason = typeof opts.reason === "string" ? opts.reason.trim() : "";
+		const agentId = typeof opts.agentId === "string" ? opts.agentId.trim() : "";
+		const current = this.finisherCloseByTask.get(taskId);
+		const next: FinisherCloseRecord = {
+			taskId,
+			reason: reason || null,
+			agentId: agentId || null,
+			ts: Date.now(),
+		};
+		this.finisherCloseByTask.set(taskId, next);
+
+		this.loopLog(
+			current ? `Finisher close marker updated for ${taskId}` : `Finisher close marker recorded for ${taskId}`,
+			current ? "warn" : "info",
+			{
+				taskId,
+				reason: next.reason,
+				agentId: next.agentId,
+			},
+		);
+
+		return next;
 	}
 
 	addPipelineInFlight(taskId: string): void {
@@ -355,7 +477,7 @@ export class PipelineManager {
 			}
 
 			try {
-				await issuerRpc.waitForAgentEnd(180_000);
+				await issuerRpc.waitForAgentEnd(900_000);
 			} catch {
 				const advance = this.takeIssuerLifecycleAdvance(task.id);
 				if (advance) {
@@ -405,6 +527,34 @@ export class PipelineManager {
 		if (initialAttempt.ok) return initialAttempt.result;
 		const initialReason = initialAttempt.reason;
 		const initialSessionId = initialAttempt.sessionId;
+		try {
+			const currentTask = await this.tasksClient.show(task.id);
+			if (currentTask.status === "closed") {
+				this.loopLog(`Task ${task.id} is closed; aborting issuer recovery`, "info", {
+					taskId: task.id,
+					status: currentTask.status,
+					initialReason,
+				});
+				return {
+					start: false,
+					message: null,
+					reason: "task closed during issuer execution",
+					raw: null,
+				};
+			}
+		} catch (err) {
+			this.loopLog(`Task ${task.id} no longer exists; aborting issuer recovery`, "info", {
+				taskId: task.id,
+				initialReason,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return {
+				start: false,
+				message: null,
+				reason: "task deleted during issuer execution",
+				raw: null,
+			};
+		}
 		const missingAdvanceNudge = buildMissingAdvanceNudge();
 		const resumeExecutionNudge = buildResumeExecutionNudge();
 		let resumeReason: string | null = null;
@@ -517,6 +667,22 @@ export class PipelineManager {
 		const decision = this.issuerLifecycleByTask.get(normalizedTaskId) ?? null;
 		if (decision) this.issuerLifecycleByTask.delete(normalizedTaskId);
 		return decision;
+	}
+
+	takeFinisherLifecycleAdvance(taskId: string): FinisherLifecycleAdvanceRecord | null {
+		const normalizedTaskId = taskId.trim();
+		if (!normalizedTaskId) return null;
+		const decision = this.finisherLifecycleByTask.get(normalizedTaskId) ?? null;
+		if (decision) this.finisherLifecycleByTask.delete(normalizedTaskId);
+		return decision;
+	}
+
+	takeFinisherCloseRecord(taskId: string): FinisherCloseRecord | null {
+		const normalizedTaskId = taskId.trim();
+		if (!normalizedTaskId) return null;
+		const closeRecord = this.finisherCloseByTask.get(normalizedTaskId) ?? null;
+		if (closeRecord) this.finisherCloseByTask.delete(normalizedTaskId);
+		return closeRecord;
 	}
 
 	private async runResumePipeline(task: TaskIssue): Promise<void> {

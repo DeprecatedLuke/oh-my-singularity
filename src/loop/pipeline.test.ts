@@ -283,6 +283,7 @@ describe("PipelineManager issuer lifecycle recovery", () => {
 		const initialRpc = new OmsRpcClient();
 		const resumedRpc = new OmsRpcClient();
 		let resumeKickoff: string | undefined;
+		let showCalls = 0;
 		let pipeline: PipelineManager;
 
 		const initialIssuer = makeIssuer(task.id, initialRpc, "issuer-task-resume-initial");
@@ -313,6 +314,10 @@ describe("PipelineManager issuer lifecycle recovery", () => {
 
 		pipeline = new PipelineManager({
 			tasksClient: {
+				show: async () => {
+					showCalls += 1;
+					return task;
+				},
 				updateStatus: async () => {},
 				comment: async () => {},
 			} as unknown as TaskStoreClient,
@@ -353,5 +358,224 @@ describe("PipelineManager issuer lifecycle recovery", () => {
 		expect(typeof resumeKickoff).toBe("string");
 		expect(resumeKickoff).toContain("[SYSTEM RESUME]");
 		expect(resumeKickoff).toContain("advance_lifecycle");
+		expect(showCalls).toBe(1);
+	});
+
+	test("runIssuerForTask aborts recovery when task is closed after initial issuer failure", async () => {
+		const task: TaskIssue = { ...makeTask("task-closed-recovery"), status: "closed" };
+		const initialRpc = new OmsRpcClient();
+		const initialIssuer = makeIssuer(task.id, initialRpc, "issuer-task-closed-initial");
+		initialIssuer.sessionId = "closed-session-1";
+		let showCalls = 0;
+		let spawnIssuerCalls = 0;
+		let resumeAgentCalls = 0;
+
+		(initialRpc as unknown as { waitForAgentEnd: (_timeoutMs?: number) => Promise<void> }).waitForAgentEnd =
+			async () => {
+				throw new Error("issuer crashed");
+			};
+
+		const pipeline = new PipelineManager({
+			tasksClient: {
+				show: async () => {
+					showCalls += 1;
+					return task;
+				},
+				updateStatus: async () => {},
+				comment: async () => {},
+			} as unknown as TaskStoreClient,
+			registry: {
+				getActiveByTask: () => [],
+			} as never,
+			scheduler: {} as never,
+			spawner: {
+				spawnIssuer: async () => {
+					spawnIssuerCalls += 1;
+					return initialIssuer;
+				},
+				resumeAgent: async () => {
+					resumeAgentCalls += 1;
+					throw new Error("resumeAgent should not be called");
+				},
+			} as never,
+			getMaxWorkers: () => 1,
+			getActiveWorkerAgents: () => [],
+			loopLog: () => {},
+			onDirty: () => {},
+			wake: () => {},
+			attachRpcHandlers: () => {},
+			finishAgent: async () => {},
+			logAgentStart: () => {},
+			logAgentFinished: async () => {},
+			hasPendingInterruptKickoff: () => false,
+			takePendingInterruptKickoff: () => null,
+			hasFinisherTakeover: () => false,
+			spawnFinisherAfterStoppingSteering: async () => {
+				throw new Error("Unexpected finisher spawn");
+			},
+			isRunning: () => true,
+			isPaused: () => false,
+		});
+
+		const result = await pipeline.runIssuerForTask(task);
+		expect(result).toEqual({
+			start: false,
+			message: null,
+			reason: "task closed during issuer execution",
+			raw: null,
+		});
+		expect(showCalls).toBe(1);
+		expect(spawnIssuerCalls).toBe(1);
+		expect(resumeAgentCalls).toBe(0);
+	});
+
+	test("runIssuerForTask aborts recovery when task is deleted after initial issuer failure", async () => {
+		const task = makeTask("task-deleted-recovery");
+		const initialRpc = new OmsRpcClient();
+		const initialIssuer = makeIssuer(task.id, initialRpc, "issuer-task-deleted-initial");
+		initialIssuer.sessionId = "deleted-session-1";
+		let showCalls = 0;
+		let spawnIssuerCalls = 0;
+		let resumeAgentCalls = 0;
+
+		(initialRpc as unknown as { waitForAgentEnd: (_timeoutMs?: number) => Promise<void> }).waitForAgentEnd =
+			async () => {
+				throw new Error("issuer crashed");
+			};
+
+		const pipeline = new PipelineManager({
+			tasksClient: {
+				show: async () => {
+					showCalls += 1;
+					throw new Error("task not found");
+				},
+				updateStatus: async () => {},
+				comment: async () => {},
+			} as unknown as TaskStoreClient,
+			registry: {
+				getActiveByTask: () => [],
+			} as never,
+			scheduler: {} as never,
+			spawner: {
+				spawnIssuer: async () => {
+					spawnIssuerCalls += 1;
+					return initialIssuer;
+				},
+				resumeAgent: async () => {
+					resumeAgentCalls += 1;
+					throw new Error("resumeAgent should not be called");
+				},
+			} as never,
+			getMaxWorkers: () => 1,
+			getActiveWorkerAgents: () => [],
+			loopLog: () => {},
+			onDirty: () => {},
+			wake: () => {},
+			attachRpcHandlers: () => {},
+			finishAgent: async () => {},
+			logAgentStart: () => {},
+			logAgentFinished: async () => {},
+			hasPendingInterruptKickoff: () => false,
+			takePendingInterruptKickoff: () => null,
+			hasFinisherTakeover: () => false,
+			spawnFinisherAfterStoppingSteering: async () => {
+				throw new Error("Unexpected finisher spawn");
+			},
+			isRunning: () => true,
+			isPaused: () => false,
+		});
+
+		const result = await pipeline.runIssuerForTask(task);
+		expect(result).toEqual({
+			start: false,
+			message: null,
+			reason: "task deleted during issuer execution",
+			raw: null,
+		});
+		expect(showCalls).toBe(1);
+		expect(spawnIssuerCalls).toBe(1);
+		expect(resumeAgentCalls).toBe(0);
+	});
+});
+
+describe("PipelineManager finisher lifecycle tracking", () => {
+	const createLifecyclePipeline = () =>
+		new PipelineManager({
+			tasksClient: {
+				updateStatus: async () => {},
+				comment: async () => {},
+			} as unknown as TaskStoreClient,
+			registry: {
+				getActiveByTask: () => [],
+			} as never,
+			scheduler: {} as never,
+			spawner: {} as never,
+			getMaxWorkers: () => 1,
+			getActiveWorkerAgents: () => [],
+			loopLog: () => {},
+			onDirty: () => {},
+			wake: () => {},
+			attachRpcHandlers: () => {},
+			finishAgent: async () => {},
+			logAgentStart: () => {},
+			logAgentFinished: async () => {},
+			hasPendingInterruptKickoff: () => false,
+			takePendingInterruptKickoff: () => null,
+			hasFinisherTakeover: () => false,
+			spawnFinisherAfterStoppingSteering: async () => {
+				throw new Error("Unexpected finisher spawn");
+			},
+			isRunning: () => true,
+			isPaused: () => false,
+		});
+
+	test("records and retrieves worker/issuer/defer finisher advance decisions", () => {
+		const pipeline = createLifecyclePipeline();
+		for (const action of ["worker", "issuer", "defer"] as const) {
+			const response = pipeline.advanceFinisherLifecycle({
+				taskId: "task-finish",
+				action,
+				message: `message-${action}`,
+				reason: `reason-${action}`,
+				agentId: "finisher-1",
+			});
+			expect(response).toMatchObject({ ok: true, action });
+
+			const decision = pipeline.takeFinisherLifecycleAdvance("task-finish");
+			expect(decision).toMatchObject({
+				taskId: "task-finish",
+				action,
+				message: `message-${action}`,
+				reason: `reason-${action}`,
+				agentId: "finisher-1",
+			});
+			expect(pipeline.takeFinisherLifecycleAdvance("task-finish")).toBeNull();
+		}
+	});
+
+	test("rejects unsupported finisher advance action", () => {
+		const pipeline = createLifecyclePipeline();
+		const response = pipeline.advanceFinisherLifecycle({
+			taskId: "task-finish",
+			action: "start",
+		});
+		expect(response).toEqual({
+			ok: false,
+			summary: "advance_lifecycle rejected: unsupported action 'start'",
+		});
+		expect(pipeline.takeFinisherLifecycleAdvance("task-finish")).toBeNull();
+	});
+
+	test("records and retrieves finisher close markers", () => {
+		const pipeline = createLifecyclePipeline();
+		pipeline.recordFinisherClose({ taskId: "task-finish", reason: "done", agentId: "finisher-1" });
+
+		const closeRecord = pipeline.takeFinisherCloseRecord("task-finish");
+		expect(closeRecord).toMatchObject({
+			taskId: "task-finish",
+			reason: "done",
+			agentId: "finisher-1",
+		});
+		expect(pipeline.takeFinisherCloseRecord("task-finish")).toBeNull();
 	});
 });

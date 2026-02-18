@@ -32,6 +32,15 @@ export interface IssuerAdvanceLifecycleMessage extends IPCMessageBase {
 	agentId: string;
 }
 
+export interface FinisherAdvanceLifecycleMessage extends IPCMessageBase {
+	type: "finisher_advance_lifecycle";
+	taskId: string;
+	action: string;
+	message: string;
+	reason: string;
+	agentId: string;
+}
+
 export interface FinisherCloseTaskMessage extends IPCMessageBase {
 	type: "finisher_close_task";
 	taskId: string;
@@ -113,6 +122,7 @@ export interface IPCMessageMap {
 
 	tasks_request: TasksRequestMessage;
 	issuer_advance_lifecycle: IssuerAdvanceLifecycleMessage;
+	finisher_advance_lifecycle: FinisherAdvanceLifecycleMessage;
 	finisher_close_task: FinisherCloseTaskMessage;
 	broadcast: BroadcastMessage;
 	interrupt_agent: InterruptAgentMessage;
@@ -144,6 +154,7 @@ const CORE_IPC_MESSAGE_TYPES = [
 
 	"tasks_request",
 	"issuer_advance_lifecycle",
+	"finisher_advance_lifecycle",
 	"finisher_close_task",
 	"broadcast",
 	"interrupt_agent",
@@ -159,6 +170,7 @@ const CORE_IPC_MESSAGE_TYPES = [
 ] as const;
 
 const REPLACE_AGENT_ROLES = new Set<ReplaceAgentRole>(["finisher", "issuer", "worker"]);
+const FINISHER_LIFECYCLE_ACTIONS = new Set(["worker", "issuer", "defer"]);
 const WAIT_FOR_AGENT_DEFAULT_TIMEOUT_MS = TIMEOUT_AGENT_WAIT_MS;
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -326,6 +338,36 @@ export function parseIPCMessage(payload: unknown): ParseIPCMessageResult {
 			if (!taskId.ok) return taskId;
 			const action = readStringField(rec, rawType, "action");
 			if (!action.ok) return action;
+			const message = readStringField(rec, rawType, "message");
+			if (!message.ok) return message;
+			const reason = readStringField(rec, rawType, "reason");
+			if (!reason.ok) return reason;
+			const agentId = readStringField(rec, rawType, "agentId");
+			if (!agentId.ok) return agentId;
+			return {
+				ok: true,
+				message: {
+					...rec,
+					type: rawType,
+					taskId: taskId.value,
+					action: action.value,
+					message: message.value,
+					reason: reason.value,
+					agentId: agentId.value,
+				},
+			};
+		}
+		case "finisher_advance_lifecycle": {
+			const taskId = readStringField(rec, rawType, "taskId");
+			if (!taskId.ok) return taskId;
+			const action = readStringField(rec, rawType, "action", { trim: true });
+			if (!action.ok) return action;
+			if (!FINISHER_LIFECYCLE_ACTIONS.has(action.value)) {
+				return {
+					ok: false,
+					error: `Invalid IPC payload for "${rawType}": "action" must be one of worker, issuer, defer (received "${action.value || "(empty)"}").`,
+				};
+			}
 			const message = readStringField(rec, rawType, "message");
 			if (!message.ok) return message;
 			const reason = readStringField(rec, rawType, "reason");
