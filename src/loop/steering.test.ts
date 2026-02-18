@@ -13,7 +13,11 @@ function makeRpc(overrides: Record<string, unknown> = {}): OmsRpcClient {
 		steer: async (_message: string) => {},
 		abort: async () => {},
 		stop: async () => {},
-		waitForAgentEnd: async (_timeoutMs?: number) => {},
+		waitForAgentEnd: async (_timeoutMs = 60_000) => {},
+		prompt: async (_message: string) => {},
+		abortAndPrompt: async (_message: string) => {},
+		getState: async () => ({ isStreaming: false }),
+		suppressNextAgentEnd: () => {},
 		getLastAssistantText: async () => null,
 		getMessages: async () => [],
 		onEvent: (_listener: (event: unknown) => void) => () => {},
@@ -132,37 +136,111 @@ describe("SteeringManager", () => {
 		expect(await manager.steerAgent("", "x")).toBe(false);
 	});
 
-	test("interruptAgent sends urgent steer and asks stopper to abort targets", async () => {
-		const steerCalls: string[] = [];
-		let stoppedAgentIds: string[] = [];
-		const { manager, registry } = createManager({
-			stopAgentsMatching: async pred => {
-				stoppedAgentIds = registry
-					.getActive()
-					.filter(pred)
-					.map(agent => agent.id);
-				return new Set(["task-1"]);
-			},
-		});
+	test("interruptAgent sends suppressNextAgentEnd + abortAndPrompt to all RPC agents", async () => {
+		const abortCalls: Array<{ id: string; message: string }> = [];
+		const { manager, registry, finishCalls } = createManager();
 		registry.register(
 			makeAgent("worker-1", {
 				role: "worker",
 				taskId: "task-1",
-				rpc: makeRpc({ steer: async (msg: string) => steerCalls.push(msg) }),
+				rpc: makeRpc({
+					abortAndPrompt: async (msg: string) => {
+						abortCalls.push({ id: "worker-1", message: msg });
+					},
+				}),
 			}),
 		);
 		registry.register(
-			makeAgent("worker-2", {
-				role: "worker",
+			makeAgent("issuer-1", {
+				role: "issuer",
 				taskId: "task-1",
-				rpc: makeRpc({ steer: async (msg: string) => steerCalls.push(msg) }),
+				rpc: makeRpc({
+					abortAndPrompt: async (msg: string) => {
+						abortCalls.push({ id: "issuer-1", message: msg });
+					},
+				}),
 			}),
 		);
-
+		registry.register(
+			makeAgent("finisher-1", {
+				role: "finisher",
+				taskId: "task-1",
+				rpc: makeRpc({
+					abortAndPrompt: async (msg: string) => {
+						abortCalls.push({ id: "finisher-1", message: msg });
+					},
+				}),
+			}),
+		);
+		registry.register(
+			makeAgent("steering-1", {
+				role: "steering",
+				taskId: "task-1",
+				rpc: makeRpc({
+					abortAndPrompt: async (msg: string) => {
+						abortCalls.push({ id: "steering-1", message: msg });
+					},
+				}),
+			}),
+		);
+		registry.register(
+			makeAgent("worker-other", {
+				role: "worker",
+				taskId: "task-2",
+				rpc: makeRpc({
+					abortAndPrompt: async (msg: string) => abortCalls.push({ id: "worker-other", message: msg }),
+				}),
+			}),
+		);
 		const ok = await manager.interruptAgent("task-1", "stop and reset");
 		expect(ok).toBe(true);
-		expect(steerCalls[0]).toBe("[URGENT INTERRUPT]\n\nstop and reset");
-		expect(stoppedAgentIds.sort()).toEqual(["worker-1", "worker-2"]);
+		expect(abortCalls).toHaveLength(4);
+		expect(abortCalls.map(call => call.id).sort()).toEqual(["finisher-1", "issuer-1", "steering-1", "worker-1"]);
+		for (const call of abortCalls) {
+			expect(call.message).toBe("[URGENT MESSAGE]\n\nstop and reset");
+		}
+		expect(
+			finishCalls
+				.filter(c => c.status === "stopped")
+				.map(c => c.id)
+				.sort(),
+		).toEqual([]);
+		expect(manager.hasPendingInterruptKickoff("task-1")).toBe(false);
+	});
+
+	test("interruptAgent falls back to stop+queue when abort fails", async () => {
+		const { manager, registry, finishCalls } = createManager();
+		registry.register(
+			makeAgent("worker-1", {
+				role: "worker",
+				taskId: "task-1",
+				rpc: makeRpc({
+					abortAndPrompt: async () => {
+						throw new Error("process exited");
+					},
+				}),
+			}),
+		);
+		const ok = await manager.interruptAgent("task-1", "stop and reset");
+		expect(ok).toBe(true);
+		expect(finishCalls).toContainEqual({ id: "worker-1", status: "stopped" });
+		expect(manager.hasPendingInterruptKickoff("task-1")).toBe(true);
+		expect(manager.takePendingInterruptKickoff("task-1")).toBe("[URGENT MESSAGE]\n\nstop and reset");
+	});
+
+	test("interruptAgent falls back to stop+queue when issuer has no rpc", async () => {
+		const { manager, registry, finishCalls } = createManager();
+		registry.register(
+			makeAgent("issuer-1", {
+				role: "issuer",
+				taskId: "task-1",
+			}),
+		);
+		const ok = await manager.interruptAgent("task-1", "stop and reset");
+		expect(ok).toBe(true);
+		expect(finishCalls).toContainEqual({ id: "issuer-1", status: "stopped" });
+		expect(manager.hasPendingInterruptKickoff("task-1")).toBe(true);
+		expect(manager.takePendingInterruptKickoff("task-1")).toBe("[URGENT MESSAGE]\n\nstop and reset");
 	});
 
 	test("broadcastToWorkers routes steering decisions to workers", async () => {

@@ -6,8 +6,8 @@ import type { ExtensionAPI } from "./types";
 /**
  * OMS extension for omp.
  *
- * Provides an `interrupt_agent` tool that requests a hard reset for a task by
- * best-effort delivering an urgent message, then force-stopping task agents via the OMS main process.
+ * Provides an `interrupt_agent` tool that gracefully stops task agents and queues
+ * an urgent interrupt message for delivery on restart.
  *
  * Intended for singularity to relay specific, actionable user feedback
  * (e.g., root cause info, "stop doing X") when the task must be restarted.
@@ -21,8 +21,8 @@ export default async function interruptAgentExtension(api: ExtensionAPI): Promis
 		name: "interrupt_agent",
 		label: "Interrupt Agent",
 		description:
-			"Hard-reset a task's running agents with an urgent message. " +
-			"Message delivery is best-effort; worker/issuer/steering agents on that task are force-stopped. " +
+			"Gracefully stop task agents and queue an urgent interrupt message for delivery on restart. " +
+			"Agents are stopped gracefully (like pressing Esc in TUI), and the message is delivered when they resume. " +
 			"Use for relaying specific, actionable user feedback (root cause info, corrections, 'stop what you're doing'). " +
 			"Do NOT use for general planning or strategic redirection — use steer_agent when correction doesn't require restart. This does NOT keep the current agent session alive.",
 		parameters: Type.Object(
