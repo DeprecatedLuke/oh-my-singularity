@@ -1,8 +1,10 @@
+import { MergerQueue } from "../agents/merger-queue";
 import type { AgentRegistry } from "../agents/registry";
 import { OmsRpcClient } from "../agents/rpc-wrapper";
 import type { AgentSpawner } from "../agents/spawner";
 import type { AgentInfo } from "../agents/types";
 import { DEFAULT_CONFIG, type OmsConfig } from "../config";
+import { ReplicaManager } from "../replica/manager";
 import type { SessionLogWriter } from "../session-log-writer";
 import type { TaskStoreClient } from "../tasks/client";
 import { logger } from "../utils";
@@ -40,6 +42,12 @@ export class AgentLoop {
 	private readonly spawnAgentInFlight = new Set<string>();
 	private readonly lifecycleTransitionInFlight = new Set<string>();
 
+	#mergerQueue = new MergerQueue();
+	#replicaManager: ReplicaManager | null;
+	#mergerQueueRestored = false;
+	#mergerQueueProcessing = false;
+	#mergerQueueRunning = false;
+
 	constructor(opts: {
 		tasksClient: TaskStoreClient;
 		registry: AgentRegistry;
@@ -57,6 +65,17 @@ export class AgentLoop {
 		this.config = opts.config ?? DEFAULT_CONFIG;
 		this.onDirty = opts.onDirty;
 		this.logAgentId = opts.logAgentId;
+
+		const replicaManagerFromSpawner = (
+			this.spawner as unknown as { getReplicaManager?: () => ReplicaManager | undefined }
+		).getReplicaManager?.();
+		if (replicaManagerFromSpawner) {
+			this.#replicaManager = replicaManagerFromSpawner;
+		} else {
+			const maybeWorkingDir = (this.tasksClient as { workingDir?: unknown }).workingDir;
+			const workingDir = typeof maybeWorkingDir === "string" ? maybeWorkingDir.trim() : "";
+			this.#replicaManager = workingDir ? new ReplicaManager({ projectRoot: workingDir }) : null;
+		}
 		this.lifecycleHelpers = new LifecycleHelpers({
 			registry: this.registry,
 			loopLog: this.loopLog.bind(this),
@@ -92,6 +111,10 @@ export class AgentLoop {
 			kickoffIssuerFromFinisherAdvance: async (taskId, _kickoffMessage) =>
 				this.withLifecycleTransition(taskId, async () => {
 					const task = await this.tasksClient.show(taskId);
+					if (task.status === "blocked") {
+						this.loopLog(`Skipped issuer kickoff for blocked task ${taskId}`, "info", { taskId });
+						return;
+					}
 					this.pipelineManager.kickoffResumePipeline(task);
 				}),
 		});
@@ -192,6 +215,7 @@ export class AgentLoop {
 		});
 
 		this.registry.startHeartbeat();
+		void this.#restoreMergerQueueFromReplicas();
 
 		void this.tick();
 
@@ -368,6 +392,16 @@ export class AgentLoop {
 		return this.pipelineManager.advanceIssuerLifecycle(opts);
 	}
 
+	advanceFastWorkerLifecycle(opts: {
+		taskId?: string;
+		action?: string;
+		message?: string;
+		reason?: string;
+		agentId?: string;
+	}): Record<string, unknown> {
+		return this.pipelineManager.advanceFastWorkerLifecycle(opts);
+	}
+
 	advanceFinisherLifecycle(opts: {
 		taskId?: string;
 		action?: string;
@@ -378,6 +412,267 @@ export class AgentLoop {
 		return this.pipelineManager.advanceFinisherLifecycle(opts);
 	}
 
+	async #restoreMergerQueueFromReplicas(): Promise<void> {
+		if (this.#mergerQueueRestored) {
+			void this.#processMergerQueue();
+			return;
+		}
+
+		this.#mergerQueueRestored = true;
+		if (!this.config.enableReplicas || !this.#replicaManager) return;
+
+		try {
+			const replicaTaskIds = await this.#replicaManager.listReplicas();
+			let restoredCount = 0;
+			for (const replicaTaskId of replicaTaskIds) {
+				try {
+					const task = await this.tasksClient.show(replicaTaskId);
+					if (task.status !== "in_progress") {
+						try {
+							await this.#replicaManager.destroyReplica(replicaTaskId);
+							this.loopLog(
+								`Removed stale replica ${replicaTaskId} during startup restore (status: ${task.status})`,
+								"debug",
+								{ taskId: replicaTaskId },
+							);
+						} catch (destroyErr) {
+							this.loopLog(
+								`Failed to clean stale replica ${replicaTaskId} during startup restore: ${destroyErr instanceof Error ? destroyErr.message : String(destroyErr)}`,
+								"debug",
+								{ taskId: replicaTaskId },
+							);
+						}
+						continue;
+					}
+
+					if (this.#mergerQueue.hasTask(task.id)) continue;
+					const replicaDir = this.#replicaManager.getReplicaDir(task.id);
+					if (!this.#mergerQueue.enqueue(task.id, replicaDir)) continue;
+					restoredCount += 1;
+				} catch (err) {
+					this.loopLog(
+						`Skipped replica ${replicaTaskId} during merger queue restore: ${err instanceof Error ? err.message : String(err)}`,
+						"debug",
+						{ replicaTaskId },
+					);
+					try {
+						await this.#replicaManager.destroyReplica(replicaTaskId);
+						this.loopLog(`Removed orphaned replica ${replicaTaskId} during startup restore`, "debug", {
+							taskId: replicaTaskId,
+						});
+					} catch (destroyErr) {
+						this.loopLog(
+							`Failed to remove orphaned replica ${replicaTaskId} during startup restore: ${destroyErr instanceof Error ? destroyErr.message : String(destroyErr)}`,
+							"debug",
+							{ taskId: replicaTaskId },
+						);
+					}
+				}
+			}
+
+			if (restoredCount > 0) {
+				this.loopLog(`Restored ${restoredCount} queued merger task(s) from replica directories`, "info", {
+					restoredCount,
+					queueSize: this.#mergerQueue.size(),
+				});
+			}
+		} catch (err) {
+			this.loopLog(
+				`Failed to restore merger queue from replica directories: ${err instanceof Error ? err.message : String(err)}`,
+				"warn",
+			);
+		}
+
+		void this.#processMergerQueue();
+	}
+
+	async #closeTaskAndUnblockDependents(taskId: string, reason: string): Promise<boolean> {
+		let taskClosed = false;
+		try {
+			await this.tasksClient.close(taskId, reason);
+			taskClosed = true;
+		} catch (err) {
+			this.loopLog(`Failed to close task ${taskId}: ${err instanceof Error ? err.message : String(err)}`, "warn", {
+				taskId,
+				reason,
+			});
+		}
+
+		if (!taskClosed || this.paused) return taskClosed;
+
+		try {
+			const unblockedDependents = await this.scheduler.findTasksUnblockedBy(taskId);
+			let autoSpawnedCount = 0;
+			let skippedNoSlotCount = 0;
+			let skippedInFlightCount = 0;
+			let unblockedCount = 0;
+			let unblockFailedCount = 0;
+			let availableSlots = this.pipelineManager.availableWorkerSlots();
+			for (const dependent of unblockedDependents) {
+				if (dependent.status !== "blocked") continue;
+				try {
+					await this.tasksClient.updateStatus(dependent.id, "open");
+					unblockedCount += 1;
+				} catch (err) {
+					unblockFailedCount += 1;
+					this.loopLog(
+						`Failed to unblock dependent task ${dependent.id} after close ${taskId}: ${err instanceof Error ? err.message : String(err)}`,
+						"warn",
+						{ taskId, dependentTaskId: dependent.id },
+					);
+				}
+			}
+
+			for (const dependent of unblockedDependents) {
+				if (availableSlots <= 0) {
+					skippedNoSlotCount = unblockedDependents.length - autoSpawnedCount - skippedInFlightCount;
+					break;
+				}
+				if (this.pipelineManager.isPipelineInFlight(dependent.id)) {
+					skippedInFlightCount += 1;
+					continue;
+				}
+				this.pipelineManager.kickoffNewTaskPipeline(dependent);
+				autoSpawnedCount += 1;
+				availableSlots -= 1;
+			}
+			const skippedCount = skippedInFlightCount + skippedNoSlotCount;
+			if (autoSpawnedCount > 0 || skippedCount > 0) {
+				this.loopLog(`Auto-spawned ${autoSpawnedCount} dependent issuer(s) after task close ${taskId}`, "info", {
+					closedTaskId: taskId,
+					autoSpawnedCount,
+					skippedInFlightCount,
+					skippedNoSlotCount,
+					skippedCount,
+					unblockedCount,
+					unblockFailedCount,
+					unblockedDependentCount: unblockedDependents.length,
+					unblockedDependentIds: unblockedDependents.map(task => task.id),
+				});
+			}
+		} catch (err) {
+			this.loopLog(
+				`Failed to auto-spawn dependents after close for ${taskId}: ${err instanceof Error ? err.message : String(err)}`,
+				"warn",
+				{ taskId },
+			);
+		}
+
+		return taskClosed;
+	}
+
+	async #isTaskReadyForMergeQueue(taskId: string): Promise<boolean> {
+		const task = await this.tasksClient.show(taskId);
+		return task.status === "in_progress";
+	}
+
+	#abortActiveAgentsByRole(taskId: string, role: AgentInfo["role"]): number {
+		const agents = this.registry.getActiveByTask(taskId).filter(agent => agent.role === role);
+		for (const agent of agents) {
+			const rpc = agent.rpc;
+			if (rpc && rpc instanceof OmsRpcClient) {
+				void rpc.abort().catch(err => {
+					this.loopLog(`Failed to abort ${role} RPC during close (non-fatal)`, "debug", {
+						taskId,
+						role,
+						agentId: agent.id,
+						error: err instanceof Error ? err.message : String(err),
+					});
+				});
+			}
+		}
+		return agents.length;
+	}
+
+	async #processMergerQueue(): Promise<void> {
+		if (this.#mergerQueueRunning) return;
+		this.#mergerQueueRunning = true;
+		try {
+			if (!this.running || this.paused) return;
+			if (!this.config.enableReplicas || !this.#replicaManager) return;
+			if (this.#mergerQueueProcessing) {
+				const activeMergerExists = this.registry.getActive().some(agent => agent.role === "merger");
+				if (activeMergerExists) return;
+				this.#mergerQueueProcessing = false;
+				this.loopLog("Merger queue lock reset after merger agent exit without completion signal", "warn");
+			}
+			while (true) {
+				const entry = this.#mergerQueue.peek();
+				if (!entry) return;
+				let hasMergeWork = true;
+				try {
+					hasMergeWork = await this.#isTaskReadyForMergeQueue(entry.taskId);
+				} catch (err) {
+					this.loopLog(
+						`Failed to check queued task status for ${entry.taskId}: ${err instanceof Error ? err.message : String(err)}`,
+						"warn",
+						{ taskId: entry.taskId },
+					);
+					hasMergeWork = true;
+				}
+				if (!hasMergeWork) {
+					this.#mergerQueue.dequeue();
+					try {
+						await this.#replicaManager.destroyReplica(entry.taskId);
+					} catch (err) {
+						this.loopLog(
+							`Failed to cleanup stale merge queue entry for ${entry.taskId}: ${err instanceof Error ? err.message : String(err)}`,
+							"warn",
+							{ taskId: entry.taskId },
+						);
+					}
+					this.loopLog(`Skipped merger for ${entry.taskId}: task no longer in_progress`, "warn", {
+						taskId: entry.taskId,
+						replicaDir: entry.replicaDir,
+					});
+					continue;
+				}
+				const replicaExists = await this.#replicaManager.replicaExists(entry.taskId).catch(err => {
+					this.loopLog(
+						`Failed to check queued replica for ${entry.taskId}: ${err instanceof Error ? err.message : String(err)}`,
+						"warn",
+						{
+							taskId: entry.taskId,
+							replicaDir: entry.replicaDir,
+						},
+					);
+					return false;
+				});
+				if (!replicaExists) {
+					this.#mergerQueue.dequeue();
+					await this.#closeTaskAndUnblockDependents(
+						entry.taskId,
+						"Closed without merge (replica directory missing)",
+					);
+					this.loopLog(`Skipped merger for ${entry.taskId}: replica directory missing`, "warn", {
+						taskId: entry.taskId,
+						replicaDir: entry.replicaDir,
+					});
+					continue;
+				}
+				this.#mergerQueueProcessing = true;
+				try {
+					const merger = await this.spawner.spawnMerger(entry.taskId, entry.replicaDir);
+					this.rpcHandlerManager.attachRpcHandlers(merger);
+					this.lifecycleHelpers.logAgentStart("loop", merger, `Replica merge: ${entry.replicaDir}`);
+					this.onDirty?.();
+				} catch (err) {
+					this.#mergerQueueProcessing = false;
+					this.loopLog(
+						`Failed to spawn merger for ${entry.taskId}: ${err instanceof Error ? err.message : String(err)}`,
+						"warn",
+						{
+							taskId: entry.taskId,
+							replicaDir: entry.replicaDir,
+						},
+					);
+				}
+				return;
+			}
+		} finally {
+			this.#mergerQueueRunning = false;
+		}
+	}
 	async handleFinisherCloseTask(opts: {
 		taskId?: string;
 		reason?: string;
@@ -396,97 +691,58 @@ export class AgentLoop {
 			agentId: agentId || undefined,
 		});
 
-		let taskClosed = false;
-		try {
-			await this.tasksClient.close(taskId, reason || "Closed by finisher");
-			taskClosed = true;
-		} catch (err) {
-			this.loopLog(`Failed to close task ${taskId}: ${err instanceof Error ? err.message : String(err)}`, "warn", {
-				taskId,
-				reason: reason || null,
-			});
-		}
+		const finishers = this.registry.getActiveByTask(taskId).filter(agent => agent.role === "finisher");
+		const finisherWithReplica =
+			finishers.find(
+				agent => agent.id === agentId && typeof agent.replicaDir === "string" && agent.replicaDir.trim(),
+			) ?? finishers.find(agent => typeof agent.replicaDir === "string" && agent.replicaDir.trim());
+		const replicaDir =
+			typeof finisherWithReplica?.replicaDir === "string" ? finisherWithReplica.replicaDir.trim() : "";
 
-		if (taskClosed && !this.paused) {
+		if (this.config.enableReplicas && this.#replicaManager && replicaDir) {
+			let replicaExists = false;
 			try {
-				const unblockedDependents = await this.scheduler.findTasksUnblockedBy(taskId);
-				let autoSpawnedCount = 0;
-				let skippedNoSlotCount = 0;
-				let skippedInFlightCount = 0;
-				let unblockedCount = 0;
-				let unblockFailedCount = 0;
-				let availableSlots = this.pipelineManager.availableWorkerSlots();
-				for (const dependent of unblockedDependents) {
-					if (dependent.status !== "blocked") continue;
-					try {
-						await this.tasksClient.updateStatus(dependent.id, "open");
-						unblockedCount += 1;
-					} catch (err) {
-						unblockFailedCount += 1;
-						this.loopLog(
-							`Failed to unblock dependent task ${dependent.id} after close ${taskId}: ${err instanceof Error ? err.message : String(err)}`,
-							"warn",
-							{ taskId, dependentTaskId: dependent.id },
-						);
-					}
-				}
-
-				for (const dependent of unblockedDependents) {
-					if (availableSlots <= 0) {
-						skippedNoSlotCount = unblockedDependents.length - autoSpawnedCount - skippedInFlightCount;
-						break;
-					}
-					if (this.pipelineManager.isPipelineInFlight(dependent.id)) {
-						skippedInFlightCount += 1;
-						continue;
-					}
-					this.pipelineManager.kickoffNewTaskPipeline(dependent);
-					autoSpawnedCount += 1;
-					availableSlots -= 1;
-				}
-
-				const skippedCount = skippedInFlightCount + skippedNoSlotCount;
-				if (autoSpawnedCount > 0 || skippedCount > 0) {
-					this.loopLog(`Auto-spawned ${autoSpawnedCount} dependent issuer(s) after task close ${taskId}`, "info", {
-						closedTaskId: taskId,
-						autoSpawnedCount,
-						skippedInFlightCount,
-						skippedNoSlotCount,
-						skippedCount,
-						unblockedCount,
-						unblockFailedCount,
-						unblockedDependentCount: unblockedDependents.length,
-						unblockedDependentIds: unblockedDependents.map(task => task.id),
-					});
-				}
+				replicaExists = await this.#replicaManager.replicaExists(taskId);
 			} catch (err) {
 				this.loopLog(
-					`Failed to auto-spawn dependents after close for ${taskId}: ${err instanceof Error ? err.message : String(err)}`,
+					`Failed to check replica existence for ${taskId}: ${err instanceof Error ? err.message : String(err)}`,
 					"warn",
-					{ taskId },
+					{ taskId, replicaDir },
 				);
 			}
-		}
 
-		const finishers = this.registry.getActiveByTask(taskId).filter(a => a.role === "finisher");
-		for (const finisher of finishers) {
-			const rpc = finisher.rpc;
-			if (rpc && rpc instanceof OmsRpcClient) {
-				void rpc.abort().catch(err => {
-					this.loopLog("Failed to abort finisher RPC during close (non-fatal)", "debug", {
-						taskId,
-						finisherId: finisher.id,
-						error: err instanceof Error ? err.message : String(err),
-					});
+			if (replicaExists) {
+				this.#mergerQueue.enqueue(taskId, replicaDir);
+				const abortedFinisherCount = this.#abortActiveAgentsByRole(taskId, "finisher");
+				this.loopLog(`Finisher close queued merger for ${taskId}`, "info", {
+					taskId,
+					reason: reason || null,
+					agentId: agentId || null,
+					replicaDir,
+					abortedFinisherCount,
+					mergerQueueSize: this.#mergerQueue.size(),
 				});
+				void this.#processMergerQueue();
+				return {
+					ok: true,
+					summary: `finisher_close_task queued merger for ${taskId}`,
+					taskId,
+					reason: reason || null,
+					agentId: agentId || null,
+					replicaDir,
+					queuedForMerge: true,
+					abortedFinisherCount,
+				};
 			}
 		}
 
+		await this.#closeTaskAndUnblockDependents(taskId, reason || "Closed by finisher");
+		const abortedFinisherCount = this.#abortActiveAgentsByRole(taskId, "finisher");
 		this.loopLog(`Finisher close recorded for ${taskId}`, "info", {
 			taskId,
 			reason: reason || null,
 			agentId: agentId || null,
-			abortedFinisherCount: finishers.length,
+			abortedFinisherCount,
 		});
 
 		return {
@@ -495,7 +751,145 @@ export class AgentLoop {
 			taskId,
 			reason: reason || null,
 			agentId: agentId || null,
-			abortedFinisherCount: finishers.length,
+			abortedFinisherCount,
+		};
+	}
+
+	async handleExternalTaskClose(taskId: string): Promise<void> {
+		const normalizedTaskId = taskId.trim();
+		if (!normalizedTaskId || !this.#mergerQueue.hasTask(normalizedTaskId)) return;
+
+		this.#mergerQueue.remove(normalizedTaskId);
+		if (this.#replicaManager) {
+			try {
+				await this.#replicaManager.destroyReplica(normalizedTaskId);
+			} catch (err) {
+				this.loopLog(
+					`Failed to destroy replica for externally closed task ${normalizedTaskId}: ${err instanceof Error ? err.message : String(err)}`,
+					"warn",
+					{ taskId: normalizedTaskId },
+				);
+			}
+		}
+
+		const abortedMergerCount = this.#abortActiveAgentsByRole(normalizedTaskId, "merger");
+		this.loopLog(`External close removed ${normalizedTaskId} from merger queue`, "info", {
+			taskId: normalizedTaskId,
+			abortedMergerCount,
+			mergerQueueSize: this.#mergerQueue.size(),
+		});
+		void this.#processMergerQueue();
+	}
+
+	async handleMergerComplete(opts: {
+		taskId?: string;
+		reason?: string;
+		agentId?: string;
+	}): Promise<Record<string, unknown>> {
+		const taskId = typeof opts.taskId === "string" ? opts.taskId.trim() : "";
+		if (!taskId) {
+			return { ok: false, summary: "merger_complete rejected: taskId is required" };
+		}
+
+		const reason = typeof opts.reason === "string" ? opts.reason.trim() : "";
+		const agentId = typeof opts.agentId === "string" ? opts.agentId.trim() : "";
+		const queueHead = this.#mergerQueue.peek();
+		if (queueHead?.taskId === taskId) {
+			this.#mergerQueue.dequeue();
+		} else {
+			this.#mergerQueue.remove(taskId);
+		}
+
+		if (this.#replicaManager) {
+			try {
+				await this.#replicaManager.destroyReplica(taskId);
+			} catch (err) {
+				this.loopLog(
+					`Failed to destroy replica for ${taskId}: ${err instanceof Error ? err.message : String(err)}`,
+					"warn",
+					{ taskId },
+				);
+			}
+		}
+
+		await this.#closeTaskAndUnblockDependents(taskId, reason || "Closed by merger");
+		const abortedMergerCount = this.#abortActiveAgentsByRole(taskId, "merger");
+
+		this.#mergerQueueProcessing = false;
+		void this.#processMergerQueue();
+
+		this.loopLog(`Merger complete recorded for ${taskId}`, "info", {
+			taskId,
+			reason: reason || null,
+			agentId: agentId || null,
+			abortedMergerCount,
+		});
+
+		return {
+			ok: true,
+			summary: `merger_complete recorded for ${taskId}`,
+			taskId,
+			reason: reason || null,
+			agentId: agentId || null,
+			abortedMergerCount,
+		};
+	}
+
+	async handleMergerConflict(opts: {
+		taskId?: string;
+		reason?: string;
+		agentId?: string;
+	}): Promise<Record<string, unknown>> {
+		const taskId = typeof opts.taskId === "string" ? opts.taskId.trim() : "";
+		if (!taskId) {
+			return { ok: false, summary: "merger_conflict rejected: taskId is required" };
+		}
+
+		const reason = typeof opts.reason === "string" ? opts.reason.trim() : "";
+		const conflictReason = reason || "No conflict details provided";
+		const agentId = typeof opts.agentId === "string" ? opts.agentId.trim() : "";
+		const queueHead = this.#mergerQueue.peek();
+		if (queueHead?.taskId === taskId) {
+			this.#mergerQueue.dequeue();
+		} else {
+			this.#mergerQueue.remove(taskId);
+		}
+
+		try {
+			await this.tasksClient.updateStatus(taskId, "blocked");
+		} catch (err) {
+			this.loopLog(
+				`Failed to set blocked status for ${taskId}: ${err instanceof Error ? err.message : String(err)}`,
+				"warn",
+				{ taskId },
+			);
+		}
+
+		try {
+			await this.tasksClient.comment(taskId, `Blocked by merger conflict. ${conflictReason}`);
+		} catch (err) {
+			logger.debug("loop/agent-loop.ts: failed to post merger conflict comment (non-fatal)", { err });
+		}
+
+		const abortedMergerCount = this.#abortActiveAgentsByRole(taskId, "merger");
+
+		this.#mergerQueueProcessing = false;
+		void this.#processMergerQueue();
+
+		this.loopLog(`Merger conflict recorded for ${taskId}`, "warn", {
+			taskId,
+			reason: conflictReason,
+			agentId: agentId || null,
+			abortedMergerCount,
+		});
+
+		return {
+			ok: true,
+			summary: `merger_conflict recorded for ${taskId}`,
+			taskId,
+			reason: conflictReason,
+			agentId: agentId || null,
+			abortedMergerCount,
 		};
 	}
 
@@ -731,7 +1125,31 @@ export class AgentLoop {
 			agent => agent.taskId === taskId && (includeFinisher || agent.role !== "finisher"),
 		);
 		if (stopped.size > 0) {
+			const reason = "Blocked by user via Stop. Ask Singularity for guidance, then unblock when ready.";
+			await Promise.all(
+				[...stopped].map(async stoppedTaskId => {
+					try {
+						await this.tasksClient.updateStatus(stoppedTaskId, "blocked");
+					} catch (err) {
+						this.loopLog(
+							`Failed to set blocked status for ${stoppedTaskId}: ${err instanceof Error ? err.message : err}`,
+							"warn",
+							{ taskId: stoppedTaskId },
+						);
+					}
+
+					try {
+						await this.tasksClient.comment(stoppedTaskId, reason);
+					} catch (err) {
+						logger.debug(
+							"loop/agent-loop.ts: best-effort failure after await this.tasksClient.comment(stoppedTaskId, reason);",
+							{ err },
+						);
+					}
+				}),
+			);
 			this.loopLog(`Stopped agents for task ${taskId}`, "info", { taskId, includeFinisher, stopped: [...stopped] });
+			this.loopLog(`Blocked ${stopped.size} task(s) after Stop`, "info", { taskIds: [...stopped] });
 		}
 	}
 
@@ -820,6 +1238,7 @@ export class AgentLoop {
 		if (this.tickInFlight) return;
 		this.tickInFlight = true;
 		try {
+			await this.#processMergerQueue();
 			let slots = this.pipelineManager.availableWorkerSlots();
 
 			// Phase 1a: Resume some in-progress tasks, but keep one slot available for new work.

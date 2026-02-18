@@ -429,6 +429,74 @@ describe("PipelineManager issuer lifecycle recovery", () => {
 		expect(resumeAgentCalls).toBe(0);
 	});
 
+	test("runIssuerForTask aborts recovery when task is blocked after initial issuer failure", async () => {
+		const task: TaskIssue = { ...makeTask("task-blocked-recovery"), status: "blocked" };
+		const initialRpc = new OmsRpcClient();
+		const initialIssuer = makeIssuer(task.id, initialRpc, "issuer-task-blocked-initial");
+		initialIssuer.sessionId = "blocked-session-1";
+		let showCalls = 0;
+		let spawnIssuerCalls = 0;
+		let resumeAgentCalls = 0;
+
+		(initialRpc as unknown as { waitForAgentEnd: (_timeoutMs?: number) => Promise<void> }).waitForAgentEnd =
+			async () => {
+				throw new Error("issuer crashed");
+			};
+
+		const pipeline = new PipelineManager({
+			tasksClient: {
+				show: async () => {
+					showCalls += 1;
+					return task;
+				},
+				updateStatus: async () => {},
+				comment: async () => {},
+			} as unknown as TaskStoreClient,
+			registry: {
+				getActiveByTask: () => [],
+			} as never,
+			scheduler: {} as never,
+			spawner: {
+				spawnIssuer: async () => {
+					spawnIssuerCalls += 1;
+					return initialIssuer;
+				},
+				resumeAgent: async () => {
+					resumeAgentCalls += 1;
+					throw new Error("resumeAgent should not be called");
+				},
+			} as never,
+			getMaxWorkers: () => 1,
+			getActiveWorkerAgents: () => [],
+			loopLog: () => {},
+			onDirty: () => {},
+			wake: () => {},
+			attachRpcHandlers: () => {},
+			finishAgent: async () => {},
+			logAgentStart: () => {},
+			logAgentFinished: async () => {},
+			hasPendingInterruptKickoff: () => false,
+			takePendingInterruptKickoff: () => null,
+			hasFinisherTakeover: () => false,
+			spawnFinisherAfterStoppingSteering: async () => {
+				throw new Error("Unexpected finisher spawn");
+			},
+			isRunning: () => true,
+			isPaused: () => false,
+		});
+
+		const result = await pipeline.runIssuerForTask(task);
+		expect(result).toEqual({
+			start: false,
+			message: null,
+			reason: "task blocked during issuer execution",
+			raw: null,
+		});
+		expect(showCalls).toBe(1);
+		expect(spawnIssuerCalls).toBe(1);
+		expect(resumeAgentCalls).toBe(0);
+	});
+
 	test("runIssuerForTask aborts recovery when task is deleted after initial issuer failure", async () => {
 		const task = makeTask("task-deleted-recovery");
 		const initialRpc = new OmsRpcClient();
@@ -577,5 +645,178 @@ describe("PipelineManager finisher lifecycle tracking", () => {
 			agentId: "finisher-1",
 		});
 		expect(pipeline.takeFinisherCloseRecord("task-finish")).toBeNull();
+	});
+});
+
+describe("PipelineManager tiny-scope fast-worker routing", () => {
+	const createTinyScopeFixture = (opts: {
+		runFastWorkerForTask: () => Promise<{
+			done: boolean;
+			escalate: boolean;
+			message: string | null;
+			reason: string | null;
+			raw: string | null;
+		}>;
+		runIssuerForTask?: (runOpts?: { kickoffMessage?: string }) => Promise<IssuerResult>;
+		tryClaim?: boolean;
+	}) => {
+		const calls = {
+			runFastWorkerForTask: 0,
+			runIssuerForTask: 0,
+			spawnWorker: 0,
+			spawnFinisher: 0,
+			issuerKickoffs: [] as Array<string | undefined>,
+			finisherOutputs: [] as string[],
+		};
+		const pipeline = new PipelineManager({
+			tasksClient: {
+				updateStatus: async () => {},
+				comment: async () => {},
+			} as unknown as TaskStoreClient,
+			registry: {} as never,
+			scheduler: {
+				tryClaim: async () => opts.tryClaim ?? true,
+			} as never,
+			spawner: {
+				spawnWorker: async (taskId: string) => {
+					calls.spawnWorker += 1;
+					return makeWorker(taskId);
+				},
+				spawnDesignerWorker: async () =>
+					({
+						...makeWorker("designer"),
+						role: "designer-worker",
+					}) as never,
+			} as never,
+			getMaxWorkers: () => 1,
+			getActiveWorkerAgents: () => [],
+			loopLog: () => {},
+			onDirty: () => {},
+			wake: () => {},
+			attachRpcHandlers: () => {},
+			finishAgent: async () => {},
+			logAgentStart: () => {},
+			logAgentFinished: async () => {},
+			hasPendingInterruptKickoff: () => false,
+			takePendingInterruptKickoff: () => null,
+			hasFinisherTakeover: () => false,
+			spawnFinisherAfterStoppingSteering: async (_taskId: string, workerOutput: string) => {
+				calls.spawnFinisher += 1;
+				calls.finisherOutputs.push(workerOutput);
+				return {
+					...makeWorker("finisher", `finisher:${Date.now()}`),
+					role: "finisher",
+				} as AgentInfo;
+			},
+			isRunning: () => true,
+			isPaused: () => false,
+		});
+
+		(
+			pipeline as unknown as {
+				runFastWorkerForTask: (task: TaskIssue) => Promise<{
+					done: boolean;
+					escalate: boolean;
+					message: string | null;
+					reason: string | null;
+					raw: string | null;
+				}>;
+			}
+		).runFastWorkerForTask = async () => {
+			calls.runFastWorkerForTask += 1;
+			return await opts.runFastWorkerForTask();
+		};
+		(
+			pipeline as unknown as {
+				runIssuerForTask: (task: TaskIssue, runOpts?: { kickoffMessage?: string }) => Promise<IssuerResult>;
+			}
+		).runIssuerForTask = async (_task, runOpts) => {
+			calls.runIssuerForTask += 1;
+			calls.issuerKickoffs.push(runOpts?.kickoffMessage);
+			if (opts.runIssuerForTask) return await opts.runIssuerForTask(runOpts);
+			return { start: true, message: null, reason: null, raw: null };
+		};
+
+		return { pipeline, calls };
+	};
+
+	test("tiny scope uses fast-worker done path and skips issuer/worker spawn", async () => {
+		const { pipeline, calls } = createTinyScopeFixture({
+			runFastWorkerForTask: async () => ({
+				done: true,
+				escalate: false,
+				message: "tiny change complete",
+				reason: null,
+				raw: "{}",
+			}),
+			runIssuerForTask: async () => {
+				throw new Error("issuer should not run");
+			},
+		});
+		const task: TaskIssue = { ...makeTask("tiny-done"), scope: "tiny" };
+
+		await (pipeline as unknown as { runNewTaskPipeline: (task: TaskIssue) => Promise<void> }).runNewTaskPipeline(
+			task,
+		);
+
+		expect(calls.runFastWorkerForTask).toBe(1);
+		expect(calls.runIssuerForTask).toBe(0);
+		expect(calls.spawnWorker).toBe(0);
+		expect(calls.spawnFinisher).toBe(1);
+		expect(calls.finisherOutputs).toEqual(["tiny change complete"]);
+	});
+
+	test("tiny scope escalation falls through to issuer and spawns worker", async () => {
+		const { pipeline, calls } = createTinyScopeFixture({
+			runFastWorkerForTask: async () => ({
+				done: false,
+				escalate: true,
+				message: "touches broader lifecycle code",
+				reason: "requires decomposition",
+				raw: "{}",
+			}),
+			runIssuerForTask: async () => ({
+				start: true,
+				message: "issuer kickoff",
+				reason: null,
+				raw: "{}",
+			}),
+		});
+		const task: TaskIssue = { ...makeTask("tiny-escalate"), scope: "tiny" };
+
+		await (pipeline as unknown as { runNewTaskPipeline: (task: TaskIssue) => Promise<void> }).runNewTaskPipeline(
+			task,
+		);
+
+		expect(calls.runFastWorkerForTask).toBe(1);
+		expect(calls.runIssuerForTask).toBe(1);
+		expect(calls.spawnWorker).toBe(1);
+		expect(calls.spawnFinisher).toBe(0);
+		expect(calls.issuerKickoffs[0]).toContain("Fast-worker escalated this tiny task to full issuer lifecycle.");
+		expect(calls.issuerKickoffs[0]).toContain("Reason: requires decomposition");
+	});
+
+	test("non-tiny scope keeps normal issuer path", async () => {
+		const { pipeline, calls } = createTinyScopeFixture({
+			runFastWorkerForTask: async () => {
+				throw new Error("fast-worker should not run");
+			},
+			runIssuerForTask: async () => ({
+				start: true,
+				message: null,
+				reason: null,
+				raw: null,
+			}),
+		});
+		const task: TaskIssue = { ...makeTask("small-normal"), scope: "small" };
+
+		await (pipeline as unknown as { runNewTaskPipeline: (task: TaskIssue) => Promise<void> }).runNewTaskPipeline(
+			task,
+		);
+
+		expect(calls.runFastWorkerForTask).toBe(0);
+		expect(calls.runIssuerForTask).toBe(1);
+		expect(calls.spawnWorker).toBe(1);
+		expect(calls.spawnFinisher).toBe(0);
 	});
 });

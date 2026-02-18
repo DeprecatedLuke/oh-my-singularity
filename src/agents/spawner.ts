@@ -1,7 +1,16 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { DEFAULT_CONFIG, FINISHER_TOOLS, ISSUER_TOOLS, type OmsConfig, STEERING_TOOLS, WORKER_TOOLS } from "../config";
+import {
+	DEFAULT_CONFIG,
+	FINISHER_TOOLS,
+	ISSUER_TOOLS,
+	MERGER_TOOLS,
+	type OmsConfig,
+	STEERING_TOOLS,
+	WORKER_TOOLS,
+} from "../config";
 import { AGENT_EXTENSION_FILENAMES } from "../config/constants";
+import type { ReplicaManager } from "../replica/manager";
 import type { TaskStoreClient } from "../tasks/client";
 import { logger } from "../utils";
 import type { AgentRegistry } from "./registry";
@@ -207,6 +216,7 @@ export class AgentSpawner {
 	private readonly registry: AgentRegistry;
 	private readonly config: OmsConfig;
 	private readonly tasksAvailable: boolean;
+	#replicaManager?: ReplicaManager;
 
 	private readonly ipcSockPath?: string;
 
@@ -214,16 +224,20 @@ export class AgentSpawner {
 	private readonly extensionsDir: string;
 
 	private readonly workerPromptPath: string;
+	private readonly fastWorkerPromptPath: string;
 	private readonly designerWorkerPromptPath: string;
 	private readonly finisherPromptPath: string;
+	private readonly mergerPromptPath: string;
 	private readonly steeringPromptPath: string;
 	private readonly issuerPromptPath: string;
 	private readonly broadcastSteeringPromptPath: string;
 	private readonly resolverPromptPath: string;
 
 	private readonly workerExtensionPath: string;
+	private readonly fastWorkerExtensionPath: string;
 	private readonly designerWorkerExtensionPath: string;
 	private readonly finisherExtensionPath: string;
+	private readonly mergerExtensionPath: string;
 	private readonly steeringExtensionPath: string;
 	private readonly issuerExtensionPath: string;
 	private readonly broadcastExtensionPath: string;
@@ -247,28 +261,34 @@ export class AgentSpawner {
 		config?: OmsConfig;
 		ipcSockPath?: string;
 		tasksAvailable?: boolean;
+		replicaManager?: ReplicaManager;
 	}) {
 		this.tasksClient = opts.tasksClient;
 		this.registry = opts.registry;
 		this.config = opts.config ?? DEFAULT_CONFIG;
 		this.ipcSockPath = opts.ipcSockPath;
 		this.tasksAvailable = opts.tasksAvailable ?? true;
+		this.#replicaManager = opts.replicaManager;
 
 		const baseDir = getImportMetaDir();
 		this.promptsDir = path.resolve(baseDir, "prompts");
 		this.extensionsDir = path.resolve(baseDir, "extensions");
 
 		this.workerPromptPath = path.resolve(this.promptsDir, "worker.md");
+		this.fastWorkerPromptPath = path.resolve(this.promptsDir, "fast-worker.md");
 		this.designerWorkerPromptPath = path.resolve(this.promptsDir, "designer-worker.md");
 		this.finisherPromptPath = path.resolve(this.promptsDir, "finisher.md");
+		this.mergerPromptPath = path.resolve(this.promptsDir, "merger.md");
 		this.steeringPromptPath = path.resolve(this.promptsDir, "steering.md");
 		this.issuerPromptPath = path.resolve(this.promptsDir, "issuer.md");
 		this.broadcastSteeringPromptPath = path.resolve(this.promptsDir, "broadcast-steering.md");
 		this.resolverPromptPath = path.resolve(this.promptsDir, "resolver.md");
 
 		this.workerExtensionPath = this.buildExtensionPath(AGENT_EXTENSION_FILENAMES.worker);
+		this.fastWorkerExtensionPath = this.buildExtensionPath(AGENT_EXTENSION_FILENAMES.fastWorker);
 		this.designerWorkerExtensionPath = this.buildExtensionPath(AGENT_EXTENSION_FILENAMES.designerWorker);
 		this.finisherExtensionPath = this.buildExtensionPath(AGENT_EXTENSION_FILENAMES.finisher);
+		this.mergerExtensionPath = this.buildExtensionPath(AGENT_EXTENSION_FILENAMES.merger);
 		this.steeringExtensionPath = this.buildExtensionPath(AGENT_EXTENSION_FILENAMES.steering);
 		this.issuerExtensionPath = this.buildExtensionPath(AGENT_EXTENSION_FILENAMES.issuer);
 		this.broadcastExtensionPath = this.buildExtensionPath(AGENT_EXTENSION_FILENAMES.broadcast);
@@ -288,6 +308,10 @@ export class AgentSpawner {
 		return this.tasksAvailable;
 	}
 
+	getReplicaManager(): ReplicaManager | undefined {
+		return this.#replicaManager;
+	}
+
 	private spawnGuardKey(role: SpawnGuardRole, taskId: string): string {
 		return `${role}:${taskId}`;
 	}
@@ -296,10 +320,41 @@ export class AgentSpawner {
 		const active = this.registry.getByTask(taskId).filter(agent => isActiveStatus(agent.status));
 
 		if (role === "worker") {
-			return active.find(agent => agent.role === "worker" || agent.role === "designer-worker") ?? null;
+			return (
+				active.find(
+					agent => agent.role === "worker" || agent.role === "fast-worker" || agent.role === "designer-worker",
+				) ?? null
+			);
 		}
 
 		return active.find(agent => agent.role === role) ?? null;
+	}
+
+	#getRegisteredWorkerReplicaDir(taskId: string): string | undefined {
+		const workerWithReplica = this.registry.getByTask(taskId).find(agent => {
+			if (agent.role !== "worker" && agent.role !== "fast-worker" && agent.role !== "designer-worker") return false;
+			return typeof agent.replicaDir === "string" && agent.replicaDir.trim().length > 0;
+		});
+		return workerWithReplica?.replicaDir;
+	}
+
+	async #resolveFinisherReplicaDir(taskId: string): Promise<string | undefined> {
+		if (!this.config.enableReplicas || !this.#replicaManager) return undefined;
+
+		const workerReplicaDir = this.#getRegisteredWorkerReplicaDir(taskId);
+		if (workerReplicaDir) return workerReplicaDir;
+
+		try {
+			const replicaExists = await this.#replicaManager.replicaExists(taskId);
+			if (!replicaExists) return undefined;
+			return this.#replicaManager.getReplicaDir(taskId);
+		} catch (err) {
+			logger.warn("agents/spawner.ts: failed to resolve finisher replica directory, falling back to root cwd", {
+				taskId,
+				err,
+			});
+			return undefined;
+		}
 	}
 
 	private async withSpawnGuard(
@@ -344,6 +399,213 @@ export class AgentSpawner {
 	async spawnDesignerWorker(taskId: string, opts?: { claim?: boolean; kickoffMessage?: string }): Promise<AgentInfo> {
 		return await this.withSpawnGuard("worker", taskId, async () => {
 			return await this.spawnImplementationWorker("designer-worker", taskId, opts);
+		});
+	}
+
+	async spawnFastWorker(
+		taskId: string,
+		opts?: { claim?: boolean; kickoffMessage?: string; resumeSessionId?: string },
+	): Promise<AgentInfo> {
+		return await this.withSpawnGuard("worker", taskId, async () => {
+			const normalizedResumeSessionId =
+				typeof opts?.resumeSessionId === "string" && opts.resumeSessionId.trim()
+					? opts.resumeSessionId.trim()
+					: undefined;
+			const normalizedKickoffMessage =
+				typeof opts?.kickoffMessage === "string" && opts.kickoffMessage.trim() ? opts.kickoffMessage.trim() : "";
+			const spawnedAt = Date.now();
+			let tasksAgentId: string | null = null;
+			let rpc: OmsRpcClient | null = null;
+
+			try {
+				if (opts?.claim !== false) {
+					await this.tasksClient.claim(taskId);
+				} else {
+					const current = await this.tasksClient.show(taskId);
+					const status = (typeof current.status === "string" ? current.status : "").toLowerCase();
+					if (status === "blocked" || status === "closed" || status === "deferred") {
+						throw new Error(`Task ${taskId} status is '${status}'; refusing to spawn fast-worker`);
+					}
+				}
+
+				tasksAgentId = await this.tasksClient.createAgent(`fast-worker-${taskId}`);
+				await this.tasksClient.setAgentState(tasksAgentId, "spawning");
+				const agentId = `fast-worker:${taskId}:${tasksAgentId}`;
+				const roleCfg = this.config.roles["fast-worker"];
+				const toolsBase = normalizeTools(roleCfg.tools ?? WORKER_TOOLS, WORKER_TOOLS, {
+					stripBash: false,
+				});
+				const tools = toolsBase;
+				const args: string[] = [
+					"--thinking",
+					roleCfg.thinking,
+					...(roleCfg.model ? ["--model", roleCfg.model] : []),
+					"--no-pty",
+					...(normalizedResumeSessionId ? ["--resume", normalizedResumeSessionId] : []),
+					"--extension",
+					this.ompCrashLoggerExtensionPath,
+					"--extension",
+					this.fastWorkerExtensionPath,
+					"--extension",
+					this.tasksBashGuardExtensionPath,
+					"--tools",
+					tools,
+					"--append-system-prompt",
+					this.fastWorkerPromptPath,
+				];
+
+				let replicaDir: string | undefined;
+				let workerCwd = this.tasksClient.workingDir;
+				if (this.config.enableReplicas && this.#replicaManager) {
+					try {
+						replicaDir = await this.#replicaManager.createReplica(taskId);
+						workerCwd = replicaDir;
+					} catch (err) {
+						logger.warn(
+							"agents/spawner.ts: failed to create fast-worker replica directory, falling back to root cwd",
+							{
+								taskId,
+								err,
+							},
+						);
+					}
+				}
+
+				rpc = new OmsRpcClient({
+					ompCli: this.config.ompCli,
+					cwd: workerCwd,
+					env: buildEnv({
+						TASKS_ACTOR: "oms-fast-worker",
+						OMS_ROLE: "fast-worker",
+						OMS_TASK_ID: taskId,
+						OMS_AGENT_ID: agentId,
+						OMS_SINGULARITY_SOCK: this.ipcSockPath,
+					}),
+					args,
+				});
+
+				rpc.start();
+
+				let promptText: string | null = null;
+				if (normalizedResumeSessionId) {
+					if (normalizedKickoffMessage) {
+						promptText = normalizedKickoffMessage;
+						await rpc.prompt(promptText);
+					}
+				} else {
+					const task = await this.tasksClient.show(taskId);
+					const dependsOnIds = Array.isArray(task.depends_on_ids)
+						? task.depends_on_ids
+								.filter(
+									(dependencyId): dependencyId is string =>
+										typeof dependencyId === "string" && dependencyId.trim().length > 0,
+								)
+								.map(dependencyId => dependencyId.trim())
+						: [];
+					const parentComments = dependsOnIds.length
+						? await formatParentTaskComments(this.tasksClient, dependsOnIds)
+						: "";
+					const referenceIds = Array.isArray(task.references)
+						? task.references
+								.filter(
+									(referenceId): referenceId is string =>
+										typeof referenceId === "string" && referenceId.trim().length > 0,
+								)
+								.map(referenceId => referenceId.trim())
+						: [];
+					const referencedTaskComments = referenceIds.length
+						? await formatReferencedTaskComments(this.tasksClient, referenceIds)
+						: "";
+					const kickoffGuidance = normalizedKickoffMessage
+						? `## Implementation Guidance\n\n${normalizedKickoffMessage}`
+						: "";
+					const extra = [parentComments, referencedTaskComments, kickoffGuidance].filter(Boolean).join("\n\n");
+					promptText = buildTaskPrompt({
+						role: "fast-worker",
+						task: {
+							id: task.id,
+							title: task.title,
+							description: task.description,
+							acceptance: task.acceptance_criteria,
+							issueType: task.issue_type,
+							labels: task.labels,
+						},
+						extra: extra || undefined,
+					});
+					await rpc.prompt(promptText);
+				}
+
+				await this.tasksClient.setSlot(tasksAgentId, "callbackHandler", taskId);
+				await this.tasksClient.setAgentState(tasksAgentId, "working");
+				const info: AgentInfo = {
+					id: agentId,
+					role: "fast-worker",
+					taskId,
+					replicaDir,
+					tasksAgentId,
+					status: "working",
+					usage: createEmptyAgentUsage(),
+					events: [],
+					spawnedAt,
+					lastActivity: Date.now(),
+					rpc,
+					model: roleCfg.model,
+					thinking: roleCfg.thinking,
+					sessionId: this.getAgentSessionId(rpc) ?? normalizedResumeSessionId,
+				};
+				this.registry.register(info);
+				if (promptText?.trim()) {
+					this.registry.pushEvent(info.id, { type: "initial_prompt", text: promptText, ts: Date.now() });
+				}
+				return info;
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+
+				if (tasksAgentId) {
+					try {
+						const action = normalizedResumeSessionId ? "resume" : "spawn";
+						await this.tasksClient.comment(
+							taskId,
+							`Failed to ${action} fast-worker RPC agent for task ${taskId}.\n` +
+								`tasksAgentId: ${tasksAgentId}\n` +
+								`sessionId: ${normalizedResumeSessionId ?? "(none)"}\n` +
+								`error: ${message}`,
+						);
+					} catch (err) {
+						logger.debug("agents/spawner.ts: failed to record fast-worker spawn-failure comment (non-fatal)", {
+							err,
+						});
+					}
+
+					try {
+						await this.tasksClient.setAgentState(tasksAgentId, "failed");
+					} catch (err) {
+						logger.debug(
+							'agents/spawner.ts: best-effort failure after await this.tasksClient.setAgentState(tasksAgentId, "failed");',
+							{ err },
+						);
+					}
+
+					try {
+						await this.tasksClient.close(tasksAgentId, "spawn failed");
+					} catch (err) {
+						logger.debug(
+							'agents/spawner.ts: best-effort failure after await this.tasksClient.close(tasksAgentId, "spawn failed");',
+							{ err },
+						);
+					}
+				}
+
+				if (rpc) {
+					try {
+						await rpc.stop();
+					} catch (err) {
+						logger.debug("agents/spawner.ts: best-effort failure after await rpc.stop();", { err });
+					}
+				}
+
+				throw err;
+			}
 		});
 	}
 
@@ -406,9 +668,24 @@ export class AgentSpawner {
 				promptPath,
 			];
 
+			let replicaDir: string | undefined;
+			let workerCwd = this.tasksClient.workingDir;
+			if (this.config.enableReplicas && this.#replicaManager) {
+				try {
+					replicaDir = await this.#replicaManager.createReplica(taskId);
+					workerCwd = replicaDir;
+				} catch (err) {
+					logger.warn("agents/spawner.ts: failed to create worker replica directory, falling back to root cwd", {
+						taskId,
+						kind,
+						err,
+					});
+				}
+			}
+
 			rpc = new OmsRpcClient({
 				ompCli: this.config.ompCli,
-				cwd: this.tasksClient.workingDir,
+				cwd: workerCwd,
 				env: buildEnv({
 					TASKS_ACTOR: `oms-${kind}`,
 					OMS_ROLE: kind,
@@ -468,6 +745,7 @@ export class AgentSpawner {
 				id: agentId,
 				role: kind,
 				taskId,
+				replicaDir,
 				tasksAgentId,
 				status: "working",
 				usage: createEmptyAgentUsage(),
@@ -511,6 +789,138 @@ export class AgentSpawner {
 				} catch (err) {
 					logger.debug(
 						'agents/spawner.ts: best-effort failure after await this.tasksClient.close(tasksAgentId, "spawn failed");',
+						{ err },
+					);
+				}
+			}
+
+			if (rpc) {
+				try {
+					await rpc.stop();
+				} catch (err) {
+					logger.debug("agents/spawner.ts: best-effort failure after await rpc.stop();", { err });
+				}
+			}
+
+			throw err;
+		}
+	}
+
+	async spawnMerger(taskId: string, replicaDir: string): Promise<AgentInfo> {
+		const normalizedTaskId = taskId.trim();
+		if (!normalizedTaskId) throw new Error("spawnMerger requires a non-empty taskId");
+
+		const normalizedReplicaDir = replicaDir.trim();
+		if (!normalizedReplicaDir) throw new Error("spawnMerger requires a non-empty replicaDir");
+
+		const spawnedAt = Date.now();
+		let tasksAgentId: string | null = null;
+		let rpc: OmsRpcClient | null = null;
+
+		try {
+			tasksAgentId = await this.tasksClient.createAgent(`merger-${normalizedTaskId}`);
+			await this.tasksClient.setAgentState(tasksAgentId, "spawning");
+			const agentId = `merger:${normalizedTaskId}:${tasksAgentId}`;
+			const roleCfg = this.config.roles.merger;
+			const toolsBase = normalizeTools(roleCfg.tools ?? MERGER_TOOLS, MERGER_TOOLS, {
+				stripBash: false,
+			});
+			const tools = toolsBase;
+			const args: string[] = [
+				"--thinking",
+				roleCfg.thinking,
+				...(roleCfg.model ? ["--model", roleCfg.model] : []),
+				"--no-pty",
+				"--extension",
+				this.ompCrashLoggerExtensionPath,
+				"--extension",
+				this.mergerExtensionPath,
+				"--extension",
+				this.tasksBashGuardExtensionPath,
+				"--tools",
+				tools,
+				"--append-system-prompt",
+				this.mergerPromptPath,
+			];
+
+			rpc = new OmsRpcClient({
+				ompCli: this.config.ompCli,
+				cwd: this.tasksClient.workingDir,
+				env: buildEnv({
+					TASKS_ACTOR: "oms-merger",
+					OMS_ROLE: "merger",
+					OMS_TASK_ID: normalizedTaskId,
+					OMS_AGENT_ID: agentId,
+					OMS_REPLICA_DIR: normalizedReplicaDir,
+					OMS_SINGULARITY_SOCK: this.ipcSockPath,
+				}),
+				args,
+			});
+
+			rpc.start();
+
+			const task = await this.tasksClient.show(normalizedTaskId);
+			const mergerExtra =
+				`Replica directory: ${normalizedReplicaDir}\n` + `Project root: ${this.tasksClient.workingDir}`;
+			const promptText = buildTaskPrompt({
+				role: "merger",
+				task: {
+					id: task.id,
+					title: task.title,
+					description: task.description,
+					acceptance: task.acceptance_criteria,
+					issueType: task.issue_type,
+					labels: task.labels,
+				},
+				extra: mergerExtra,
+			});
+			await rpc.prompt(promptText);
+
+			await this.tasksClient.setSlot(tasksAgentId, "callbackHandler", normalizedTaskId);
+			await this.tasksClient.setAgentState(tasksAgentId, "working");
+			const info: AgentInfo = {
+				id: agentId,
+				role: "merger",
+				taskId: normalizedTaskId,
+				replicaDir: normalizedReplicaDir,
+				tasksAgentId,
+				status: "working",
+				usage: createEmptyAgentUsage(),
+				events: [],
+				spawnedAt,
+				lastActivity: Date.now(),
+				rpc,
+				model: roleCfg.model,
+				thinking: roleCfg.thinking,
+				sessionId: this.getAgentSessionId(rpc),
+			};
+
+			this.registry.register(info);
+			this.registry.pushEvent(info.id, { type: "initial_prompt", text: promptText, ts: Date.now() });
+			return info;
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+
+			if (tasksAgentId) {
+				try {
+					await this.tasksClient.comment(
+						normalizedTaskId,
+						`Failed to spawn merger RPC agent for task ${normalizedTaskId}.\n` +
+							`tasksAgentId: ${tasksAgentId}\n` +
+							`replicaDir: ${normalizedReplicaDir}\n` +
+							`error: ${message}`,
+					);
+				} catch (err) {
+					logger.debug("agents/spawner.ts: failed to record merger spawn-failure comment (non-fatal)", {
+						err,
+					});
+				}
+
+				try {
+					await this.tasksClient.setAgentState(tasksAgentId, "failed");
+				} catch (err) {
+					logger.debug(
+						'agents/spawner.ts: best-effort failure after await this.tasksClient.setAgentState(tasksAgentId, "failed");',
 						{ err },
 					);
 				}
@@ -576,9 +986,12 @@ export class AgentSpawner {
 			"--append-system-prompt",
 			this.finisherPromptPath,
 		];
+
+		const replicaDir = await this.#resolveFinisherReplicaDir(taskId);
+		const finisherCwd = replicaDir ?? this.tasksClient.workingDir;
 		const rpc = new OmsRpcClient({
 			ompCli: this.config.ompCli,
-			cwd: this.tasksClient.workingDir,
+			cwd: finisherCwd,
 			env: buildEnv({
 				TASKS_ACTOR: "oms-finisher",
 				OMS_ROLE: "finisher",
@@ -634,6 +1047,7 @@ export class AgentSpawner {
 			id: agentId,
 			role: "finisher",
 			taskId,
+			replicaDir,
 			tasksAgentId,
 			status: "working",
 			usage: createEmptyAgentUsage(),

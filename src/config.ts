@@ -11,7 +11,15 @@ import {
 } from "./config/constants";
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
-export type AgentRole = "singularity" | "issuer" | "worker" | "designer-worker" | "finisher" | "steering";
+export type AgentRole =
+	| "singularity"
+	| "issuer"
+	| "worker"
+	| "fast-worker"
+	| "designer-worker"
+	| "finisher"
+	| "merger"
+	| "steering";
 
 type RoleKey = AgentRole | "orchestrator";
 
@@ -30,6 +38,7 @@ export interface OmsConfig {
 	maxWorkers: number;
 	/** Rolling per-agent event buffer size for TUI logs. */
 	agentEventLimit: number;
+	enableReplicas: boolean;
 
 	layout: {
 		/** Height ratio (0..1) for the Tasks pane (top). */
@@ -50,6 +59,8 @@ export const WORKER_TOOLS =
 
 export const FINISHER_TOOLS = "bash,read,grep,find,lsp,python,notebook,browser,fetch,web_search,todo_write,task";
 
+export const MERGER_TOOLS = "bash,read,grep,find";
+
 export const STEERING_TOOLS = "bash,read,grep,find,lsp,python,notebook,browser,fetch,web_search,todo_write,task";
 
 export const ISSUER_TOOLS = "bash,read,grep,find,lsp,python,notebook,browser,fetch,web_search,todo_write,task";
@@ -60,6 +71,7 @@ export const DEFAULT_CONFIG: OmsConfig = {
 	steeringIntervalMs: TIMEOUT_STEERING_INTERVAL_MS,
 	maxWorkers: DEFAULT_MAX_WORKERS,
 	agentEventLimit: LIMIT_AGENT_EVENT_BUFFER,
+	enableReplicas: false,
 
 	layout: {
 		tasksHeightRatio: DEFAULT_LAYOUT_TASKS_HEIGHT_RATIO,
@@ -78,6 +90,11 @@ export const DEFAULT_CONFIG: OmsConfig = {
 			thinking: "xhigh",
 			tools: WORKER_TOOLS,
 		},
+		"fast-worker": {
+			model: "codex-spark",
+			thinking: "medium",
+			tools: WORKER_TOOLS,
+		},
 		"designer-worker": {
 			model: "opus",
 			thinking: "xhigh",
@@ -87,6 +104,11 @@ export const DEFAULT_CONFIG: OmsConfig = {
 			model: "codex-spark",
 			thinking: "medium",
 			tools: FINISHER_TOOLS,
+		},
+		merger: {
+			model: "codex-spark",
+			thinking: "medium",
+			tools: MERGER_TOOLS,
 		},
 		steering: {
 			model: "codex-spark",
@@ -105,8 +127,10 @@ function normalizeRoleKey(role: string): Exclude<AgentRole, "singularity"> | nul
 	if (
 		role === "issuer" ||
 		role === "worker" ||
+		role === "fast-worker" ||
 		role === "designer-worker" ||
 		role === "finisher" ||
+		role === "merger" ||
 		role === "steering"
 	) {
 		return role;
@@ -141,11 +165,22 @@ function readPositiveIntEnv(name: string): number | undefined {
 	return parsed;
 }
 
+function readBooleanEnv(name: string): boolean | undefined {
+	const raw = readNonEmptyEnv(name);
+	if (!raw) return undefined;
+	const normalized = raw.toLowerCase();
+	if (normalized === "1" || normalized === "true") return true;
+	if (normalized === "0" || normalized === "false") return false;
+	return undefined;
+}
+
 const ROLE_ENV_SUFFIX: Record<Exclude<AgentRole, "singularity">, string> = {
 	issuer: "ISSUER",
 	worker: "WORKER",
+	"fast-worker": "FAST_WORKER",
 	"designer-worker": "DESIGNER_WORKER",
 	finisher: "FINISHER",
+	merger: "MERGER",
 	steering: "STEERING",
 };
 
@@ -167,8 +202,19 @@ export function loadConfigFromEnvironment(): OmsConfigOverride {
 	const agentEventLimit = readPositiveIntEnv("OMS_AGENT_EVENT_LIMIT");
 	if (typeof agentEventLimit === "number") override.agentEventLimit = agentEventLimit;
 
+	const enableReplicas = readBooleanEnv("OMS_ENABLE_REPLICAS");
+	if (typeof enableReplicas === "boolean") override.enableReplicas = enableReplicas;
+
 	const roleOverrides: Partial<Record<RoleKey, Partial<RoleConfig>>> = {};
-	for (const role of ["issuer", "worker", "designer-worker", "finisher", "steering"] as const) {
+	for (const role of [
+		"issuer",
+		"worker",
+		"fast-worker",
+		"designer-worker",
+		"finisher",
+		"merger",
+		"steering",
+	] as const) {
 		const suffix = ROLE_ENV_SUFFIX[role];
 		const model = readNonEmptyEnv(`OMS_MODEL_${suffix}`);
 		const thinking = readNonEmptyEnv(`OMS_THINKING_${suffix}`);

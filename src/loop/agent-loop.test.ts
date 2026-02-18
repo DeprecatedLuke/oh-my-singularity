@@ -60,6 +60,202 @@ function createLoopFixture() {
 	return { loop, registry, calls };
 }
 
+type ReplicaDependentTask = {
+	id: string;
+	status?: string;
+	issue_type?: string;
+	depends_on_ids?: string[];
+};
+
+function createLoopWithReplicasFixture() {
+	const calls = {
+		close: [] as Array<{ taskId: string; reason?: string }>,
+		setAgentState: [] as Array<{ id: string; state: string }>,
+		clearSlot: [] as Array<{ id: string; slot: string }>,
+		updateStatus: [] as Array<{ taskId: string; status: string }>,
+		comment: [] as Array<{ taskId: string; text: string }>,
+		show: [] as string[],
+		replicaExists: [] as string[],
+		destroyReplica: [] as string[],
+		listReplicas: 0,
+		getReplicaDir: [] as string[],
+		spawnMerger: [] as Array<{ taskId: string; replicaDir: string }>,
+		abortMerger: [] as string[],
+		attachRpcHandlers: [] as string[],
+		logAgentStart: [] as Array<{ agentId: string; note?: string }>,
+		sequence: [] as string[],
+	};
+	const replicaExistsByTaskId = new Map<string, boolean>();
+	const replicaDirsByTaskId = new Map<string, string>();
+	const taskStatusByTaskId = new Map<string, string>();
+	const dependentsByTaskId = new Map<string, ReplicaDependentTask[]>();
+	const showErrorsByTaskId = new Map<string, Error>();
+
+	const tasksClient = {
+		workingDir: "/repo",
+		close: async (taskId: string, reason?: string) => {
+			calls.sequence.push(`close:${taskId}`);
+			calls.close.push({ taskId, reason });
+		},
+		updateStatus: async (taskId: string, status: string) => {
+			calls.sequence.push(`updateStatus:${taskId}:${status}`);
+			calls.updateStatus.push({ taskId, status });
+		},
+		comment: async (taskId: string, text: string) => {
+			calls.sequence.push(`comment:${taskId}`);
+			calls.comment.push({ taskId, text });
+		},
+		setAgentState: async (id: string, state: string) => {
+			calls.setAgentState.push({ id, state });
+		},
+		clearSlot: async (id: string, slot: string) => {
+			calls.clearSlot.push({ id, slot });
+		},
+		show: async (taskId: string) => {
+			calls.sequence.push(`show:${taskId}`);
+			calls.show.push(taskId);
+			const showError = showErrorsByTaskId.get(taskId);
+			if (showError) throw showError;
+			return {
+				id: taskId,
+				title: `Task ${taskId}`,
+				description: null,
+				acceptance_criteria: null,
+				status: taskStatusByTaskId.get(taskId) ?? "in_progress",
+				priority: 2,
+				issue_type: "task",
+				labels: [],
+				assignee: null,
+				created_at: "2026-01-01T00:00:00.000Z",
+				updated_at: "2026-01-01T00:00:00.000Z",
+			};
+		},
+	} as unknown as TaskStoreClient;
+	const registry = new AgentRegistry({ tasksClient });
+	const scheduler = {
+		getInProgressTasksWithoutAgent: async () => [],
+		getNextTasks: async () => [],
+		findTasksUnblockedBy: async (taskId: string) => dependentsByTaskId.get(taskId) ?? [],
+	} as never;
+
+	const replicaManager = {
+		replicaExists: async (taskId: string) => {
+			calls.sequence.push(`replicaExists:${taskId}`);
+			calls.replicaExists.push(taskId);
+			return replicaExistsByTaskId.get(taskId) ?? false;
+		},
+		destroyReplica: async (taskId: string) => {
+			calls.sequence.push(`destroyReplica:${taskId}`);
+			calls.destroyReplica.push(taskId);
+		},
+		listReplicas: async () => {
+			calls.sequence.push("listReplicas");
+			calls.listReplicas += 1;
+			return [...replicaDirsByTaskId.keys()];
+		},
+		getReplicaDir: (taskId: string) => {
+			calls.sequence.push(`getReplicaDir:${taskId}`);
+			calls.getReplicaDir.push(taskId);
+			return replicaDirsByTaskId.get(taskId) ?? `/tmp/replica/${taskId}`;
+		},
+	};
+
+	let mergerCount = 0;
+	const spawner = {
+		getReplicaManager: () => replicaManager,
+		spawnMerger: async (taskId: string, replicaDir: string) => {
+			calls.sequence.push(`spawnMerger:${taskId}`);
+			calls.spawnMerger.push({ taskId, replicaDir });
+			mergerCount += 1;
+			return registry.register({
+				id: `merger:${taskId}:${mergerCount}`,
+				role: "merger",
+				taskId,
+				tasksAgentId: `agent-merger-${mergerCount}`,
+				status: "running",
+				usage: createEmptyAgentUsage(),
+				events: [],
+				spawnedAt: mergerCount,
+				lastActivity: mergerCount + 1,
+				rpc: makeRpc({ abort: async () => calls.abortMerger.push(taskId) }),
+			});
+		},
+	} as never;
+
+	const loop = new AgentLoop({
+		tasksClient,
+		registry,
+		scheduler,
+		spawner,
+		config: { ...DEFAULT_CONFIG, enableReplicas: true, pollIntervalMs: 50, steeringIntervalMs: 50 },
+	});
+	(
+		loop as unknown as {
+			rpcHandlerManager: { attachRpcHandlers: (agent: { id: string }) => void };
+		}
+	).rpcHandlerManager.attachRpcHandlers = (agent: { id: string }) => {
+		calls.sequence.push(`attachRpcHandlers:${agent.id}`);
+		calls.attachRpcHandlers.push(agent.id);
+	};
+	(
+		loop as unknown as {
+			lifecycleHelpers: {
+				logAgentStart: (_startedBy: string, agent: { id: string }, note?: string) => void;
+			};
+		}
+	).lifecycleHelpers.logAgentStart = (_startedBy: string, agent: { id: string }, note?: string) => {
+		calls.sequence.push(`logAgentStart:${agent.id}`);
+		calls.logAgentStart.push({ agentId: agent.id, note });
+	};
+
+	const setReplica = (taskId: string, replicaDir: string, exists = true): void => {
+		replicaDirsByTaskId.set(taskId, replicaDir);
+		replicaExistsByTaskId.set(taskId, exists);
+	};
+	const setReplicaExists = (taskId: string, exists: boolean): void => {
+		replicaExistsByTaskId.set(taskId, exists);
+	};
+	const setTaskStatus = (taskId: string, status: string): void => {
+		taskStatusByTaskId.set(taskId, status);
+	};
+	const setShowError = (taskId: string, error: Error): void => {
+		showErrorsByTaskId.set(taskId, error);
+	};
+	const setUnblockedDependents = (taskId: string, dependents: ReplicaDependentTask[]): void => {
+		dependentsByTaskId.set(taskId, dependents);
+	};
+
+	return {
+		loop,
+		registry,
+		calls,
+		setReplica,
+		setReplicaExists,
+		setTaskStatus,
+		setUnblockedDependents,
+		setShowError,
+	};
+}
+
+function registerReplicaFinisher(
+	fixture: ReturnType<typeof createLoopWithReplicasFixture>,
+	opts: { taskId: string; agentId: string; replicaDir?: string; onAbort?: () => void },
+): void {
+	fixture.registry.register({
+		id: opts.agentId,
+		role: "finisher",
+		taskId: opts.taskId,
+		tasksAgentId: `agent-${opts.agentId}`,
+		status: "running",
+		usage: createEmptyAgentUsage(),
+		events: [],
+		spawnedAt: 1,
+		lastActivity: 2,
+		replicaDir: opts.replicaDir,
+		rpc: makeRpc({ abort: async () => opts.onAbort?.() }),
+	});
+}
+
 describe("AgentLoop lifecycle", () => {
 	test("start -> pause -> resume -> stop transitions", async () => {
 		const { loop, registry } = createLoopFixture();
@@ -128,6 +324,27 @@ describe("AgentLoop delegation", () => {
 		const result = loop.advanceIssuerLifecycle({ taskId: "task-1", action: "promote" });
 		expect(result).toEqual({ ok: true, source: "pipeline" });
 		expect(delegated).toEqual([{ taskId: "task-1", action: "promote" }]);
+	});
+
+	test("advanceFastWorkerLifecycle delegates to pipeline manager", () => {
+		const { loop } = createLoopFixture();
+		const delegated: unknown[] = [];
+		(
+			loop as unknown as {
+				pipelineManager: {
+					advanceFastWorkerLifecycle: (opts: unknown) => unknown;
+				};
+			}
+		).pipelineManager = {
+			advanceFastWorkerLifecycle: (opts: unknown) => {
+				delegated.push(opts);
+				return { ok: true, source: "pipeline-fast-worker" };
+			},
+		} as never;
+
+		const result = loop.advanceFastWorkerLifecycle({ taskId: "task-1", action: "done" });
+		expect(result).toEqual({ ok: true, source: "pipeline-fast-worker" });
+		expect(delegated).toEqual([{ taskId: "task-1", action: "done" }]);
 	});
 
 	test("advanceFinisherLifecycle delegates to pipeline manager", () => {
@@ -288,6 +505,90 @@ describe("AgentLoop delegation", () => {
 
 		expect(showCalls).toBe(0);
 		expect(runIssuerCalls).toBe(0);
+	});
+
+	test("spawnAgentBySingularity keeps replace_agent unblock behavior for blocked tasks", async () => {
+		const { loop, registry, calls } = createLoopFixture();
+		(loop as unknown as { running: boolean; paused: boolean }).running = true;
+		let spawnCalls = 0;
+
+		(
+			loop as unknown as {
+				tasksClient: {
+					show: (taskId: string) => Promise<{ id: string; title: string; status: string; issue_type: string }>;
+				};
+			}
+		).tasksClient.show = async taskId => ({
+			id: taskId,
+			title: "Task 1",
+			status: "blocked",
+			issue_type: "task",
+		});
+
+		(
+			loop as unknown as {
+				pipelineManager: {
+					spawnTaskWorker: (
+						task: { id: string },
+						opts?: { claim?: boolean; kickoffMessage?: string | null },
+					) => Promise<unknown>;
+				};
+			}
+		).pipelineManager.spawnTaskWorker = async (task: { id: string }) => {
+			spawnCalls += 1;
+			return registry.register({
+				id: `worker:${task.id}:replacement`,
+				role: "worker",
+				taskId: task.id,
+				tasksAgentId: `agent-worker-${task.id}-replacement`,
+				status: "running",
+				usage: createEmptyAgentUsage(),
+				events: [],
+				spawnedAt: 1,
+				lastActivity: 2,
+				rpc: makeRpc(),
+			});
+		};
+
+		await loop.spawnAgentBySingularity({ role: "worker", taskId: "task-1" });
+
+		expect(calls.updateStatus).toContainEqual({ taskId: "task-1", status: "in_progress" });
+		expect(spawnCalls).toBe(1);
+	});
+
+	test("stopAgentsForTask blocks task when active agents were stopped", async () => {
+		const { loop, registry, calls } = createLoopFixture();
+		registry.register({
+			id: "worker:task-stop",
+			role: "worker",
+			taskId: "task-stop",
+			tasksAgentId: "agent-worker-task-stop",
+			status: "running",
+			usage: createEmptyAgentUsage(),
+			events: [],
+			spawnedAt: 1,
+			lastActivity: 2,
+			rpc: makeRpc(),
+		});
+
+		await loop.stopAgentsForTask("task-stop");
+
+		expect(calls.updateStatus).toEqual([{ taskId: "task-stop", status: "blocked" }]);
+		expect(calls.comment).toEqual([
+			{
+				taskId: "task-stop",
+				text: "Blocked by user via Stop. Ask Singularity for guidance, then unblock when ready.",
+			},
+		]);
+	});
+
+	test("stopAgentsForTask does not block task when no agents were stopped", async () => {
+		const { loop, calls } = createLoopFixture();
+
+		await loop.stopAgentsForTask("task-missing");
+
+		expect(calls.updateStatus).toEqual([]);
+		expect(calls.comment).toEqual([]);
 	});
 	test("handleFinisherCloseTask validates task id, closes task, and aborts active finisher rpc", async () => {
 		const { loop, registry, calls } = createLoopFixture();
@@ -590,6 +891,429 @@ describe("AgentLoop delegation", () => {
 	});
 });
 
+describe("AgentLoop merger queue integration", () => {
+	test("handleFinisherCloseTask queues merger when replicas are enabled and replica exists", async () => {
+		const fixture = createLoopWithReplicasFixture();
+		const { loop, calls, setReplica } = fixture;
+		const aborted: string[] = [];
+		setReplica("task-r", "/tmp/replica/task-r", true);
+		registerReplicaFinisher(fixture, {
+			taskId: "task-r",
+			agentId: "finisher:task-r",
+			replicaDir: "/tmp/replica/task-r",
+			onAbort: () => aborted.push("finisher:task-r"),
+		});
+		(loop as unknown as { running: boolean; paused: boolean }).running = true;
+		(loop as unknown as { paused: boolean }).paused = false;
+
+		const result = await loop.handleFinisherCloseTask({
+			taskId: "task-r",
+			reason: "done",
+			agentId: "finisher:task-r",
+		});
+		await Bun.sleep(5);
+
+		expect(result).toMatchObject({
+			ok: true,
+			taskId: "task-r",
+			queuedForMerge: true,
+			replicaDir: "/tmp/replica/task-r",
+		});
+		expect(calls.close).toEqual([]);
+		expect(aborted).toEqual(["finisher:task-r"]);
+		expect(calls.spawnMerger).toEqual([{ taskId: "task-r", replicaDir: "/tmp/replica/task-r" }]);
+	});
+
+	test("handleFinisherCloseTask falls back to immediate close when finisher has no replicaDir", async () => {
+		const fixture = createLoopWithReplicasFixture();
+		const { loop, calls } = fixture;
+		registerReplicaFinisher(fixture, {
+			taskId: "task-no-replica",
+			agentId: "finisher:task-no-replica",
+		});
+		(loop as unknown as { running: boolean; paused: boolean }).running = true;
+		(loop as unknown as { paused: boolean }).paused = false;
+
+		const result = (await loop.handleFinisherCloseTask({
+			taskId: "task-no-replica",
+			reason: "done",
+			agentId: "finisher:task-no-replica",
+		})) as { queuedForMerge?: boolean };
+		await Bun.sleep(5);
+
+		expect(result.queuedForMerge).toBeUndefined();
+		expect(calls.close).toEqual([{ taskId: "task-no-replica", reason: "done" }]);
+		expect(calls.spawnMerger).toEqual([]);
+	});
+
+	test("handleFinisherCloseTask falls back to immediate close when replica no longer exists", async () => {
+		const fixture = createLoopWithReplicasFixture();
+		const { loop, calls, setReplica } = fixture;
+		setReplica("task-missing-replica", "/tmp/replica/task-missing-replica", false);
+		registerReplicaFinisher(fixture, {
+			taskId: "task-missing-replica",
+			agentId: "finisher:task-missing-replica",
+			replicaDir: "/tmp/replica/task-missing-replica",
+		});
+		(loop as unknown as { running: boolean; paused: boolean }).running = true;
+		(loop as unknown as { paused: boolean }).paused = false;
+
+		const result = (await loop.handleFinisherCloseTask({
+			taskId: "task-missing-replica",
+			reason: "done",
+			agentId: "finisher:task-missing-replica",
+		})) as { queuedForMerge?: boolean };
+		await Bun.sleep(5);
+
+		expect(result.queuedForMerge).toBeUndefined();
+		expect(calls.close).toEqual([{ taskId: "task-missing-replica", reason: "done" }]);
+		expect(calls.spawnMerger).toEqual([]);
+	});
+
+	test("handleFinisherCloseTask keeps non-replica flow unchanged when replicas are disabled", async () => {
+		const { loop, registry, calls } = createLoopFixture();
+		registry.register({
+			id: "finisher:task-disabled",
+			role: "finisher",
+			taskId: "task-disabled",
+			tasksAgentId: "agent-finisher-task-disabled",
+			status: "running",
+			usage: createEmptyAgentUsage(),
+			events: [],
+			spawnedAt: 1,
+			lastActivity: 2,
+			replicaDir: "/tmp/replica/task-disabled",
+			rpc: makeRpc(),
+		});
+
+		await loop.handleFinisherCloseTask({ taskId: "task-disabled", reason: "done" });
+
+		expect(calls.close).toEqual([{ taskId: "task-disabled", reason: "done" }]);
+	});
+
+	test("handleMergerComplete destroys replica, closes task, unblocks dependents, and starts next queued merger", async () => {
+		const fixture = createLoopWithReplicasFixture();
+		const { loop, calls, setReplica, setUnblockedDependents } = fixture;
+		setReplica("task-a", "/tmp/replica/task-a", true);
+		setReplica("task-b", "/tmp/replica/task-b", true);
+		setUnblockedDependents("task-a", [
+			{
+				id: "task-a-dep",
+				status: "blocked",
+				issue_type: "task",
+				depends_on_ids: ["task-a"],
+			},
+		]);
+		registerReplicaFinisher(fixture, {
+			taskId: "task-a",
+			agentId: "finisher:task-a",
+			replicaDir: "/tmp/replica/task-a",
+		});
+		registerReplicaFinisher(fixture, {
+			taskId: "task-b",
+			agentId: "finisher:task-b",
+			replicaDir: "/tmp/replica/task-b",
+		});
+		(loop as unknown as { running: boolean; paused: boolean }).running = true;
+		(loop as unknown as { paused: boolean }).paused = false;
+		(
+			loop as unknown as {
+				pipelineManager: {
+					availableWorkerSlots: () => number;
+					isPipelineInFlight: (_taskId: string) => boolean;
+					kickoffNewTaskPipeline: (_task: { id: string }) => void;
+				};
+			}
+		).pipelineManager = {
+			availableWorkerSlots: () => 0,
+			isPipelineInFlight: () => false,
+			kickoffNewTaskPipeline: () => {},
+		} as never;
+
+		await loop.handleFinisherCloseTask({ taskId: "task-a", reason: "done", agentId: "finisher:task-a" });
+		await loop.handleFinisherCloseTask({ taskId: "task-b", reason: "done", agentId: "finisher:task-b" });
+		await Bun.sleep(5);
+		expect(calls.spawnMerger).toEqual([{ taskId: "task-a", replicaDir: "/tmp/replica/task-a" }]);
+
+		calls.sequence.length = 0;
+		const result = await loop.handleMergerComplete({ taskId: "task-a", reason: "merged cleanly" });
+		await Bun.sleep(5);
+
+		expect(result).toMatchObject({ ok: true, taskId: "task-a" });
+		expect(calls.destroyReplica).toContain("task-a");
+		expect(calls.close).toContainEqual({ taskId: "task-a", reason: "merged cleanly" });
+		expect(calls.updateStatus).toContainEqual({ taskId: "task-a-dep", status: "open" });
+		expect(calls.spawnMerger).toEqual([
+			{ taskId: "task-a", replicaDir: "/tmp/replica/task-a" },
+			{ taskId: "task-b", replicaDir: "/tmp/replica/task-b" },
+		]);
+		const destroyIndex = calls.sequence.indexOf("destroyReplica:task-a");
+		const closeIndex = calls.sequence.indexOf("close:task-a");
+		const unblockIndex = calls.sequence.indexOf("updateStatus:task-a-dep:open");
+		const nextSpawnIndex = calls.sequence.indexOf("spawnMerger:task-b");
+		expect(destroyIndex).toBeGreaterThan(-1);
+		expect(closeIndex).toBeGreaterThan(destroyIndex);
+		expect(unblockIndex).toBeGreaterThan(closeIndex);
+		expect(nextSpawnIndex).toBeGreaterThan(unblockIndex);
+	});
+
+	test("handleMergerConflict blocks task, comments conflict reason, keeps replica, and starts next queued merger", async () => {
+		const fixture = createLoopWithReplicasFixture();
+		const { loop, calls, setReplica } = fixture;
+		setReplica("task-c", "/tmp/replica/task-c", true);
+		setReplica("task-d", "/tmp/replica/task-d", true);
+		registerReplicaFinisher(fixture, {
+			taskId: "task-c",
+			agentId: "finisher:task-c",
+			replicaDir: "/tmp/replica/task-c",
+		});
+		registerReplicaFinisher(fixture, {
+			taskId: "task-d",
+			agentId: "finisher:task-d",
+			replicaDir: "/tmp/replica/task-d",
+		});
+		(loop as unknown as { running: boolean; paused: boolean }).running = true;
+		(loop as unknown as { paused: boolean }).paused = false;
+
+		await loop.handleFinisherCloseTask({ taskId: "task-c", reason: "done", agentId: "finisher:task-c" });
+		await loop.handleFinisherCloseTask({ taskId: "task-d", reason: "done", agentId: "finisher:task-d" });
+		await Bun.sleep(5);
+		expect(calls.spawnMerger).toEqual([{ taskId: "task-c", replicaDir: "/tmp/replica/task-c" }]);
+
+		calls.sequence.length = 0;
+		const result = await loop.handleMergerConflict({
+			taskId: "task-c",
+			reason: "merge conflict in src/conflict.ts",
+		});
+		await Bun.sleep(5);
+
+		expect(result).toMatchObject({
+			ok: true,
+			taskId: "task-c",
+			reason: "merge conflict in src/conflict.ts",
+		});
+		expect(calls.close.find(call => call.taskId === "task-c")).toBeUndefined();
+		expect(calls.updateStatus).toContainEqual({ taskId: "task-c", status: "blocked" });
+		expect(calls.comment).toContainEqual({
+			taskId: "task-c",
+			text: "Blocked by merger conflict. merge conflict in src/conflict.ts",
+		});
+		expect(calls.destroyReplica).not.toContain("task-c");
+		expect(calls.spawnMerger).toEqual([
+			{ taskId: "task-c", replicaDir: "/tmp/replica/task-c" },
+			{ taskId: "task-d", replicaDir: "/tmp/replica/task-d" },
+		]);
+		const blockIndex = calls.sequence.indexOf("updateStatus:task-c:blocked");
+		const nextSpawnIndex = calls.sequence.indexOf("spawnMerger:task-d");
+		expect(blockIndex).toBeGreaterThan(-1);
+		expect(nextSpawnIndex).toBeGreaterThan(blockIndex);
+	});
+
+	test("merger queue serializes two completions FIFO", async () => {
+		const fixture = createLoopWithReplicasFixture();
+		const { loop, calls, setReplica } = fixture;
+		setReplica("task-1", "/tmp/replica/task-1", true);
+		setReplica("task-2", "/tmp/replica/task-2", true);
+		registerReplicaFinisher(fixture, {
+			taskId: "task-1",
+			agentId: "finisher:task-1",
+			replicaDir: "/tmp/replica/task-1",
+		});
+		registerReplicaFinisher(fixture, {
+			taskId: "task-2",
+			agentId: "finisher:task-2",
+			replicaDir: "/tmp/replica/task-2",
+		});
+		(loop as unknown as { running: boolean; paused: boolean }).running = true;
+		(loop as unknown as { paused: boolean }).paused = false;
+
+		await loop.handleFinisherCloseTask({ taskId: "task-1", reason: "done", agentId: "finisher:task-1" });
+		await loop.handleFinisherCloseTask({ taskId: "task-2", reason: "done", agentId: "finisher:task-2" });
+		await Bun.sleep(5);
+		expect(calls.spawnMerger).toEqual([{ taskId: "task-1", replicaDir: "/tmp/replica/task-1" }]);
+
+		await loop.handleMergerComplete({ taskId: "task-1", reason: "merged" });
+		await Bun.sleep(5);
+		expect(calls.spawnMerger).toEqual([
+			{ taskId: "task-1", replicaDir: "/tmp/replica/task-1" },
+			{ taskId: "task-2", replicaDir: "/tmp/replica/task-2" },
+		]);
+	});
+
+	test("handleExternalTaskClose removes manually closed queued merge task and destroys replica", async () => {
+		const fixture = createLoopWithReplicasFixture();
+		const { loop, calls, setReplica } = fixture;
+		setReplica("task-merge", "/tmp/replica/task-merge", true);
+		setReplica("task-manual-close", "/tmp/replica/task-manual-close", true);
+		registerReplicaFinisher(fixture, {
+			taskId: "task-merge",
+			agentId: "finisher:task-merge",
+			replicaDir: "/tmp/replica/task-merge",
+		});
+		registerReplicaFinisher(fixture, {
+			taskId: "task-manual-close",
+			agentId: "finisher:task-manual-close",
+			replicaDir: "/tmp/replica/task-manual-close",
+		});
+		(loop as unknown as { running: boolean; paused: boolean }).running = true;
+		(loop as unknown as { paused: boolean }).paused = false;
+
+		await loop.handleFinisherCloseTask({ taskId: "task-merge", reason: "done", agentId: "finisher:task-merge" });
+		await loop.handleFinisherCloseTask({
+			taskId: "task-manual-close",
+			reason: "done",
+			agentId: "finisher:task-manual-close",
+		});
+		await Bun.sleep(5);
+		expect(calls.spawnMerger).toEqual([{ taskId: "task-merge", replicaDir: "/tmp/replica/task-merge" }]);
+
+		await loop.handleExternalTaskClose("task-manual-close");
+		await loop.handleMergerComplete({ taskId: "task-merge", reason: "merged" });
+		await Bun.sleep(5);
+
+		expect(calls.destroyReplica).toContain("task-manual-close");
+		expect(calls.spawnMerger).toEqual([{ taskId: "task-merge", replicaDir: "/tmp/replica/task-merge" }]);
+	});
+
+	test("handleExternalTaskClose removes manually deleted merge queue head and advances to next task", async () => {
+		const fixture = createLoopWithReplicasFixture();
+		const { loop, calls, registry, setReplica } = fixture;
+		setReplica("task-manual-delete", "/tmp/replica/task-manual-delete", true);
+		setReplica("task-after-delete", "/tmp/replica/task-after-delete", true);
+		registerReplicaFinisher(fixture, {
+			taskId: "task-manual-delete",
+			agentId: "finisher:task-manual-delete",
+			replicaDir: "/tmp/replica/task-manual-delete",
+		});
+		registerReplicaFinisher(fixture, {
+			taskId: "task-after-delete",
+			agentId: "finisher:task-after-delete",
+			replicaDir: "/tmp/replica/task-after-delete",
+		});
+		(loop as unknown as { running: boolean; paused: boolean }).running = true;
+		(loop as unknown as { paused: boolean }).paused = false;
+
+		await loop.handleFinisherCloseTask({
+			taskId: "task-manual-delete",
+			reason: "done",
+			agentId: "finisher:task-manual-delete",
+		});
+		await loop.handleFinisherCloseTask({
+			taskId: "task-after-delete",
+			reason: "done",
+			agentId: "finisher:task-after-delete",
+		});
+		await Bun.sleep(5);
+		expect(calls.spawnMerger).toEqual([
+			{ taskId: "task-manual-delete", replicaDir: "/tmp/replica/task-manual-delete" },
+		]);
+
+		await loop.handleExternalTaskClose("task-manual-delete");
+		const activeMerger = registry.getActiveByTask("task-manual-delete").find(agent => agent.role === "merger");
+		if (activeMerger) registry.remove(activeMerger.id);
+		await (loop as unknown as { tick: () => Promise<void> }).tick();
+		await Bun.sleep(5);
+
+		expect(calls.destroyReplica).toContain("task-manual-delete");
+		expect(calls.abortMerger).toContain("task-manual-delete");
+		expect(calls.spawnMerger).toEqual([
+			{ taskId: "task-manual-delete", replicaDir: "/tmp/replica/task-manual-delete" },
+			{ taskId: "task-after-delete", replicaDir: "/tmp/replica/task-after-delete" },
+		]);
+	});
+
+	test("processMergerQueue skips missing replica head, closes it, and continues", async () => {
+		const fixture = createLoopWithReplicasFixture();
+		const { loop, calls, setReplica, setReplicaExists } = fixture;
+		setReplica("task-missing", "/tmp/replica/task-missing", true);
+		setReplica("task-next", "/tmp/replica/task-next", true);
+		registerReplicaFinisher(fixture, {
+			taskId: "task-missing",
+			agentId: "finisher:task-missing",
+			replicaDir: "/tmp/replica/task-missing",
+		});
+		registerReplicaFinisher(fixture, {
+			taskId: "task-next",
+			agentId: "finisher:task-next",
+			replicaDir: "/tmp/replica/task-next",
+		});
+
+		await loop.handleFinisherCloseTask({ taskId: "task-missing", reason: "done", agentId: "finisher:task-missing" });
+		await loop.handleFinisherCloseTask({ taskId: "task-next", reason: "done", agentId: "finisher:task-next" });
+		expect(calls.spawnMerger).toEqual([]);
+
+		setReplicaExists("task-missing", false);
+		(loop as unknown as { running: boolean; paused: boolean }).running = true;
+		(loop as unknown as { paused: boolean }).paused = false;
+		await (loop as unknown as { tick: () => Promise<void> }).tick();
+		await Bun.sleep(5);
+
+		expect(calls.close).toContainEqual({
+			taskId: "task-missing",
+			reason: "Closed without merge (replica directory missing)",
+		});
+		expect(calls.spawnMerger).toEqual([{ taskId: "task-next", replicaDir: "/tmp/replica/task-next" }]);
+	});
+
+	test("startup restore queues in_progress replica tasks", async () => {
+		const fixture = createLoopWithReplicasFixture();
+		const { loop, calls, setReplica, setTaskStatus } = fixture;
+		setReplica("task-r", "/tmp/replica/task-r", true);
+		setTaskStatus("task-r", "in_progress");
+
+		loop.start();
+		await Bun.sleep(20);
+		await loop.stop();
+
+		expect(calls.listReplicas).toBeGreaterThan(0);
+		expect(calls.show).toContain("task-r");
+		expect(calls.spawnMerger).toEqual([{ taskId: "task-r", replicaDir: "/tmp/replica/task-r" }]);
+	});
+
+	test("startup restore skips replicas for tasks not in progress", async () => {
+		const fixture = createLoopWithReplicasFixture();
+		const { loop, calls, setReplica, setTaskStatus } = fixture;
+		setReplica("task-closed", "/tmp/replica/task-closed", true);
+		setTaskStatus("task-closed", "closed");
+
+		loop.start();
+		await Bun.sleep(20);
+		await loop.stop();
+
+		expect(calls.listReplicas).toBeGreaterThan(0);
+		expect(calls.show).toContain("task-closed");
+		expect(calls.spawnMerger).toEqual([]);
+	});
+
+	test("startup restore destroys orphaned replica when task lookup fails", async () => {
+		const fixture = createLoopWithReplicasFixture();
+		const { loop, calls, setReplica, setShowError } = fixture;
+		setReplica("task-deleted", "/tmp/replica/task-deleted", true);
+		setShowError("task-deleted", new Error("task not found"));
+
+		loop.start();
+		await Bun.sleep(20);
+		await loop.stop();
+
+		expect(calls.show).toContain("task-deleted");
+		expect(calls.destroyReplica).toContain("task-deleted");
+		expect(calls.spawnMerger).toEqual([]);
+	});
+
+	test("startup restore with empty replica directories leaves queue empty", async () => {
+		const fixture = createLoopWithReplicasFixture();
+		const { loop, calls } = fixture;
+
+		loop.start();
+		await Bun.sleep(20);
+		await loop.stop();
+
+		expect(calls.listReplicas).toBeGreaterThan(0);
+		expect(calls.show).toEqual([]);
+		expect(calls.spawnMerger).toEqual([]);
+	});
+});
+
 describe("AgentLoop finisher exit routing", () => {
 	const registerRunningFinisher = (fixture: ReturnType<typeof createLoopFixture>, taskId: string, id: string) =>
 		fixture.registry.register({
@@ -741,6 +1465,52 @@ describe("AgentLoop finisher exit routing", () => {
 		expect(deferCase.calls.comment).toEqual([
 			{ taskId: "task-defer", text: "Blocked by finisher advance_lifecycle. reason-defer\nmessage: message-defer" },
 		]);
+	});
+
+	test("finisher issuer advance skips kickoff when task is already blocked", async () => {
+		const fixture = createLoopFixture();
+		const { loop } = fixture;
+		(loop as unknown as { running: boolean }).running = true;
+		const issuerKickoffs: string[] = [];
+
+		(
+			loop as unknown as {
+				tasksClient: {
+					show: (taskId: string) => Promise<{ id: string; title: string; status: string; issue_type: string }>;
+				};
+			}
+		).tasksClient.show = async taskId => ({
+			id: taskId,
+			title: `Task ${taskId}`,
+			status: "blocked",
+			issue_type: "task",
+		});
+		(
+			loop as unknown as {
+				pipelineManager: {
+					kickoffResumePipeline: (task: { id: string }) => void;
+				};
+			}
+		).pipelineManager.kickoffResumePipeline = (task: { id: string }) => {
+			issuerKickoffs.push(task.id);
+		};
+
+		const finisher = registerRunningFinisher(fixture, "task-issuer-blocked", "finisher:task-issuer-blocked:old");
+		loop.advanceFinisherLifecycle({
+			taskId: "task-issuer-blocked",
+			action: "issuer",
+			message: "message-issuer-blocked",
+			reason: "reason-issuer-blocked",
+			agentId: "fin-1",
+		});
+
+		await (
+			loop as unknown as {
+				rpcHandlerManager: { onAgentEnd: (agent: unknown) => Promise<void> };
+			}
+		).rpcHandlerManager.onAgentEnd(finisher);
+
+		expect(issuerKickoffs).toEqual([]);
 	});
 });
 

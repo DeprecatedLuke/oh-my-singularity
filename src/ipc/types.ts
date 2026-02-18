@@ -32,6 +32,15 @@ export interface IssuerAdvanceLifecycleMessage extends IPCMessageBase {
 	agentId: string;
 }
 
+export interface FastWorkerAdvanceLifecycleMessage extends IPCMessageBase {
+	type: "fast_worker_advance_lifecycle";
+	taskId: string;
+	action: string;
+	message: string;
+	reason: string;
+	agentId: string;
+}
+
 export interface FinisherAdvanceLifecycleMessage extends IPCMessageBase {
 	type: "finisher_advance_lifecycle";
 	taskId: string;
@@ -43,6 +52,20 @@ export interface FinisherAdvanceLifecycleMessage extends IPCMessageBase {
 
 export interface FinisherCloseTaskMessage extends IPCMessageBase {
 	type: "finisher_close_task";
+	taskId: string;
+	reason: string;
+	agentId: string;
+}
+
+export interface MergerCompleteMessage extends IPCMessageBase {
+	type: "merger_complete";
+	taskId: string;
+	reason: string;
+	agentId: string;
+}
+
+export interface MergerConflictMessage extends IPCMessageBase {
+	type: "merger_conflict";
 	taskId: string;
 	reason: string;
 	agentId: string;
@@ -122,8 +145,11 @@ export interface IPCMessageMap {
 
 	tasks_request: TasksRequestMessage;
 	issuer_advance_lifecycle: IssuerAdvanceLifecycleMessage;
+	fast_worker_advance_lifecycle: FastWorkerAdvanceLifecycleMessage;
 	finisher_advance_lifecycle: FinisherAdvanceLifecycleMessage;
 	finisher_close_task: FinisherCloseTaskMessage;
+	merger_complete: MergerCompleteMessage;
+	merger_conflict: MergerConflictMessage;
 	broadcast: BroadcastMessage;
 	interrupt_agent: InterruptAgentMessage;
 	steer_agent: SteerAgentMessage;
@@ -154,8 +180,11 @@ const CORE_IPC_MESSAGE_TYPES = [
 
 	"tasks_request",
 	"issuer_advance_lifecycle",
+	"fast_worker_advance_lifecycle",
 	"finisher_advance_lifecycle",
 	"finisher_close_task",
+	"merger_complete",
+	"merger_conflict",
 	"broadcast",
 	"interrupt_agent",
 	"steer_agent",
@@ -170,6 +199,7 @@ const CORE_IPC_MESSAGE_TYPES = [
 ] as const;
 
 const REPLACE_AGENT_ROLES = new Set<ReplaceAgentRole>(["finisher", "issuer", "worker"]);
+const FAST_WORKER_LIFECYCLE_ACTIONS = new Set(["done", "escalate"]);
 const FINISHER_LIFECYCLE_ACTIONS = new Set(["worker", "issuer", "defer"]);
 const WAIT_FOR_AGENT_DEFAULT_TIMEOUT_MS = TIMEOUT_AGENT_WAIT_MS;
 
@@ -357,6 +387,37 @@ export function parseIPCMessage(payload: unknown): ParseIPCMessageResult {
 				},
 			};
 		}
+		case "fast_worker_advance_lifecycle": {
+			const taskId = readStringField(rec, rawType, "taskId");
+			if (!taskId.ok) return taskId;
+			const action = readStringField(rec, rawType, "action", { trim: true });
+			if (!action.ok) return action;
+			if (!FAST_WORKER_LIFECYCLE_ACTIONS.has(action.value)) {
+				return {
+					ok: false,
+					error: `Invalid IPC payload for "${rawType}": "action" must be one of done, escalate (received "${action.value || "(empty)"}").`,
+				};
+			}
+			const message = readStringField(rec, rawType, "message");
+			if (!message.ok) return message;
+			const reason = readStringField(rec, rawType, "reason");
+			if (!reason.ok) return reason;
+			const agentId = readStringField(rec, rawType, "agentId");
+			if (!agentId.ok) return agentId;
+			return {
+				ok: true,
+				message: {
+					...rec,
+					type: rawType,
+					taskId: taskId.value,
+					action: action.value,
+					message: message.value,
+					reason: reason.value,
+					agentId: agentId.value,
+				},
+			};
+		}
+
 		case "finisher_advance_lifecycle": {
 			const taskId = readStringField(rec, rawType, "taskId");
 			if (!taskId.ok) return taskId;
@@ -388,6 +449,43 @@ export function parseIPCMessage(payload: unknown): ParseIPCMessageResult {
 			};
 		}
 		case "finisher_close_task": {
+			const taskId = readStringField(rec, rawType, "taskId");
+			if (!taskId.ok) return taskId;
+			const reason = readStringField(rec, rawType, "reason");
+			if (!reason.ok) return reason;
+			const agentId = readStringField(rec, rawType, "agentId");
+			if (!agentId.ok) return agentId;
+			return {
+				ok: true,
+				message: {
+					...rec,
+					type: rawType,
+					taskId: taskId.value,
+					reason: reason.value,
+					agentId: agentId.value,
+				},
+			};
+		}
+
+		case "merger_complete": {
+			const taskId = readStringField(rec, rawType, "taskId");
+			if (!taskId.ok) return taskId;
+			const reason = readStringField(rec, rawType, "reason");
+			if (!reason.ok) return reason;
+			const agentId = readStringField(rec, rawType, "agentId");
+			if (!agentId.ok) return agentId;
+			return {
+				ok: true,
+				message: {
+					...rec,
+					type: rawType,
+					taskId: taskId.value,
+					reason: reason.value,
+					agentId: agentId.value,
+				},
+			};
+		}
+		case "merger_conflict": {
 			const taskId = readStringField(rec, rawType, "taskId");
 			if (!taskId.ok) return taskId;
 			const reason = readStringField(rec, rawType, "reason");

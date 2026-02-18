@@ -9,6 +9,7 @@ import { LIMIT_POLLER_ACTIVITY_DEFAULT } from "./config/constants";
 import { Scheduler } from "./loop/scheduler";
 import { runPipeMode } from "./modes/pipe";
 import { runTuiMode } from "./modes/tui";
+import { ReplicaManager } from "./replica/manager";
 import { SessionLogWriter } from "./session-log-writer";
 import {
 	computeOmsSingularitySockPath,
@@ -85,10 +86,12 @@ async function main(opts: OmsLaunchOptions): Promise<void> {
 	});
 
 	const scheduler = new Scheduler({ tasksClient, registry, tasksAvailable: true });
+	const replicaManager = new ReplicaManager({ projectRoot: tasksClient.workingDir });
 	const spawner = new AgentSpawner({
 		tasksClient,
 		registry,
 		config,
+		replicaManager,
 		ipcSockPath: singularitySockPath,
 		tasksAvailable: true,
 	});

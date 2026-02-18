@@ -18,16 +18,19 @@ type SettingRow = {
 	getValue: () => string;
 	change?: (delta: 1 | -1) => void;
 	readOnly?: boolean;
+	isHeader?: boolean;
 };
 
-const MODEL_OPTIONS = ["codex", "codex-spark", "haiku", "sonnet", "opus"] as const;
+const MODEL_OPTIONS = ["codex", "codex-spark", "haiku", "sonnet", "sonnet-4-6", "opus"] as const;
 const THINKING_OPTIONS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 const ROLE_ORDER: readonly Exclude<AgentRole, "singularity">[] = [
 	"worker",
 	"issuer",
 	"finisher",
+	"merger",
 	"steering",
 	"designer-worker",
+	"fast-worker",
 ];
 
 function clampInt(value: number, min: number, max: number): number {
@@ -81,6 +84,8 @@ function roleLabel(role: AgentRole): string {
 			return "steering";
 		case "designer-worker":
 			return "designer-worker";
+		case "fast-worker":
+			return "fast-worker";
 		case "singularity":
 			return "singularity";
 		default:
@@ -220,12 +225,13 @@ export class SettingsPane {
 
 			const selected = index === this.#selectedIndex;
 			const marker = selected ? `${FG.accent}›${RESET_FG}` : " ";
+			const isHeader = setting.isHeader === true;
 			const labelColor = selected ? FG.accent : FG.muted;
 			const valueColor = setting.readOnly ? FG.dim : FG.success;
-			const suffix = setting.readOnly ? `${FG.dim} (read-only)${RESET_FG}` : "";
-
+			const value = setting.getValue();
+			const suffix = setting.readOnly && !isHeader ? `${FG.dim} (read-only)${RESET_FG}` : "";
 			const label = clipPadText(setting.label, labelWidth);
-			const line = `${marker} ${labelColor}${label}${RESET_FG} ${valueColor}${setting.getValue()}${RESET_FG}${suffix}`;
+			const line = `${marker} ${labelColor}${label}${RESET_FG} ${valueColor}${value}${RESET_FG}${suffix}`;
 			writeInnerLine(listTop + row, line);
 		}
 	}
@@ -260,11 +266,16 @@ export class SettingsPane {
 
 	#buildRows(): SettingRow[] {
 		const rows: SettingRow[] = [];
-
 		for (const role of ROLE_ORDER) {
 			const roleCfg = this.#config.roles[role];
 			rows.push({
-				label: `${roleLabel(role)} model`,
+				label: `${roleLabel(role)}:`,
+				getValue: () => "",
+				readOnly: true,
+				isHeader: true,
+			});
+			rows.push({
+				label: "  model",
 				getValue: () => roleCfg.model,
 				change: delta => {
 					const nextModel = cycleOption(roleCfg.model, MODEL_OPTIONS, delta);
@@ -272,12 +283,8 @@ export class SettingsPane {
 					this.#persistConfigOverride(buildRoleOverride(role, { model: nextModel }));
 				},
 			});
-		}
-
-		for (const role of ROLE_ORDER) {
-			const roleCfg = this.#config.roles[role];
 			rows.push({
-				label: `${roleLabel(role)} thinking`,
+				label: "  thinking",
 				getValue: () => roleCfg.thinking,
 				change: delta => {
 					const nextThinking = cycleOption(roleCfg.thinking, THINKING_OPTIONS, delta);
@@ -295,6 +302,15 @@ export class SettingsPane {
 				const next = clampInt(this.#config.maxWorkers + step, 1, 10);
 				this.#config.maxWorkers = next;
 				this.#persistConfigOverride({ maxWorkers: next });
+			},
+		});
+		rows.push({
+			label: "enableReplicas",
+			getValue: () => (this.#config.enableReplicas ? "on" : "off"),
+			change: () => {
+				const next = !this.#config.enableReplicas;
+				this.#config.enableReplicas = next;
+				this.#persistConfigOverride({ enableReplicas: next });
 			},
 		});
 
@@ -356,7 +372,6 @@ export class SettingsPane {
 				this.#persistConfigOverride({ steeringIntervalMs: next });
 			},
 		});
-
 		return rows;
 	}
 }

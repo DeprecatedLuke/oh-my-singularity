@@ -57,8 +57,10 @@ export const PATH_MAX_SOCK_PATH_LENGTH = 100;
 
 export const AGENT_EXTENSION_FILENAMES = {
 	worker: "tasks-worker.ts",
+	fastWorker: "tasks-fast-worker.ts",
 	designerWorker: "tasks-designer-worker.ts",
 	finisher: "tasks-finisher.ts",
+	merger: "tasks-merger.ts",
 	steering: "tasks-steering.ts",
 	issuer: "tasks-issuer.ts",
 	broadcast: "broadcast-to-workers.ts",

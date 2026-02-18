@@ -23,6 +23,15 @@ type IssuerLifecycleAdvanceRecord = {
 	agentId: string | null;
 	ts: number;
 };
+type FastWorkerLifecycleAction = "done" | "escalate";
+type FastWorkerLifecycleAdvanceRecord = {
+	taskId: string;
+	action: FastWorkerLifecycleAction;
+	message: string | null;
+	reason: string | null;
+	agentId: string | null;
+	ts: number;
+};
 type FinisherLifecycleAction = "worker" | "issuer" | "defer";
 type FinisherLifecycleAdvanceRecord = {
 	taskId: string;
@@ -72,6 +81,7 @@ export class PipelineManager {
 
 	private readonly pipelineInFlight = new Set<string>();
 	private readonly issuerLifecycleByTask = new Map<string, IssuerLifecycleAdvanceRecord>();
+	private readonly fastWorkerLifecycleByTask = new Map<string, FastWorkerLifecycleAdvanceRecord>();
 	private readonly finisherLifecycleByTask = new Map<string, FinisherLifecycleAdvanceRecord>();
 	private readonly finisherCloseByTask = new Map<string, FinisherCloseRecord>();
 
@@ -186,6 +196,83 @@ export class PipelineManager {
 			current
 				? `Issuer lifecycle decision updated for ${taskId}: ${current.action} -> ${action}`
 				: `Issuer lifecycle decision recorded for ${taskId}: ${action}`,
+			current ? "warn" : "info",
+			{
+				taskId,
+				action,
+				reason: next.reason,
+				message: next.message,
+				agentId: next.agentId,
+			},
+		);
+
+		return {
+			ok: true,
+			summary: `advance_lifecycle recorded for ${taskId}: ${action}`,
+			taskId,
+			action,
+			message: next.message,
+			reason: next.reason,
+			agentId: next.agentId,
+		};
+	}
+
+	advanceFastWorkerLifecycle(opts: {
+		taskId?: string;
+		action?: string;
+		message?: string;
+		reason?: string;
+		agentId?: string;
+	}): Record<string, unknown> {
+		const taskId = typeof opts.taskId === "string" ? opts.taskId.trim() : "";
+		if (!taskId) {
+			return { ok: false, summary: "advance_lifecycle rejected: taskId is required" };
+		}
+
+		const rawAction = typeof opts.action === "string" ? opts.action.trim().toLowerCase() : "";
+		const action: FastWorkerLifecycleAction | null =
+			rawAction === "done" || rawAction === "escalate" ? rawAction : null;
+		if (!action) {
+			return {
+				ok: false,
+				summary: `advance_lifecycle rejected: unsupported action '${rawAction || "(empty)"}'`,
+			};
+		}
+
+		const message = typeof opts.message === "string" ? opts.message.trim() : "";
+		const reason = typeof opts.reason === "string" ? opts.reason.trim() : "";
+		const agentId = typeof opts.agentId === "string" ? opts.agentId.trim() : "";
+		const current = this.fastWorkerLifecycleByTask.get(taskId);
+		const next: FastWorkerLifecycleAdvanceRecord = {
+			taskId,
+			action,
+			message: message || null,
+			reason: reason || null,
+			agentId: agentId || null,
+			ts: Date.now(),
+		};
+		this.fastWorkerLifecycleByTask.set(taskId, next);
+
+		const fastWorkers = this.registry.getActiveByTask(taskId).filter(a => a.role === "fast-worker");
+		for (const fastWorker of fastWorkers) {
+			const rpc = fastWorker.rpc;
+			if (rpc && rpc instanceof OmsRpcClient) {
+				try {
+					rpc.forceKill();
+				} catch (err) {
+					this.loopLog("Failed to kill fast-worker RPC after lifecycle advance (non-fatal)", "debug", {
+						taskId,
+						fastWorkerId: fastWorker.id,
+						error: err instanceof Error ? err.message : String(err),
+					});
+				}
+			}
+		}
+
+		this.loopLog(
+			current
+				? `Fast-worker lifecycle decision updated for ${taskId}: ${current.action} -> ${action}`
+				: `Fast-worker lifecycle decision recorded for ${taskId}: ${action}`,
 			current ? "warn" : "info",
 			{
 				taskId,
@@ -533,8 +620,8 @@ export class PipelineManager {
 		const initialSessionId = initialAttempt.sessionId;
 		try {
 			const currentTask = await this.tasksClient.show(task.id);
-			if (currentTask.status === "closed") {
-				this.loopLog(`Task ${task.id} is closed; aborting issuer recovery`, "info", {
+			if (currentTask.status === "closed" || currentTask.status === "blocked") {
+				this.loopLog(`Task ${task.id} is ${currentTask.status}; aborting issuer recovery`, "info", {
 					taskId: task.id,
 					status: currentTask.status,
 					initialReason,
@@ -542,7 +629,10 @@ export class PipelineManager {
 				return {
 					start: false,
 					message: null,
-					reason: "task closed during issuer execution",
+					reason:
+						currentTask.status === "blocked"
+							? "task blocked during issuer execution"
+							: "task closed during issuer execution",
 					raw: null,
 				};
 			}
@@ -598,6 +688,267 @@ export class PipelineManager {
 			start: false,
 			message: null,
 			reason: `issuer failed after recovery attempts (${reasonParts.join(", ")})`,
+			raw: null,
+		};
+	}
+
+	async runFastWorkerForTask(
+		task: TaskIssue,
+		opts?: { kickoffMessage?: string },
+	): Promise<{
+		done: boolean;
+		escalate: boolean;
+		message: string | null;
+		reason: string | null;
+		raw: string | null;
+	}> {
+		type FastWorkerResult = {
+			done: boolean;
+			escalate: boolean;
+			message: string | null;
+			reason: string | null;
+			raw: string | null;
+		};
+		type FastWorkerAttemptResult =
+			| { ok: true; result: FastWorkerResult }
+			| { ok: false; reason: string; sessionId: string | null; missingAdvanceTool: boolean };
+
+		const toFastWorkerResult = (advance: FastWorkerLifecycleAdvanceRecord): FastWorkerResult => {
+			let raw: string | null = null;
+			try {
+				raw = JSON.stringify({
+					action: advance.action,
+					message: advance.message,
+					reason: advance.reason,
+					agentId: advance.agentId,
+					ts: advance.ts,
+				});
+			} catch {
+				raw = null;
+			}
+
+			if (advance.action === "escalate") {
+				return {
+					done: false,
+					escalate: true,
+					message: advance.message,
+					reason: advance.reason,
+					raw,
+				};
+			}
+
+			return {
+				done: true,
+				escalate: false,
+				message: advance.message,
+				reason: advance.reason,
+				raw,
+			};
+		};
+		const normalizeSessionId = (value: string | null | undefined): string | null => {
+			if (typeof value !== "string") return null;
+			const trimmed = value.trim();
+			return trimmed || null;
+		};
+		const kickoffMessage = opts?.kickoffMessage?.trim() || "";
+		const buildMissingAdvanceNudge = (): string => {
+			const lines = [
+				"[SYSTEM RECOVERY]",
+				"Your previous fast-worker run ended without calling `advance_lifecycle`, so OMS could not continue.",
+				'Resume this task and call `advance_lifecycle` exactly once with action="done" or "escalate".',
+				"Then stop.",
+			];
+			if (kickoffMessage) {
+				lines.push("", "Original kickoff context:", kickoffMessage);
+			}
+			return lines.join("\n");
+		};
+		const buildResumeExecutionNudge = (): string => {
+			const lines = [
+				"[SYSTEM RESUME]",
+				"Your previous fast-worker process exited unexpectedly before lifecycle completion.",
+				'Resume this task and call `advance_lifecycle` exactly once with action="done" or "escalate".',
+				"Then stop.",
+			];
+			if (kickoffMessage) {
+				lines.push("", "Original kickoff context:", kickoffMessage);
+			}
+			return lines.join("\n");
+		};
+		const runAttempt = async (
+			mode: "spawn" | "resume",
+			resumeSessionId?: string | null,
+			steerMessage?: string | null,
+		): Promise<FastWorkerAttemptResult> => {
+			let fastWorker: AgentInfo;
+			const normalizedResumeSessionId = normalizeSessionId(resumeSessionId);
+			this.fastWorkerLifecycleByTask.delete(task.id);
+
+			try {
+				fastWorker = await this.spawner.spawnFastWorker(task.id, {
+					claim: false,
+					resumeSessionId: mode === "resume" ? (normalizedResumeSessionId ?? undefined) : undefined,
+					kickoffMessage: steerMessage?.trim() || undefined,
+				});
+				this.attachRpcHandlers(fastWorker);
+				this.logAgentStart(
+					"OMS/system",
+					fastWorker,
+					mode === "resume" ? `${task.title} (resume ${normalizedResumeSessionId})` : task.title,
+				);
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				const label = mode === "resume" ? "Fast-worker resume failed" : "Fast-worker spawn failed";
+				this.loopLog(`${label} for ${task.id}: ${message}`, "warn", {
+					taskId: task.id,
+					error: message,
+					sessionId: normalizedResumeSessionId,
+				});
+				return {
+					ok: false,
+					reason: mode === "resume" ? "fast-worker resume failed" : "fast-worker spawn failed",
+					sessionId: normalizedResumeSessionId,
+					missingAdvanceTool: false,
+				};
+			}
+			const fastWorkerRpc = fastWorker.rpc;
+			const captureSessionId = (): string | null => {
+				if (fastWorkerRpc && fastWorkerRpc instanceof OmsRpcClient) {
+					const rpcSessionId = normalizeSessionId(fastWorkerRpc.getSessionId());
+					if (rpcSessionId) return rpcSessionId;
+				}
+				return normalizeSessionId(fastWorker.sessionId) ?? normalizedResumeSessionId;
+			};
+			if (!fastWorkerRpc || !(fastWorkerRpc instanceof OmsRpcClient)) {
+				const sessionId = captureSessionId();
+				await this.finishAgent(fastWorker, "dead");
+				return { ok: false, reason: "fast-worker has no rpc", sessionId, missingAdvanceTool: false };
+			}
+
+			try {
+				await fastWorkerRpc.waitForAgentEnd(900_000);
+			} catch {
+				const advance = this.takeFastWorkerLifecycleAdvance(task.id);
+				if (advance) {
+					let text: string | null = null;
+					try {
+						text = await fastWorkerRpc.getLastAssistantText();
+					} catch {
+						text = null;
+					}
+					await this.finishAgent(fastWorker, "done");
+					await this.logAgentFinished(fastWorker, text ?? "");
+					return { ok: true, result: toFastWorkerResult(advance) };
+				}
+				const sessionId = captureSessionId();
+				await this.finishAgent(fastWorker, "dead");
+				return { ok: false, reason: "fast-worker died", sessionId, missingAdvanceTool: false };
+			}
+			let text: string | null = null;
+			try {
+				text = await fastWorkerRpc.getLastAssistantText();
+			} catch {
+				text = null;
+			}
+
+			const advance = this.takeFastWorkerLifecycleAdvance(task.id);
+			await this.finishAgent(fastWorker, "done");
+			await this.logAgentFinished(fastWorker, text ?? "");
+			if (!advance) {
+				const sessionId = captureSessionId();
+				this.loopLog(`Fast-worker exited without advance_lifecycle for ${task.id}`, "warn", {
+					taskId: task.id,
+					sessionId,
+					mode,
+				});
+				return {
+					ok: false,
+					reason: "fast-worker exited without advance_lifecycle tool call",
+					sessionId,
+					missingAdvanceTool: true,
+				};
+			}
+
+			return { ok: true, result: toFastWorkerResult(advance) };
+		};
+
+		const initialAttempt = await runAttempt("spawn", null, kickoffMessage || null);
+		if (initialAttempt.ok) return initialAttempt.result;
+		const initialReason = initialAttempt.reason;
+		const initialSessionId = initialAttempt.sessionId;
+		try {
+			const currentTask = await this.tasksClient.show(task.id);
+			if (currentTask.status === "closed" || currentTask.status === "blocked") {
+				this.loopLog(`Task ${task.id} is ${currentTask.status}; aborting fast-worker recovery`, "info", {
+					taskId: task.id,
+					status: currentTask.status,
+					initialReason,
+				});
+				return {
+					done: false,
+					escalate: false,
+					message: null,
+					reason:
+						currentTask.status === "blocked"
+							? "task blocked during fast-worker execution"
+							: "task closed during fast-worker execution",
+					raw: null,
+				};
+			}
+		} catch (err) {
+			this.loopLog(`Task ${task.id} no longer exists; aborting fast-worker recovery`, "info", {
+				taskId: task.id,
+				initialReason,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return {
+				done: false,
+				escalate: false,
+				message: null,
+				reason: "task deleted during fast-worker execution",
+				raw: null,
+			};
+		}
+		const missingAdvanceNudge = buildMissingAdvanceNudge();
+		const resumeExecutionNudge = buildResumeExecutionNudge();
+		let resumeReason: string | null = null;
+		let resumeMissingAdvance = false;
+		if (initialSessionId) {
+			this.loopLog(`Fast-worker failed for ${task.id}; attempting resume`, "warn", {
+				taskId: task.id,
+				sessionId: initialSessionId,
+				reason: initialReason,
+			});
+			const resumeSteerMessage = initialAttempt.missingAdvanceTool ? missingAdvanceNudge : resumeExecutionNudge;
+			const resumedAttempt = await runAttempt("resume", initialSessionId, resumeSteerMessage);
+			if (resumedAttempt.ok) return resumedAttempt.result;
+			resumeReason = resumedAttempt.reason;
+			resumeMissingAdvance = resumedAttempt.missingAdvanceTool;
+			this.loopLog(`Fast-worker resume failed for ${task.id}; attempting fresh retry`, "warn", {
+				taskId: task.id,
+				sessionId: initialSessionId,
+				reason: resumeReason,
+			});
+		} else {
+			this.loopLog(`Fast-worker failed for ${task.id} with no recoverable session; attempting fresh retry`, "warn", {
+				taskId: task.id,
+				reason: initialReason,
+			});
+		}
+		const retrySteerMessage =
+			initialAttempt.missingAdvanceTool || resumeMissingAdvance ? missingAdvanceNudge : kickoffMessage || null;
+		const retryAttempt = await runAttempt("spawn", null, retrySteerMessage);
+		if (retryAttempt.ok) return retryAttempt.result;
+		const reasonParts = [
+			`initial=${initialReason}`,
+			resumeReason ? `resume=${resumeReason}` : null,
+			`retry=${retryAttempt.reason}`,
+		].filter((part): part is string => !!part);
+		return {
+			done: false,
+			escalate: false,
+			message: null,
+			reason: `fast-worker failed after recovery attempts (${reasonParts.join(", ")})`,
 			raw: null,
 		};
 	}
@@ -670,6 +1021,14 @@ export class PipelineManager {
 		if (!normalizedTaskId) return null;
 		const decision = this.issuerLifecycleByTask.get(normalizedTaskId) ?? null;
 		if (decision) this.issuerLifecycleByTask.delete(normalizedTaskId);
+		return decision;
+	}
+
+	private takeFastWorkerLifecycleAdvance(taskId: string): FastWorkerLifecycleAdvanceRecord | null {
+		const normalizedTaskId = taskId.trim();
+		if (!normalizedTaskId) return null;
+		const decision = this.fastWorkerLifecycleByTask.get(normalizedTaskId) ?? null;
+		if (decision) this.fastWorkerLifecycleByTask.delete(normalizedTaskId);
 		return decision;
 	}
 
@@ -784,7 +1143,77 @@ export class PipelineManager {
 			});
 			return;
 		}
-		const result = await this.runIssuerForTask(task);
+
+		let issuerKickoffMessage: string | undefined;
+		if (task.scope === "tiny") {
+			const fastWorkerResult = await this.runFastWorkerForTask(task);
+			if (fastWorkerResult.done) {
+				const fastWorkerOutput =
+					typeof fastWorkerResult.message === "string" && fastWorkerResult.message.trim()
+						? fastWorkerResult.message.trim()
+						: "[Fast-worker completed without summary]";
+				this.loopLog(`Fast-worker completed tiny task ${task.id}`, "info", {
+					taskId: task.id,
+					reason: fastWorkerResult.reason,
+				});
+				try {
+					const finisher = await this.spawnFinisherAfterStoppingSteering(task.id, fastWorkerOutput);
+					this.attachRpcHandlers(finisher);
+					this.logAgentStart("OMS/system", finisher, "fast-worker completion");
+					this.onDirty?.();
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					this.loopLog(`Finisher spawn failed (fast-worker done) for ${task.id}: ${message}`, "warn", {
+						taskId: task.id,
+						error: message,
+					});
+				}
+				return;
+			}
+
+			if (!fastWorkerResult.escalate) {
+				const reason = fastWorkerResult.reason || "Fast-worker deferred start";
+				try {
+					await this.tasksClient.updateStatus(task.id, "blocked");
+				} catch (err) {
+					this.loopLog(
+						`Failed to set blocked status for ${task.id}: ${err instanceof Error ? err.message : err}`,
+						"warn",
+						{ taskId: task.id },
+					);
+				}
+
+				try {
+					await this.tasksClient.comment(
+						task.id,
+						`Blocked by fast-worker. ${reason}${fastWorkerResult.message ? `\nmessage: ${fastWorkerResult.message}` : ""}`,
+					);
+				} catch (err) {
+					logger.debug("loop/pipeline.ts: failed to post fast-worker-blocked comment (non-fatal)", { err });
+				}
+				this.loopLog(`Fast-worker deferred tiny task ${task.id}: ${reason}`, "warn", {
+					taskId: task.id,
+					reason,
+				});
+				return;
+			}
+
+			const escalationReason = fastWorkerResult.reason?.trim() || "Task too complex for fast-worker";
+			const escalationMessage = fastWorkerResult.message?.trim() || "";
+			issuerKickoffMessage = [
+				"Fast-worker escalated this tiny task to full issuer lifecycle.",
+				`Reason: ${escalationReason}`,
+				...(escalationMessage ? [`Message: ${escalationMessage}`] : []),
+			].join("\n");
+			this.loopLog(`Fast-worker escalated tiny task ${task.id}`, "info", {
+				taskId: task.id,
+				reason: escalationReason,
+			});
+		}
+
+		const result = issuerKickoffMessage
+			? await this.runIssuerForTask(task, { kickoffMessage: issuerKickoffMessage })
+			: await this.runIssuerForTask(task);
 		if (result.skip) {
 			const skipReason = result.reason || result.message || "No implementation work needed";
 			const skipMessage = result.message && result.message !== skipReason ? result.message : "";
@@ -838,7 +1267,6 @@ export class PipelineManager {
 			});
 			return;
 		}
-
 		if (!this.isRunning() || this.isPaused()) return;
 		const normalizedTaskId = task.id.trim();
 		if (

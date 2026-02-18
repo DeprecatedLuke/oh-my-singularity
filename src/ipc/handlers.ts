@@ -17,7 +17,7 @@ import type {
 } from "../tasks/client";
 import { TaskCliError } from "../tasks/client";
 import type { BatchCreateIssueInput } from "../tasks/store/types";
-import type { TaskIssue } from "../tasks/types";
+import type { TaskIssue, TaskIssueScope } from "../tasks/types";
 import { asRecord, logger } from "../utils";
 
 function asString(value: unknown): string | null {
@@ -48,6 +48,7 @@ type CompactTaskListIssue = {
 	status: string;
 	priority: number;
 	assignee: string | null;
+	scope?: string;
 	dependency_count: number;
 	issue_type: string;
 };
@@ -79,6 +80,7 @@ function toCompactTaskListIssue(issue: TaskIssue): CompactTaskListIssue {
 		status: String(issue.status ?? ""),
 		priority: typeof issue.priority === "number" && Number.isFinite(issue.priority) ? Math.trunc(issue.priority) : 0,
 		assignee: typeof issue.assignee === "string" ? issue.assignee : null,
+		scope: typeof issue.scope === "string" ? issue.scope : undefined,
 		dependency_count: getTaskDependencyCount(issue),
 		issue_type: String(issue.issue_type ?? ""),
 	};
@@ -307,6 +309,18 @@ function logTasksMutationForSystem(
 	});
 }
 
+function parseTasksRequestContext(rec: Record<string, unknown>): {
+	action: string | null;
+	issueId: string | null;
+	params: Record<string, unknown>;
+} {
+	const params = asRecord(rec.params) ?? rec;
+	const action = asString(rec.action)?.toLowerCase() ?? null;
+	const fallbackTaskId = asString(rec.defaultTaskId) ?? asString(params.defaultTaskId);
+	const issueId = asString(params.id) ?? fallbackTaskId;
+	return { action, issueId, params };
+}
+
 async function executeTasksToolAction(
 	tasksClient: TaskStoreClient,
 	request: unknown,
@@ -314,26 +328,25 @@ async function executeTasksToolAction(
 	const rec = asRecord(request);
 	if (!rec) return { ok: false, error: "Invalid tasks request payload" };
 
-	const action = asString(rec.action)?.toLowerCase();
+	const { action, issueId, params } = parseTasksRequestContext(rec);
 	if (!action) return { ok: false, error: "Missing tasks action" };
-
-	const params = asRecord(rec.params) ?? rec;
-	const fallbackTaskId = asString(rec.defaultTaskId) ?? asString(params.defaultTaskId);
-	const issueId = asString(params.id) ?? fallbackTaskId;
 	const actor = asString(rec.actor) ?? asString(params.actor) ?? undefined;
 	const includeClosed = params.includeClosed === true;
 	const requestedStatus = asString(params.status);
 	const applyDefaultVisibility = !includeClosed && !requestedStatus;
 	const effectiveStatus = requestedStatus ?? null;
-	const parseListArgs = (): string[] => {
+	const requestedLimit = asFiniteInt(params.limit);
+	const effectiveLimit = typeof requestedLimit === "number" ? Math.max(0, requestedLimit) : LIMIT_TASK_LIST_DEFAULT;
+	const requestedType = asString(params.type);
+	const parseListArgs = (opts?: { includeLimit?: boolean }): string[] => {
 		const args: string[] = [];
 		if (includeClosed) args.push("--all");
 		if (effectiveStatus) args.push("--status", effectiveStatus);
-		const type = asString(params.type);
-		if (type) args.push("--type", type);
-		const limit = asFiniteInt(params.limit);
-		const effectiveLimit = typeof limit === "number" ? limit : LIMIT_TASK_LIST_DEFAULT;
-		args.push("--limit", String(Math.max(0, effectiveLimit)));
+		const type = requestedType ?? "task";
+		args.push("--type", type);
+		if (opts?.includeLimit !== false) {
+			args.push("--limit", String(effectiveLimit));
+		}
 		return args;
 	};
 
@@ -343,7 +356,8 @@ async function executeTasksToolAction(
 				return { ok: true, data: (await tasksClient.ready()).map(issue => toCompactTaskListIssue(issue)) };
 			}
 			case "list": {
-				const issues = await tasksClient.list(parseListArgs());
+				const listArgs = parseListArgs({ includeLimit: !applyDefaultVisibility });
+				const issues = await tasksClient.list(listArgs.length > 0 ? listArgs : undefined);
 				const sortedIssues = [...issues].sort((a, b) => {
 					const aTime = parseTimestampMs(a.updated_at);
 					const bTime = parseTimestampMs(b.updated_at);
@@ -352,7 +366,9 @@ async function executeTasksToolAction(
 				const visibleIssues = applyDefaultVisibility
 					? sortedIssues.filter(issue => !isClosedTaskIssue(issue) && !isTerminalAgentStatus(issue.status))
 					: sortedIssues;
-				return { ok: true, data: visibleIssues.map(issue => toCompactTaskListIssue(issue)) };
+				const limitedIssues =
+					applyDefaultVisibility && effectiveLimit > 0 ? visibleIssues.slice(0, effectiveLimit) : visibleIssues;
+				return { ok: true, data: limitedIssues.map(issue => toCompactTaskListIssue(issue)) };
 			}
 			case "types": {
 				return { ok: true, data: await tasksClient.types() };
@@ -390,6 +406,7 @@ async function executeTasksToolAction(
 				const referencesArray = asStringArray(params.references);
 				const referencesString = asString(params.references);
 				const references = referencesArray.length > 0 ? referencesArray : (referencesString ?? undefined);
+				const scope = asString(params.scope);
 				const createInput: TaskCreateInput = {
 					type: asString(params.type) ?? "task",
 					labels: asStringArray(params.labels),
@@ -397,6 +414,7 @@ async function executeTasksToolAction(
 					depends_on: dependsOn,
 					references,
 				};
+				if (scope) createInput.scope = scope as TaskIssueScope;
 				const created = await tasksClient.create(title, description, priority ?? undefined, createInput);
 				return { ok: true, data: created };
 			}
@@ -421,6 +439,10 @@ async function executeTasksToolAction(
 				if (typeof priority === "number") patch.priority = priority;
 				if (Object.hasOwn(params, "assignee")) {
 					patch.assignee = params.assignee === null ? null : asString(params.assignee);
+				}
+				if (Object.hasOwn(params, "scope")) {
+					const scope = asString(params.scope);
+					if (scope) patch.scope = scope as TaskIssueScope;
 				}
 				await tasksClient.update(issueId, patch);
 				const dependsOnArray = asStringArray(params.depends_on);
@@ -521,6 +543,13 @@ export async function handleIpcMessage(opts: {
 	if (t === "tasks_request") {
 		const response = await executeTasksToolAction(opts.tasksClient, rec);
 		logTasksMutationForSystem(opts.registry, opts.systemAgentId, rec, response);
+		const tasksRequest = asRecord(rec);
+		if (response.ok && opts.loop && tasksRequest) {
+			const { action, issueId } = parseTasksRequestContext(tasksRequest);
+			if (issueId && (action === "close" || action === "delete")) {
+				await opts.loop.handleExternalTaskClose(issueId);
+			}
+		}
 		return response;
 	}
 
@@ -542,6 +571,34 @@ export async function handleIpcMessage(opts: {
 			return { ok: false, summary: "Agent loop unavailable" };
 		}
 		const result = opts.loop.advanceIssuerLifecycle({
+			taskId,
+			action,
+			message: msg,
+			reason,
+			agentId: agentId || undefined,
+		});
+		refresh();
+		return result;
+	}
+
+	if (t === "fast_worker_advance_lifecycle") {
+		const taskId = typeof (rec as any)?.taskId === "string" ? (rec as any).taskId : "";
+		const action = typeof (rec as any)?.action === "string" ? (rec as any).action : "";
+		const msg = typeof rec?.message === "string" ? rec.message : "";
+		const reason = typeof rec?.reason === "string" ? rec.reason : "";
+		const agentId = typeof (rec as any)?.agentId === "string" ? (rec as any).agentId : "";
+		opts.registry.pushEvent(opts.systemAgentId, {
+			type: "log",
+			ts: Date.now(),
+			level: "info",
+			message: `IPC: fast_worker_advance_lifecycle taskId=${taskId} action=${action}`,
+			data: opts.payload,
+		});
+		if (!opts.loop) {
+			refresh();
+			return { ok: false, summary: "Agent loop unavailable" };
+		}
+		const result = opts.loop.advanceFastWorkerLifecycle({
 			taskId,
 			action,
 			message: msg,
@@ -596,6 +653,54 @@ export async function handleIpcMessage(opts: {
 			return { ok: false, summary: "Agent loop unavailable" };
 		}
 		const result = opts.loop.handleFinisherCloseTask({
+			taskId,
+			reason,
+			agentId: agentId || undefined,
+		});
+		refresh();
+		return result;
+	}
+
+	if (t === "merger_complete") {
+		const taskId = typeof (rec as any)?.taskId === "string" ? (rec as any).taskId : "";
+		const reason = typeof rec?.reason === "string" ? rec.reason : "";
+		const agentId = typeof (rec as any)?.agentId === "string" ? (rec as any).agentId : "";
+		opts.registry.pushEvent(opts.systemAgentId, {
+			type: "log",
+			ts: Date.now(),
+			level: "info",
+			message: `IPC: merger_complete taskId=${taskId}`,
+			data: opts.payload,
+		});
+		if (!opts.loop) {
+			refresh();
+			return { ok: false, summary: "Agent loop unavailable" };
+		}
+		const result = opts.loop.handleMergerComplete({
+			taskId,
+			reason,
+			agentId: agentId || undefined,
+		});
+		refresh();
+		return result;
+	}
+
+	if (t === "merger_conflict") {
+		const taskId = typeof (rec as any)?.taskId === "string" ? (rec as any).taskId : "";
+		const reason = typeof rec?.reason === "string" ? rec.reason : "";
+		const agentId = typeof (rec as any)?.agentId === "string" ? (rec as any).agentId : "";
+		opts.registry.pushEvent(opts.systemAgentId, {
+			type: "log",
+			ts: Date.now(),
+			level: "info",
+			message: `IPC: merger_conflict taskId=${taskId}`,
+			data: opts.payload,
+		});
+		if (!opts.loop) {
+			refresh();
+			return { ok: false, summary: "Agent loop unavailable" };
+		}
+		const result = opts.loop.handleMergerConflict({
 			taskId,
 			reason,
 			agentId: agentId || undefined,

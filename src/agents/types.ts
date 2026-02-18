@@ -1,4 +1,12 @@
-export type AgentRole = "singularity" | "issuer" | "worker" | "designer-worker" | "finisher" | "steering";
+export type AgentRole =
+	| "singularity"
+	| "issuer"
+	| "worker"
+	| "fast-worker"
+	| "designer-worker"
+	| "finisher"
+	| "merger"
+	| "steering";
 
 export type AgentStatus =
 	| "spawning"
@@ -64,6 +72,8 @@ export interface AgentInfo {
 
 	role: AgentRole;
 	taskId: string | null;
+	/** Replica working directory used by editable agents (worker/finisher). */
+	replicaDir?: string;
 
 	/** tasks issue id for the agent issue backing this runtime agent. */
 	tasksAgentId: string;

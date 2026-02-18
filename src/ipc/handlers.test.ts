@@ -50,8 +50,10 @@ function createRegistry(tasksClient: TaskStoreClient): AgentRegistry {
 function createLoopStub(overrides: Record<string, unknown> = {}) {
 	return {
 		advanceIssuerLifecycle: (opts: unknown) => ({ ok: true, opts }),
+		advanceFastWorkerLifecycle: (opts: unknown) => ({ ok: true, opts }),
 		advanceFinisherLifecycle: (opts: unknown) => ({ ok: true, opts }),
 		handleFinisherCloseTask: async (opts: unknown) => ({ ok: true, opts }),
+		handleExternalTaskClose: async (_taskId: string) => {},
 		broadcastToWorkers: async (_message: string, _meta?: unknown) => {},
 		interruptAgent: async (_taskId: string, _message: string) => true,
 		steerAgent: async (_taskId: string, _message: string) => true,
@@ -140,6 +142,45 @@ describe("handleIpcMessage", () => {
 		expect(listCalls[0]).toEqual(["--all", "--status", "open", "--type", "task", "--limit", "5"]);
 	});
 
+	test("tasks_request list explicit type override is passed through", async () => {
+		const listCalls: Array<readonly string[] | undefined> = [];
+		const tasksClient = {
+			list: async (args?: readonly string[]) => {
+				listCalls.push(args);
+				const argList = Array.isArray(args) ? args : [];
+				const typeIndex = argList.indexOf("--type");
+				const requestedType = typeIndex >= 0 ? (argList[typeIndex + 1] ?? "") : "";
+				if (requestedType === "agent") {
+					return [
+						makeIssue("agent-1", {
+							issue_type: "agent",
+							status: "in_progress",
+						}),
+					];
+				}
+				return [
+					makeIssue("task-1", {
+						issue_type: "task",
+						status: "open",
+					}),
+				];
+			},
+		} as unknown as TaskStoreClient;
+		const registry = createRegistry(tasksClient);
+
+		const response = (await handleIpcMessage({
+			payload: { type: "tasks_request", action: "list", params: { type: "agent" } },
+			loop: null,
+			registry,
+			tasksClient,
+			systemAgentId: "system",
+		})) as { ok: boolean; data?: unknown[] };
+
+		expect(response.ok).toBe(true);
+		expect((response.data ?? []).map(item => (item as { id: string }).id)).toEqual(["agent-1"]);
+		expect(listCalls[0]).toEqual(["--type", "agent"]);
+	});
+
 	test("tasks_request list excludes closed and terminal statuses, keeps blocked, and defaults dependency_count to zero", async () => {
 		const listCalls: Array<readonly string[] | undefined> = [];
 		const tasksClient = {
@@ -202,8 +243,88 @@ describe("handleIpcMessage", () => {
 				issue_type: "feature",
 			},
 		]);
-		expect((response.data ?? []).every(item => Object.keys(item as Record<string, unknown>).length === 7)).toBe(true);
-		expect(listCalls[0]).toEqual(["--limit", "50"]);
+		expect((response.data ?? []).every(item => Object.keys(item as Record<string, unknown>).length === 8)).toBe(true);
+		expect(listCalls[0]).toEqual(["--type", "task"]);
+	});
+
+	test("tasks_request list applies default visibility before limit when top results are terminal", async () => {
+		const listCalls: Array<readonly string[] | undefined> = [];
+		const terminalIssues = Array.from({ length: 50 }, (_, index) =>
+			makeIssue(`agent-${index + 1}`, {
+				issue_type: "agent",
+				status: "done",
+				priority: 0,
+			}),
+		);
+		const openIssue = makeIssue("task-open-visible", {
+			status: "open",
+			priority: 4,
+			issue_type: "task",
+			updated_at: "2026-01-02T00:00:00.000Z",
+		});
+		const tasksClient = {
+			list: async (args?: readonly string[]) => {
+				listCalls.push(args);
+				if (Array.isArray(args) && args.includes("--limit")) return terminalIssues;
+				return [...terminalIssues, openIssue];
+			},
+		} as unknown as TaskStoreClient;
+		const registry = createRegistry(tasksClient);
+
+		const response = (await handleIpcMessage({
+			payload: { type: "tasks_request", action: "list", params: {} },
+			loop: null,
+			registry,
+			tasksClient,
+			systemAgentId: "system",
+		})) as { ok: boolean; data?: unknown[] };
+
+		expect(response.ok).toBe(true);
+		expect((response.data ?? []).map(item => (item as { id: string }).id)).toEqual([openIssue.id]);
+		expect(listCalls[0]).toEqual(["--type", "task"]);
+	});
+
+	test("tasks_request create remains visible in default list with real store", async () => {
+		const sessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "oms-list-visible-test-"));
+		try {
+			const tasksClient = new JsonTaskStore({
+				cwd: process.cwd(),
+				sessionDir,
+				actor: "oms-main",
+			});
+			const registry = createRegistry(tasksClient);
+			for (let i = 0; i < 50; i += 1) {
+				const agentIssue = await tasksClient.create(`Terminal agent ${i + 1}`, null, 0, { type: "agent" });
+				await tasksClient.update(agentIssue.id, { newStatus: "done" });
+			}
+
+			const openAgent = await tasksClient.create("Open terminal agent", null, 0, { type: "agent" });
+
+			const createResponse = (await handleIpcMessage({
+				payload: { type: "tasks_request", action: "create", params: { title: "Fresh open task" } },
+				loop: null,
+				registry,
+				tasksClient,
+				systemAgentId: "system",
+			})) as { ok: boolean; data?: TaskIssue };
+			expect(createResponse.ok).toBe(true);
+			const createdTaskId = createResponse.data?.id ?? "";
+			expect(createdTaskId).toBeTruthy();
+
+			const listResponse = (await handleIpcMessage({
+				payload: { type: "tasks_request", action: "list", params: {} },
+				loop: null,
+				registry,
+				tasksClient,
+				systemAgentId: "system",
+			})) as { ok: boolean; data?: unknown[] };
+			expect(listResponse.ok).toBe(true);
+			const listIds = (listResponse.data ?? []).map(item => (item as { id: string }).id);
+			expect(listIds).toEqual([createdTaskId]);
+			expect(listIds).not.toContain(openAgent.id);
+		} finally {
+			await fs.rm(sessionDir, { recursive: true, force: true });
+		}
 	});
 
 	test("tasks_request list respects explicit status without includeClosed", async () => {
@@ -230,7 +351,7 @@ describe("handleIpcMessage", () => {
 
 		expect(response.ok).toBe(true);
 		expect((response.data ?? []).map(item => (item as { status: string }).status)).toEqual(["done"]);
-		expect(listCalls[0]).toEqual(["--status", "done", "--limit", "50"]);
+		expect(listCalls[0]).toEqual(["--status", "done", "--type", "task", "--limit", "50"]);
 	});
 
 	test("tasks_request list sorts by updated_at descending and treats invalid timestamps as oldest", async () => {
@@ -585,7 +706,7 @@ describe("handleIpcMessage", () => {
 				issue_type: "bug",
 			},
 		]);
-		expect((response.data ?? []).every(item => Object.keys(item as Record<string, unknown>).length === 7)).toBe(true);
+		expect((response.data ?? []).every(item => Object.keys(item as Record<string, unknown>).length === 8)).toBe(true);
 		for (const item of response.data ?? []) {
 			expect(item).not.toHaveProperty("description");
 			expect(item).not.toHaveProperty("acceptance_criteria");
@@ -721,7 +842,7 @@ describe("handleIpcMessage", () => {
 				issue_type: "task",
 			},
 		]);
-		expect((response.data ?? []).every(item => Object.keys(item as Record<string, unknown>).length === 7)).toBe(true);
+		expect((response.data ?? []).every(item => Object.keys(item as Record<string, unknown>).length === 8)).toBe(true);
 		for (const item of response.data ?? []) {
 			expect(item).not.toHaveProperty("description");
 			expect(item).not.toHaveProperty("acceptance_criteria");
@@ -824,7 +945,7 @@ describe("handleIpcMessage", () => {
 				issue_type: "task",
 			},
 		]);
-		expect((response.data ?? []).every(item => Object.keys(item as Record<string, unknown>).length === 7)).toBe(true);
+		expect((response.data ?? []).every(item => Object.keys(item as Record<string, unknown>).length === 8)).toBe(true);
 		for (const item of response.data ?? []) {
 			expect(item).not.toHaveProperty("description");
 			expect(item).not.toHaveProperty("acceptance_criteria");
@@ -838,6 +959,31 @@ describe("handleIpcMessage", () => {
 			expect(item).not.toHaveProperty("metadata");
 		}
 		expect(queryCalls).toEqual([{ query: "status:open", args: [] }]);
+	});
+
+	test("tasks_request close notifies loop to cleanup external merge queue state", async () => {
+		const externalCloseCalls: string[] = [];
+		const loop = createLoopStub({
+			handleExternalTaskClose: async (taskId: string) => {
+				externalCloseCalls.push(taskId);
+			},
+		});
+		const tasksClient = {
+			close: async (_taskId: string, _reason?: string) => {},
+			show: async (taskId: string) => makeIssue(taskId, { status: "closed" }),
+		} as unknown as TaskStoreClient;
+		const registry = createRegistry(tasksClient);
+
+		const response = await handleIpcMessage({
+			payload: { type: "tasks_request", action: "close", params: { id: "task-closed", reason: "manual" } },
+			loop: loop as never,
+			registry,
+			tasksClient,
+			systemAgentId: "system",
+		});
+
+		expect(response).toEqual(expect.objectContaining({ ok: true }));
+		expect(externalCloseCalls).toEqual(["task-closed"]);
 	});
 
 	test("tasks_request returns validation errors for missing required params", async () => {
@@ -1144,11 +1290,18 @@ describe("handleIpcMessage", () => {
 		}
 	});
 
-	test("issuer_advance_lifecycle and finisher_advance_lifecycle return unavailable when loop is missing", async () => {
+	test("issuer_advance_lifecycle, fast_worker_advance_lifecycle, and finisher_advance_lifecycle return unavailable when loop is missing", async () => {
 		const tasksClient = {} as unknown as TaskStoreClient;
 		const registry = createRegistry(tasksClient);
 		const issuerResponse = await handleIpcMessage({
 			payload: { type: "issuer_advance_lifecycle", taskId: "task-1", action: "next" },
+			loop: null,
+			registry,
+			tasksClient,
+			systemAgentId: "system",
+		});
+		const fastWorkerResponse = await handleIpcMessage({
+			payload: { type: "fast_worker_advance_lifecycle", taskId: "task-1", action: "done" },
 			loop: null,
 			registry,
 			tasksClient,
@@ -1161,14 +1314,20 @@ describe("handleIpcMessage", () => {
 			tasksClient,
 			systemAgentId: "system",
 		});
-
 		expect(issuerResponse).toEqual({ ok: false, summary: "Agent loop unavailable" });
+		expect(fastWorkerResponse).toEqual({ ok: false, summary: "Agent loop unavailable" });
 		expect(finisherResponse).toEqual({ ok: false, summary: "Agent loop unavailable" });
 	});
 
-	test("issuer_advance_lifecycle, finisher_advance_lifecycle, and finisher_close_task delegate to loop", async () => {
-		const calls: { issuer: unknown[]; finisherAdvance: unknown[]; finisherClose: unknown[] } = {
+	test("issuer_advance_lifecycle, fast_worker_advance_lifecycle, finisher_advance_lifecycle, and finisher_close_task delegate to loop", async () => {
+		const calls: {
+			issuer: unknown[];
+			fastWorkerAdvance: unknown[];
+			finisherAdvance: unknown[];
+			finisherClose: unknown[];
+		} = {
 			issuer: [],
+			fastWorkerAdvance: [],
 			finisherAdvance: [],
 			finisherClose: [],
 		};
@@ -1176,6 +1335,10 @@ describe("handleIpcMessage", () => {
 			advanceIssuerLifecycle: (opts: unknown) => {
 				calls.issuer.push(opts);
 				return { ok: true, kind: "issuer" };
+			},
+			advanceFastWorkerLifecycle: (opts: unknown) => {
+				calls.fastWorkerAdvance.push(opts);
+				return { ok: true, kind: "fast-worker-advance" };
 			},
 			advanceFinisherLifecycle: (opts: unknown) => {
 				calls.finisherAdvance.push(opts);
@@ -1196,6 +1359,20 @@ describe("handleIpcMessage", () => {
 				message: "go",
 				reason: "ok",
 				agentId: "agent-1",
+			},
+			loop: loop as never,
+			registry,
+			tasksClient,
+			systemAgentId: "system",
+		});
+		const fastWorkerAdvance = await handleIpcMessage({
+			payload: {
+				type: "fast_worker_advance_lifecycle",
+				taskId: "task-1",
+				action: "escalate",
+				message: "needs issuer",
+				reason: "too broad",
+				agentId: "fast-1",
 			},
 			loop: loop as never,
 			registry,
@@ -1224,9 +1401,11 @@ describe("handleIpcMessage", () => {
 			systemAgentId: "system",
 		});
 		expect(issuer).toEqual({ ok: true, kind: "issuer" });
+		expect(fastWorkerAdvance).toEqual({ ok: true, kind: "fast-worker-advance" });
 		expect(finisherAdvance).toEqual({ ok: true, kind: "finisher-advance" });
 		expect(finisherClose).toEqual({ ok: true, kind: "finisher-close" });
 		expect(calls.issuer).toHaveLength(1);
+		expect(calls.fastWorkerAdvance).toHaveLength(1);
 		expect(calls.finisherAdvance).toHaveLength(1);
 		expect(calls.finisherClose).toHaveLength(1);
 	});

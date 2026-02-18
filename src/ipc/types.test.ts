@@ -103,6 +103,41 @@ describe("parseIPCMessage", () => {
 		});
 	});
 
+	describe("fast_worker_advance_lifecycle", () => {
+		test("parses required lifecycle fields and validates action values", () => {
+			const message = expectParseOk({
+				type: "fast_worker_advance_lifecycle",
+				taskId: "task-1",
+				action: "done",
+				message: "implemented tiny fix",
+				reason: "completed",
+				agentId: "fast-1",
+			});
+			expect(message).toEqual({
+				type: "fast_worker_advance_lifecycle",
+				taskId: "task-1",
+				action: "done",
+				message: "implemented tiny fix",
+				reason: "completed",
+				agentId: "fast-1",
+			});
+		});
+
+		test("rejects unsupported action", () => {
+			expectParseError(
+				{
+					type: "fast_worker_advance_lifecycle",
+					taskId: "task-1",
+					action: "start",
+					message: "go",
+					reason: "nope",
+					agentId: "fast-1",
+				},
+				/"action" must be one of done, escalate/,
+			);
+		});
+	});
+
 	describe("finisher_advance_lifecycle", () => {
 		test("parses required lifecycle fields and validates action values", () => {
 			const message = expectParseOk({
