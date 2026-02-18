@@ -15,7 +15,6 @@ export function sendIpc(sockPath: string, payload: unknown, timeoutMs = 1_500): 
 
 	const client = net.createConnection({ path: sockPath }, () => {
 		client.write(`${JSON.stringify(payload)}\n`);
-		client.end();
 	});
 
 	client.setEncoding("utf8");
