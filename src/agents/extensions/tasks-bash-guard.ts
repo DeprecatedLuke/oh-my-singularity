@@ -41,7 +41,7 @@ export default async function tasksBashGuardExtension(api: ExtensionAPI): Promis
 		}
 
 		// Block tasks tracker access via bash - agents must use the typed tasks tool
-		if (TASKS_TOKEN_RE.test(command) || TASKS_BACKING_STORE_RE.test(command)) {
+		if (isManagedAgent && (TASKS_TOKEN_RE.test(command) || TASKS_BACKING_STORE_RE.test(command))) {
 			return {
 				block: true,
 				reason:
