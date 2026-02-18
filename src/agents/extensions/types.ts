@@ -46,12 +46,73 @@ export type TypeBuilder = {
 	Boolean: (options?: TypeBoxOptions) => unknown;
 };
 
+export type ToolTheme = {
+	fg: (scope: string, text: string) => string;
+	bold?: (text: string) => string;
+	styledSymbol?: (name: string, color: string) => string;
+	sep?: {
+		dot: string;
+		slash?: string;
+		pipe?: string;
+		powerline?: string;
+	};
+	spinnerFrames?: string[];
+	boxSharp?: {
+		topLeft: string;
+		topRight: string;
+		bottomLeft: string;
+		bottomRight: string;
+		horizontal: string;
+		vertical: string;
+		cross: string;
+		teeDown: string;
+		teeUp: string;
+		teeRight: string;
+		teeLeft: string;
+	};
+	format?: {
+		bullet?: string;
+		dash?: string;
+		bracketLeft?: string;
+		bracketRight?: string;
+	};
+};
+
+export type ToolRenderComponent = {
+	render: (width: number) => string[];
+	invalidate?: () => void;
+};
+
+export type ToolRenderResultOptions = {
+	expanded: boolean;
+	isPartial: boolean;
+	spinnerFrame?: number;
+};
+
+export type ToolRenderCallOptions = {
+	spinnerFrame?: number;
+	isPartial?: boolean;
+	result?: ToolResultWithError;
+};
+
+export type ToolResultWithError = ToolResult & {
+	isError?: boolean;
+};
+
 export type ToolDefinition = {
 	name: string;
 	label: string;
 	description: string;
 	parameters: unknown;
 	execute: (toolCallId: string, params: ToolParams) => Promise<ToolResult>;
+	mergeCallAndResult?: boolean;
+	renderCall?: (args: ToolParams, theme: ToolTheme, options?: ToolRenderCallOptions) => ToolRenderComponent;
+	renderResult?: (
+		result: ToolResultWithError,
+		options: ToolRenderResultOptions,
+		theme: ToolTheme,
+		args?: ToolParams,
+	) => ToolRenderComponent;
 };
 
 export type ExecResult = {

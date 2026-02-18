@@ -1,6 +1,6 @@
 import net from "node:net";
 import { logger } from "../../utils";
-
+import { renderToolCall, renderToolResult } from "./tool-renderers";
 import type { ExtensionAPI } from "./types";
 
 /**
@@ -31,31 +31,33 @@ export default async function steerAgentExtension(api: ExtensionAPI): Promise<vo
 			},
 			{ additionalProperties: false },
 		),
+		mergeCallAndResult: true,
+		renderCall: (args, theme, options) => {
+			const taskId = typeof args?.taskId === "string" ? args.taskId.trim() : "";
+			const message = typeof args?.message === "string" ? args.message.trim() : "";
+			return renderToolCall(
+				"Steer Agent",
+				[taskId ? `taskId=${taskId}` : "", message ? `message=${message}` : ""],
+				theme,
+				options,
+			);
+		},
+		renderResult: (result, options, theme) => renderToolResult("Steer Agent", result, options, theme),
 		execute: async (_toolCallId, params) => {
 			const sockPath = process.env.OMS_SINGULARITY_SOCK ?? "";
 			if (!sockPath.trim()) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: "OMS socket not configured (OMS_SINGULARITY_SOCK is empty).",
-						},
-					],
-				};
+				throw new Error("OMS socket not configured (OMS_SINGULARITY_SOCK is empty).");
 			}
 
 			const taskId = typeof params?.taskId === "string" ? params.taskId.trim() : "";
 			const message = typeof params?.message === "string" ? params.message.trim() : "";
 
 			if (!taskId) {
-				return {
-					content: [{ type: "text", text: "steer_agent: taskId is required" }],
-				};
+				throw new Error("steer_agent: taskId is required");
 			}
+
 			if (!message) {
-				return {
-					content: [{ type: "text", text: "steer_agent: message is required" }],
-				};
+				throw new Error("steer_agent: message is required");
 			}
 
 			const payload = JSON.stringify({
@@ -66,58 +68,73 @@ export default async function steerAgentExtension(api: ExtensionAPI): Promise<vo
 			});
 
 			try {
-				await sendLine(sockPath, payload);
+				const response = await sendLine(sockPath, payload);
+				const responseRecord = asRecord(response);
+				if (responseRecord?.ok === false) {
+					const error =
+						typeof responseRecord.error === "string" && responseRecord.error.trim()
+							? responseRecord.error.trim()
+							: `steer_agent failed for task ${taskId}`;
+					throw new Error(error);
+				}
+
 				return {
 					content: [{ type: "text", text: `OK (steer queued for task ${taskId})` }],
 				};
 			} catch (err) {
-				const errMsg = err instanceof Error ? err.message : String(err);
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Failed to send steer message: ${errMsg}`,
-						},
-					],
-					details: { sockPath, error: errMsg },
-				};
+				throw new Error(`Failed to send steer message: ${err instanceof Error ? err.message : String(err)}`);
 			}
 		},
 	});
 }
 
-function sendLine(sockPath: string, line: string, timeoutMs = 1500): Promise<void> {
-	return new Promise((resolve, reject) => {
-		let settled = false;
-
-		const client = net.createConnection({ path: sockPath }, () => {
-			client.write(`${line}\n`);
-			client.end();
-		});
-
-		const timeout = setTimeout(() => {
-			if (settled) return;
-			settled = true;
-			try {
-				client.destroy();
-			} catch (err) {
-				logger.debug("agents/extensions/steer-agent.ts: best-effort failure after client.destroy();", { err });
-			}
-			reject(new Error(`Timeout connecting to ${sockPath}`));
-		}, timeoutMs);
-
-		client.on("error", err => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-			reject(err);
-		});
-
-		client.on("close", () => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-			resolve();
-		});
+function sendLine(sockPath: string, line: string, timeoutMs = 1500): Promise<unknown> {
+	const { promise, resolve, reject } = Promise.withResolvers<unknown>();
+	let settled = false;
+	let responseText = "";
+	const client = net.createConnection({ path: sockPath }, () => {
+		client.write(`${line}\n`);
+		client.end();
 	});
+	client.setEncoding("utf8");
+	client.on("data", chunk => {
+		responseText += chunk;
+	});
+	const timeout = setTimeout(() => {
+		if (settled) return;
+		settled = true;
+		try {
+			client.destroy();
+		} catch (err) {
+			logger.debug("agents/extensions/steer-agent.ts: best-effort failure after client.destroy();", { err });
+		}
+		reject(new Error(`Timeout connecting to ${sockPath}`));
+	}, timeoutMs);
+	client.on("error", err => {
+		if (settled) return;
+		settled = true;
+		clearTimeout(timeout);
+		reject(err);
+	});
+	client.on("close", () => {
+		if (settled) return;
+		settled = true;
+		clearTimeout(timeout);
+		const trimmed = responseText.trim();
+		if (!trimmed || trimmed === "ok") {
+			resolve({ ok: true });
+			return;
+		}
+		try {
+			resolve(JSON.parse(trimmed));
+		} catch {
+			resolve(trimmed);
+		}
+	});
+	return promise;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	return value as Record<string, unknown>;
 }

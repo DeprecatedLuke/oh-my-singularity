@@ -1,6 +1,6 @@
 import net from "node:net";
 import { logger } from "../../utils";
-
+import { renderToolCall, renderToolResult } from "./tool-renderers";
 import type { ExtensionAPI } from "./types";
 
 /**
@@ -30,17 +30,18 @@ export default async function broadcastToWorkersExtension(api: ExtensionAPI): Pr
 			},
 			{ additionalProperties: false },
 		),
+		mergeCallAndResult: true,
+		renderCall: (args, theme, options) => {
+			const message = typeof args?.message === "string" ? args.message.trim() : "";
+			const urgency = typeof args?.urgency === "string" ? args.urgency : "normal";
+			const details = [message ? `message=${message}` : "", `urgency=${urgency}`];
+			return renderToolCall("Broadcast to Workers", details.filter(Boolean), theme, options);
+		},
+		renderResult: (result, options, theme) => renderToolResult("Broadcast to Workers", result, options, theme),
 		execute: async (_toolCallId, params) => {
 			const sockPath = process.env.OMS_SINGULARITY_SOCK ?? "";
 			if (!sockPath.trim()) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: "OMS broadcast socket not configured (OMS_SINGULARITY_SOCK is empty).",
-						},
-					],
-				};
+				throw new Error("OMS broadcast socket not configured (OMS_SINGULARITY_SOCK is empty).");
 			}
 
 			const role = process.env.OMS_ROLE ?? "agent";
@@ -58,60 +59,74 @@ export default async function broadcastToWorkersExtension(api: ExtensionAPI): Pr
 			});
 
 			try {
-				await sendLine(sockPath, payload);
+				const response = await sendLine(sockPath, payload);
+				const responseRecord = asRecord(response);
+				if (responseRecord?.ok === false) {
+					const error =
+						typeof responseRecord.error === "string" && responseRecord.error.trim()
+							? responseRecord.error.trim()
+							: "broadcast_to_workers failed";
+					throw new Error(error);
+				}
 				return {
 					content: [{ type: "text", text: "OK (broadcast queued)" }],
 				};
 			} catch (err) {
-				const message = err instanceof Error ? err.message : String(err);
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Failed to broadcast: ${message}`,
-						},
-					],
-					details: { sockPath, error: message },
-				};
+				throw new Error(`Failed to broadcast: ${err instanceof Error ? err.message : String(err)}`);
 			}
 		},
 	});
 }
 
-function sendLine(sockPath: string, line: string, timeoutMs = 1500): Promise<void> {
-	return new Promise((resolve, reject) => {
-		let settled = false;
-
-		const client = net.createConnection({ path: sockPath }, () => {
-			client.write(`${line}\n`);
-			client.end();
-		});
-
-		const timeout = setTimeout(() => {
-			if (settled) return;
-			settled = true;
-			try {
-				client.destroy();
-			} catch (err) {
-				logger.debug("agents/extensions/broadcast-to-workers.ts: best-effort failure after client.destroy();", {
-					err,
-				});
-			}
-			reject(new Error(`Timeout connecting to ${sockPath}`));
-		}, timeoutMs);
-
-		client.on("error", err => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-			reject(err);
-		});
-
-		client.on("close", () => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-			resolve();
-		});
+function sendLine(sockPath: string, line: string, timeoutMs = 1500): Promise<unknown> {
+	const { promise, resolve, reject } = Promise.withResolvers<unknown>();
+	let settled = false;
+	let responseText = "";
+	const client = net.createConnection({ path: sockPath }, () => {
+		client.write(`${line}\n`);
+		client.end();
 	});
+	client.setEncoding("utf8");
+	client.on("data", chunk => {
+		responseText += chunk;
+	});
+	const timeout = setTimeout(() => {
+		if (settled) return;
+		settled = true;
+		try {
+			client.destroy();
+		} catch (err) {
+			logger.debug("agents/extensions/broadcast-to-workers.ts: best-effort failure after client.destroy();", {
+				err,
+			});
+		}
+		reject(new Error(`Timeout connecting to ${sockPath}`));
+	}, timeoutMs);
+	client.on("error", err => {
+		if (settled) return;
+		settled = true;
+		clearTimeout(timeout);
+		reject(err);
+	});
+	client.on("close", () => {
+		if (settled) return;
+		settled = true;
+		clearTimeout(timeout);
+		const trimmed = responseText.trim();
+		if (!trimmed || trimmed === "ok") {
+			resolve({ ok: true });
+			return;
+		}
+		try {
+			resolve(JSON.parse(trimmed));
+		} catch {
+			resolve(trimmed);
+		}
+	});
+	return promise;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	return value as Record<string, unknown>;
 }

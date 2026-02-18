@@ -1,6 +1,6 @@
 import net from "node:net";
 import { logger } from "../../utils";
-
+import { renderToolCall, renderToolResult } from "./tool-renderers";
 import type { ExtensionAPI, UnknownRecord } from "./types";
 
 const TOMBSTONE_REASON = "tombstone: cancelled by user via delete_task_issue";
@@ -36,24 +36,30 @@ export default async function deleteTaskIssueExtension(api: ExtensionAPI): Promi
 			},
 			{ additionalProperties: false },
 		),
+		mergeCallAndResult: true,
+		renderCall: (args, theme, options) => {
+			const id = typeof args?.id === "string" ? args.id.trim() : "";
+			return renderToolCall("Delete Task Issue", id ? [`id=${id}`] : [], theme, options);
+		},
+		renderResult: (result, options, theme) => renderToolResult("Delete Task Issue", result, options, theme),
 		execute: async (_toolCallId, params) => {
 			const sockPath = process.env.OMS_SINGULARITY_SOCK ?? "";
 			if (!sockPath.trim()) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: "OMS socket not configured (OMS_SINGULARITY_SOCK is empty).",
-						},
-					],
-				};
+				throw new Error("OMS socket not configured (OMS_SINGULARITY_SOCK is empty).");
 			}
 
 			const id = typeof params?.id === "string" ? params.id.trim() : "";
 			if (!id) {
-				return {
-					content: [{ type: "text", text: "delete_task_issue: id is required" }],
-				};
+				throw new Error("delete_task_issue: id is required");
+			}
+			const actor = process.env.TASKS_ACTOR ?? "oms-singularity";
+			const existing = await sendTasksRequest(sockPath, {
+				action: "show",
+				params: { id },
+				actor,
+			});
+			if (!existing.ok) {
+				throw new Error(`delete_task_issue: issue ${id} does not exist`);
 			}
 
 			try {
@@ -70,23 +76,8 @@ export default async function deleteTaskIssueExtension(api: ExtensionAPI): Promi
 				);
 			} catch (err) {
 				const errMsg = err instanceof Error ? err.message : String(err);
-				return {
-					content: [
-						{
-							type: "text",
-							text: `delete_task_issue: failed to stop agents for ${id}: ${errMsg}`,
-						},
-					],
-					details: {
-						id,
-						stopped: false,
-						deleted: false,
-						error: errMsg,
-					},
-				};
+				throw new Error(`delete_task_issue: failed to stop agents for ${id}: ${errMsg}`);
 			}
-
-			const actor = process.env.TASKS_ACTOR ?? "oms-singularity";
 			const deleted = await sendTasksRequest(sockPath, {
 				action: "delete",
 				params: { id },
@@ -131,25 +122,9 @@ export default async function deleteTaskIssueExtension(api: ExtensionAPI): Promi
 
 			const deleteError = deleted.error ?? "delete failed";
 			const tombstoneError = tombstone.error ?? "close failed";
-			return {
-				content: [
-					{
-						type: "text",
-						text:
-							`delete_task_issue: stopped agents for ${id}, but deletion failed. ` +
-							`delete error: ${deleteError}; tombstone fallback error: ${tombstoneError}`,
-					},
-				],
-				details: {
-					id,
-					stopped: true,
-					deleted: false,
-					deleteError,
-					tombstoneError,
-					deleteResponse: deleted.response,
-					tombstoneResponse: tombstone.response,
-				},
-			};
+			throw new Error(
+				`delete_task_issue: stopped agents for ${id}, but deletion failed. delete error: ${deleteError}; tombstone fallback error: ${tombstoneError}`,
+			);
 		},
 	});
 }
@@ -191,7 +166,6 @@ function sendRequest(sockPath: string, payload: unknown, timeoutMs = 1500): Prom
 
 		const client = net.createConnection({ path: sockPath }, () => {
 			client.write(`${JSON.stringify(payload)}\n`);
-			client.end();
 		});
 
 		client.setEncoding("utf8");

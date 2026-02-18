@@ -1,6 +1,6 @@
 import net from "node:net";
 import { logger } from "../../utils";
-
+import { renderToolCall, renderToolResult } from "./tool-renderers";
 import type { ExtensionAPI } from "./types";
 
 /**
@@ -44,17 +44,23 @@ export default async function replaceAgentExtension(api: ExtensionAPI): Promise<
 			},
 			{ additionalProperties: false },
 		),
+		mergeCallAndResult: true,
+		renderCall: (args, theme, options) => {
+			const role = typeof args?.role === "string" ? args.role.trim() : "";
+			const taskId = typeof args?.taskId === "string" ? args.taskId.trim() : "";
+			const context = typeof args?.context === "string" ? args.context.trim() : "";
+			const details = [
+				role ? `role=${role}` : "",
+				taskId ? `taskId=${taskId}` : "",
+				context ? `context=${context}` : "",
+			];
+			return renderToolCall("Replace Agent", details.filter(Boolean), theme, options);
+		},
+		renderResult: (result, options, theme) => renderToolResult("Replace Agent", result, options, theme),
 		execute: async (_toolCallId, params) => {
 			const sockPath = process.env.OMS_SINGULARITY_SOCK ?? "";
 			if (!sockPath.trim()) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: "OMS socket not configured (OMS_SINGULARITY_SOCK is empty).",
-						},
-					],
-				};
+				throw new Error("OMS socket not configured (OMS_SINGULARITY_SOCK is empty).");
 			}
 
 			const role = typeof params?.role === "string" ? params.role.trim() : "";
@@ -62,20 +68,11 @@ export default async function replaceAgentExtension(api: ExtensionAPI): Promise<
 			const context = typeof params?.context === "string" ? params.context.trim() : "";
 
 			if (!role || !["finisher", "issuer", "worker"].includes(role)) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: "replace_agent: role must be one of: finisher, issuer, worker",
-						},
-					],
-				};
+				throw new Error("replace_agent: role must be one of: finisher, issuer, worker");
 			}
 
 			if (!taskId) {
-				return {
-					content: [{ type: "text", text: "replace_agent: taskId is required" }],
-				};
+				throw new Error("replace_agent: taskId is required");
 			}
 
 			const payload = JSON.stringify({
@@ -87,7 +84,15 @@ export default async function replaceAgentExtension(api: ExtensionAPI): Promise<
 			});
 
 			try {
-				await sendLine(sockPath, payload);
+				const response = await sendLine(sockPath, payload);
+				const responseRecord = asRecord(response);
+				if (responseRecord?.ok === false) {
+					const error =
+						typeof responseRecord.error === "string" && responseRecord.error.trim()
+							? responseRecord.error.trim()
+							: `replace_agent failed for task ${taskId}`;
+					throw new Error(error);
+				}
 				return {
 					content: [
 						{
@@ -97,53 +102,59 @@ export default async function replaceAgentExtension(api: ExtensionAPI): Promise<
 					],
 				};
 			} catch (err) {
-				const errMsg = err instanceof Error ? err.message : String(err);
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Failed to request agent replacement: ${errMsg}`,
-						},
-					],
-					details: { sockPath, error: errMsg },
-				};
+				throw new Error(`Failed to request agent replacement: ${err instanceof Error ? err.message : String(err)}`);
 			}
 		},
 	});
 }
 
-function sendLine(sockPath: string, line: string, timeoutMs = 1500): Promise<void> {
-	return new Promise((resolve, reject) => {
-		let settled = false;
-
-		const client = net.createConnection({ path: sockPath }, () => {
-			client.write(`${line}\n`);
-			client.end();
-		});
-
-		const timeout = setTimeout(() => {
-			if (settled) return;
-			settled = true;
-			try {
-				client.destroy();
-			} catch (err) {
-				logger.debug("agents/extensions/replace-agent.ts: best-effort failure after client.destroy();", { err });
-			}
-			reject(new Error(`Timeout connecting to ${sockPath}`));
-		}, timeoutMs);
-
-		client.on("error", err => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-			reject(err);
-		});
-
-		client.on("close", () => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-			resolve();
-		});
+function sendLine(sockPath: string, line: string, timeoutMs = 1500): Promise<unknown> {
+	const { promise, resolve, reject } = Promise.withResolvers<unknown>();
+	let settled = false;
+	let responseText = "";
+	const client = net.createConnection({ path: sockPath }, () => {
+		client.write(`${line}\n`);
+		client.end();
 	});
+	client.setEncoding("utf8");
+	client.on("data", chunk => {
+		responseText += chunk;
+	});
+	const timeout = setTimeout(() => {
+		if (settled) return;
+		settled = true;
+		try {
+			client.destroy();
+		} catch (err) {
+			logger.debug("agents/extensions/replace-agent.ts: best-effort failure after client.destroy();", { err });
+		}
+		reject(new Error(`Timeout connecting to ${sockPath}`));
+	}, timeoutMs);
+	client.on("error", err => {
+		if (settled) return;
+		settled = true;
+		clearTimeout(timeout);
+		reject(err);
+	});
+	client.on("close", () => {
+		if (settled) return;
+		settled = true;
+		clearTimeout(timeout);
+		const trimmed = responseText.trim();
+		if (!trimmed || trimmed === "ok") {
+			resolve({ ok: true });
+			return;
+		}
+		try {
+			resolve(JSON.parse(trimmed));
+		} catch {
+			resolve(trimmed);
+		}
+	});
+	return promise;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	return value as Record<string, unknown>;
 }

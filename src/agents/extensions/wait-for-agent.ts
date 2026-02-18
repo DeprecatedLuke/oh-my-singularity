@@ -1,6 +1,6 @@
 import net from "node:net";
 import { logger } from "../../utils";
-
+import { renderToolCall, renderToolResult } from "./tool-renderers";
 import type { ExtensionAPI, UnknownRecord } from "./types";
 
 /**
@@ -24,24 +24,25 @@ export default async function waitForAgentExtension(api: ExtensionAPI): Promise<
 			},
 			{ additionalProperties: false },
 		),
+		mergeCallAndResult: true,
+		renderCall: (args, theme, options) => {
+			const agentId = typeof args?.agentId === "string" ? args.agentId.trim() : "";
+			return renderToolCall(
+				"Wait For Agent",
+				agentId ? [`agentId=${agentId}`] : ["agentId=(missing)"],
+				theme,
+				options,
+			);
+		},
 		execute: async (_toolCallId, params) => {
 			const sockPath = process.env.OMS_SINGULARITY_SOCK ?? "";
 			if (!sockPath.trim()) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: "OMS socket not configured (OMS_SINGULARITY_SOCK is empty).",
-						},
-					],
-				};
+				throw new Error("OMS socket not configured (OMS_SINGULARITY_SOCK is empty).");
 			}
 
 			const agentId = typeof params?.agentId === "string" ? params.agentId.trim() : "";
 			if (!agentId) {
-				return {
-					content: [{ type: "text", text: "wait_for_agent: agentId is required" }],
-				};
+				throw new Error("wait_for_agent: agentId is required");
 			}
 
 			const payload = {
@@ -54,18 +55,25 @@ export default async function waitForAgentExtension(api: ExtensionAPI): Promise<
 
 			try {
 				const response = await sendRequest(sockPath, payload, 24 * 60 * 60 * 1000);
+				const responseRecord = asRecord(response);
+				if (responseRecord?.ok === false) {
+					const error =
+						typeof responseRecord.error === "string" && responseRecord.error.trim()
+							? responseRecord.error.trim()
+							: typeof responseRecord.summary === "string" && responseRecord.summary.trim()
+								? responseRecord.summary.trim()
+								: "wait_for_agent failed";
+					throw new Error(error);
+				}
 				return {
 					content: [{ type: "text", text: `wait_for_agent response:\n${JSON.stringify(response, null, 2)}` }],
 					details: response,
 				};
 			} catch (err) {
-				const errMsg = err instanceof Error ? err.message : String(err);
-				return {
-					content: [{ type: "text", text: `wait_for_agent failed: ${errMsg}` }],
-					details: { sockPath, error: errMsg },
-				};
+				throw new Error(`wait_for_agent failed: ${err instanceof Error ? err.message : String(err)}`);
 			}
 		},
+		renderResult: (result, options, theme) => renderToolResult("Wait For Agent", result, options, theme),
 	});
 }
 
@@ -131,4 +139,9 @@ function sendRequest(sockPath: string, payload: unknown, timeoutMs = 1_500): Pro
 			}
 		});
 	});
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	return value as Record<string, unknown>;
 }

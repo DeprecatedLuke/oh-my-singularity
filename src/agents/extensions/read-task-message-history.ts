@@ -1,6 +1,6 @@
 import net from "node:net";
 import { logger } from "../../utils";
-
+import { renderToolCall, renderToolResult } from "./tool-renderers";
 import type { ExtensionAPI, UnknownRecord } from "./types";
 
 /**
@@ -22,29 +22,17 @@ export default async function readTaskMessageHistoryExtension(api: ExtensionAPI)
 		description:
 			"List OMS agents assigned to the current task. Task-scoped: only shows agents on YOUR current task, cannot inspect unrelated tasks. Returns id, role, state, and lastActivity.",
 		parameters: Type.Object({}, { additionalProperties: false }),
+		mergeCallAndResult: true,
+		renderCall: (_args, theme, options) => renderToolCall("List Task Agents", ["no args"], theme, options),
 		execute: async () => {
 			const sockPath = process.env.OMS_SINGULARITY_SOCK ?? "";
 			if (!sockPath.trim()) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: "OMS socket not configured (OMS_SINGULARITY_SOCK is empty).",
-						},
-					],
-				};
+				throw new Error("OMS socket not configured (OMS_SINGULARITY_SOCK is empty).");
 			}
 
 			const taskId = normalizeEnv(process.env.OMS_TASK_ID);
 			if (!taskId) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: "Task scope not configured (OMS_TASK_ID is empty).",
-						},
-					],
-				};
+				throw new Error("Task scope not configured (OMS_TASK_ID is empty).");
 			}
 
 			try {
@@ -57,18 +45,25 @@ export default async function readTaskMessageHistoryExtension(api: ExtensionAPI)
 					},
 					15_000,
 				);
+				const responseRecord = asRecord(response);
+				if (responseRecord?.ok === false) {
+					const error =
+						typeof responseRecord.error === "string" && responseRecord.error.trim()
+							? responseRecord.error.trim()
+							: typeof responseRecord.summary === "string" && responseRecord.summary.trim()
+								? responseRecord.summary.trim()
+								: "list_task_agents failed";
+					throw new Error(error);
+				}
 				return {
 					content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
 					details: response,
 				};
 			} catch (err) {
-				const errMsg = err instanceof Error ? err.message : String(err);
-				return {
-					content: [{ type: "text", text: `list_task_agents failed: ${errMsg}` }],
-					details: { sockPath, taskId, error: errMsg },
-				};
+				throw new Error(`list_task_agents failed: ${err instanceof Error ? err.message : String(err)}`);
 			}
 		},
+		renderResult: (result, options, theme) => renderToolResult("List Task Agents", result, options, theme),
 	});
 
 	api.registerTool({
@@ -89,36 +84,27 @@ export default async function readTaskMessageHistoryExtension(api: ExtensionAPI)
 			},
 			{ additionalProperties: false },
 		),
+		mergeCallAndResult: true,
+		renderCall: (args, theme, options) => {
+			const agentId = typeof args?.agentId === "string" ? args.agentId.trim() : "";
+			const limit = typeof args?.limit === "number" ? args.limit : 40;
+			const details = [agentId ? `agentId=${agentId}` : "agentId=(missing)", `limit=${limit}`];
+			return renderToolCall("Read Message History", details, theme, options);
+		},
 		execute: async (_toolCallId, params) => {
 			const sockPath = process.env.OMS_SINGULARITY_SOCK ?? "";
 			if (!sockPath.trim()) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: "OMS socket not configured (OMS_SINGULARITY_SOCK is empty).",
-						},
-					],
-				};
+				throw new Error("OMS socket not configured (OMS_SINGULARITY_SOCK is empty).");
 			}
 
 			const taskId = normalizeEnv(process.env.OMS_TASK_ID);
 			if (!taskId) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: "Task scope not configured (OMS_TASK_ID is empty).",
-						},
-					],
-				};
+				throw new Error("Task scope not configured (OMS_TASK_ID is empty).");
 			}
 
 			const agentId = typeof params?.agentId === "string" ? params.agentId.trim() : "";
 			if (!agentId) {
-				return {
-					content: [{ type: "text", text: "read_message_history: agentId is required" }],
-				};
+				throw new Error("read_message_history: agentId is required");
 			}
 
 			const parsedLimit = Number(params?.limit);
@@ -136,18 +122,25 @@ export default async function readTaskMessageHistoryExtension(api: ExtensionAPI)
 					},
 					20_000,
 				);
+				const responseRecord = asRecord(response);
+				if (responseRecord?.ok === false) {
+					const error =
+						typeof responseRecord.error === "string" && responseRecord.error.trim()
+							? responseRecord.error.trim()
+							: typeof responseRecord.summary === "string" && responseRecord.summary.trim()
+								? responseRecord.summary.trim()
+								: "read_message_history failed";
+					throw new Error(error);
+				}
 				return {
 					content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
 					details: response,
 				};
 			} catch (err) {
-				const errMsg = err instanceof Error ? err.message : String(err);
-				return {
-					content: [{ type: "text", text: `read_message_history failed: ${errMsg}` }],
-					details: { sockPath, taskId, error: errMsg },
-				};
+				throw new Error(`read_message_history failed: ${err instanceof Error ? err.message : String(err)}`);
 			}
 		},
+		renderResult: (result, options, theme) => renderToolResult("Read Message History", result, options, theme),
 	});
 }
 
@@ -216,4 +209,9 @@ function sendRequest(sockPath: string, payload: unknown, timeoutMs = 1_500): Pro
 			}
 		});
 	});
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	return value as Record<string, unknown>;
 }

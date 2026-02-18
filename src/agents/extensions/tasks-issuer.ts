@@ -2,6 +2,7 @@ import net from "node:net";
 import { logger } from "../../utils";
 
 import { makeTasksExtension } from "./tasks-tool";
+import { renderToolCall, renderToolResult } from "./tool-renderers";
 import type { ExtensionAPI, UnknownRecord } from "./types";
 
 const registerIssuerTasksTool = makeTasksExtension({
@@ -39,27 +40,32 @@ export default async function tasksIssuerExtension(api: ExtensionAPI): Promise<v
 			},
 			{ additionalProperties: false },
 		),
+		mergeCallAndResult: true,
+		renderCall: (args, theme, options) => {
+			const action = typeof args?.action === "string" ? args.action.trim() : "";
+			const message = typeof args?.message === "string" ? args.message.trim() : "";
+			const reason = typeof args?.reason === "string" ? args.reason.trim() : "";
+			return renderToolCall(
+				"Advance Lifecycle",
+				[
+					action ? `action=${action}` : "action=(missing)",
+					message ? `message=${message}` : "message=(none)",
+					reason ? `reason=${reason}` : "reason=(none)",
+				],
+				theme,
+				options,
+			);
+		},
 		execute: async (_toolCallId, params) => {
 			if (!sockPath.trim()) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: "advance_lifecycle: OMS socket not configured (OMS_SINGULARITY_SOCK is empty).",
-						},
-					],
-				};
+				throw new Error("advance_lifecycle: OMS socket not configured (OMS_SINGULARITY_SOCK is empty).");
 			}
 			if (!taskId) {
-				return {
-					content: [{ type: "text", text: "advance_lifecycle: OMS_TASK_ID is missing" }],
-				};
+				throw new Error("advance_lifecycle: OMS_TASK_ID is missing");
 			}
 			const action = typeof params?.action === "string" ? params.action.trim().toLowerCase() : "";
 			if (action !== "start" && action !== "skip" && action !== "defer") {
-				return {
-					content: [{ type: "text", text: `advance_lifecycle: unsupported action '${action || "(empty)"}'` }],
-				};
+				throw new Error(`advance_lifecycle: unsupported action '${action || "(empty)"}'`);
 			}
 			const message = typeof params?.message === "string" ? params.message.trim() : "";
 			const reason = typeof params?.reason === "string" ? params.reason.trim() : "";
@@ -81,10 +87,7 @@ export default async function tasksIssuerExtension(api: ExtensionAPI): Promise<v
 						typeof response?.error === "string" && response.error.trim()
 							? response.error.trim()
 							: "failed to record lifecycle decision";
-					return {
-						content: [{ type: "text", text: `advance_lifecycle: ${errMsg}` }],
-						details: response,
-					};
+					throw new Error(`advance_lifecycle: ${errMsg}`);
 				}
 				const summary =
 					typeof response.summary === "string" && response.summary.trim()
@@ -95,13 +98,10 @@ export default async function tasksIssuerExtension(api: ExtensionAPI): Promise<v
 					details: response,
 				};
 			} catch (err) {
-				const errMsg = err instanceof Error ? err.message : String(err);
-				return {
-					content: [{ type: "text", text: `advance_lifecycle failed: ${errMsg}` }],
-					details: { sockPath, error: errMsg },
-				};
+				throw new Error(`advance_lifecycle failed: ${err instanceof Error ? err.message : String(err)}`);
 			}
 		},
+		renderResult: (result, options, theme) => renderToolResult("Advance Lifecycle", result, options, theme),
 	});
 }
 

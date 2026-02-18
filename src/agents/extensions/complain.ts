@@ -1,6 +1,6 @@
 import net from "node:net";
 import { logger } from "../../utils";
-
+import { renderToolCall, renderToolResult } from "./tool-renderers";
 import type { ExtensionAPI, UnknownRecord } from "./types";
 
 /**
@@ -32,30 +32,34 @@ export default async function complainExtension(api: ExtensionAPI): Promise<void
 			},
 			{ additionalProperties: false },
 		),
+		mergeCallAndResult: true,
+		renderCall: (args, theme, options) => {
+			const files = normalizeFiles(args?.files);
+			const reason = typeof args?.reason === "string" ? args.reason.trim() : "";
+			const details: string[] = [];
+			if (files.length > 0) {
+				details.push(`files=${files.join(", ")}`);
+			}
+			if (reason) {
+				details.push(`reason=${reason}`);
+			}
+			return renderToolCall("Complain", details, theme, options);
+		},
+		renderResult: (result, options, theme) => renderToolResult("Complain", result, options, theme),
 		execute: async (_toolCallId, params) => {
 			const sockPath = process.env.OMS_SINGULARITY_SOCK ?? "";
 			if (!sockPath.trim()) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: "OMS socket not configured (OMS_SINGULARITY_SOCK is empty).",
-						},
-					],
-				};
+				throw new Error("OMS socket not configured (OMS_SINGULARITY_SOCK is empty).");
 			}
 
 			const files = normalizeFiles(params?.files);
 			const reason = typeof params?.reason === "string" ? params.reason.trim() : "";
 			if (files.length === 0) {
-				return {
-					content: [{ type: "text", text: "complain: files must contain at least one non-empty path" }],
-				};
+				throw new Error("complain: files must contain at least one non-empty path");
 			}
+
 			if (!reason) {
-				return {
-					content: [{ type: "text", text: "complain: reason is required" }],
-				};
+				throw new Error("complain: reason is required");
 			}
 
 			const payload = {
@@ -69,17 +73,23 @@ export default async function complainExtension(api: ExtensionAPI): Promise<void
 
 			try {
 				const response = await sendRequest(sockPath, payload, 120_000);
+				const responseRecord = asRecord(response);
+				if (responseRecord?.ok === false) {
+					const error =
+						typeof responseRecord.error === "string" && responseRecord.error.trim()
+							? responseRecord.error.trim()
+							: typeof responseRecord.summary === "string" && responseRecord.summary.trim()
+								? responseRecord.summary.trim()
+								: "complain failed";
+					throw new Error(error);
+				}
 				const text = formatResponseText(response, "complain");
 				return {
 					content: [{ type: "text", text }],
 					details: response,
 				};
 			} catch (err) {
-				const errMsg = err instanceof Error ? err.message : String(err);
-				return {
-					content: [{ type: "text", text: `complain failed: ${errMsg}` }],
-					details: { sockPath, error: errMsg },
-				};
+				throw new Error(`complain failed: ${err instanceof Error ? err.message : String(err)}`);
 			}
 		},
 	});
@@ -99,17 +109,21 @@ export default async function complainExtension(api: ExtensionAPI): Promise<void
 			},
 			{ additionalProperties: false },
 		),
+		mergeCallAndResult: true,
+		renderCall: (args, theme, options) => {
+			const files = normalizeFiles(args?.files);
+			return renderToolCall(
+				"Revoke Complaint",
+				files.length > 0 ? [`files=${files.join(", ")}`] : ["no files"],
+				theme,
+				options,
+			);
+		},
+		renderResult: (result, options, theme) => renderToolResult("Revoke Complaint", result, options, theme),
 		execute: async (_toolCallId, params) => {
 			const sockPath = process.env.OMS_SINGULARITY_SOCK ?? "";
 			if (!sockPath.trim()) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: "OMS socket not configured (OMS_SINGULARITY_SOCK is empty).",
-						},
-					],
-				};
+				throw new Error("OMS socket not configured (OMS_SINGULARITY_SOCK is empty).");
 			}
 
 			const files = normalizeFiles(params?.files);
@@ -123,17 +137,23 @@ export default async function complainExtension(api: ExtensionAPI): Promise<void
 
 			try {
 				const response = await sendRequest(sockPath, payload, 30_000);
+				const responseRecord = asRecord(response);
+				if (responseRecord?.ok === false) {
+					const error =
+						typeof responseRecord.error === "string" && responseRecord.error.trim()
+							? responseRecord.error.trim()
+							: typeof responseRecord.summary === "string" && responseRecord.summary.trim()
+								? responseRecord.summary.trim()
+								: "revoke_complaint failed";
+					throw new Error(error);
+				}
 				const text = formatResponseText(response, "revoke_complaint");
 				return {
 					content: [{ type: "text", text }],
 					details: response,
 				};
 			} catch (err) {
-				const errMsg = err instanceof Error ? err.message : String(err);
-				return {
-					content: [{ type: "text", text: `revoke_complaint failed: ${errMsg}` }],
-					details: { sockPath, error: errMsg },
-				};
+				throw new Error(`revoke_complaint failed: ${err instanceof Error ? err.message : String(err)}`);
 			}
 		},
 	});
@@ -167,6 +187,11 @@ function formatResponseText(response: unknown, toolName: string): string {
 	if (summary) return summary;
 
 	return `${toolName} response:\n${JSON.stringify(response, null, 2)}`;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	return value as Record<string, unknown>;
 }
 
 function sendRequest(sockPath: string, payload: unknown, timeoutMs = 1_500): Promise<unknown> {

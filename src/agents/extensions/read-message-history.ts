@@ -1,6 +1,6 @@
 import net from "node:net";
 import { logger } from "../../utils";
-
+import { renderToolCall, renderToolResult } from "./tool-renderers";
 import type { ExtensionAPI, UnknownRecord } from "./types";
 
 /**
@@ -20,33 +20,30 @@ export default async function readMessageHistoryExtension(api: ExtensionAPI): Pr
 		label: "List Active Agents",
 		description: "List active OMS agents with role/task metadata.",
 		parameters: Type.Object({}, { additionalProperties: false }),
+		mergeCallAndResult: true,
+		renderCall: (_args, theme, options) => renderToolCall("List Active Agents", ["no args"], theme, options),
 		execute: async () => {
 			const sockPath = process.env.OMS_SINGULARITY_SOCK ?? "";
 			if (!sockPath.trim()) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: "OMS socket not configured (OMS_SINGULARITY_SOCK is empty).",
-						},
-					],
-				};
+				throw new Error("OMS socket not configured (OMS_SINGULARITY_SOCK is empty).");
 			}
 
 			try {
 				const response = await sendRequest(sockPath, { type: "list_active_agents", ts: Date.now() }, 15_000);
+				const responseRecord = asRecord(response);
+				if (responseRecord?.ok === false) {
+					const error = getResponseError(responseRecord, "list_active_agents failed");
+					throw new Error(error);
+				}
 				return {
 					content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
 					details: response,
 				};
 			} catch (err) {
-				const errMsg = err instanceof Error ? err.message : String(err);
-				return {
-					content: [{ type: "text", text: `list_active_agents failed: ${errMsg}` }],
-					details: { sockPath, error: errMsg },
-				};
+				throw new Error(`list_active_agents failed: ${err instanceof Error ? err.message : String(err)}`);
 			}
 		},
+		renderResult: (result, options, theme) => renderToolResult("List Active Agents", result, options, theme),
 	});
 
 	api.registerTool({
@@ -66,29 +63,24 @@ export default async function readMessageHistoryExtension(api: ExtensionAPI): Pr
 			},
 			{ additionalProperties: false },
 		),
+		mergeCallAndResult: true,
+		renderCall: (args, theme, options) => {
+			const agentId = typeof args?.agentId === "string" ? args.agentId.trim() : "";
+			const limit = typeof args?.limit === "number" ? args.limit : 40;
+			const details = [agentId ? `agentId=${agentId}` : "agentId=(missing)", `limit=${limit}`];
+			return renderToolCall("Read Message History", details, theme, options);
+		},
 		execute: async (_toolCallId, params) => {
 			const sockPath = process.env.OMS_SINGULARITY_SOCK ?? "";
 			if (!sockPath.trim()) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: "OMS socket not configured (OMS_SINGULARITY_SOCK is empty).",
-						},
-					],
-				};
+				throw new Error("OMS socket not configured (OMS_SINGULARITY_SOCK is empty).");
 			}
-
 			const agentId = typeof params?.agentId === "string" ? params.agentId.trim() : "";
 			if (!agentId) {
-				return {
-					content: [{ type: "text", text: "read_message_history: agentId is required" }],
-				};
+				throw new Error("read_message_history: agentId is required");
 			}
-
 			const parsedLimit = Number(params?.limit);
 			const limit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.min(200, Math.trunc(parsedLimit)) : 40;
-
 			try {
 				const response = await sendRequest(
 					sockPath,
@@ -100,20 +92,34 @@ export default async function readMessageHistoryExtension(api: ExtensionAPI): Pr
 					},
 					20_000,
 				);
-
+				const responseRecord = asRecord(response);
+				if (responseRecord?.ok === false) {
+					const error = getResponseError(responseRecord, "read_message_history failed");
+					throw new Error(error);
+				}
 				return {
 					content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
 					details: response,
 				};
 			} catch (err) {
-				const errMsg = err instanceof Error ? err.message : String(err);
-				return {
-					content: [{ type: "text", text: `read_message_history failed: ${errMsg}` }],
-					details: { sockPath, error: errMsg },
-				};
+				throw new Error(`read_message_history failed: ${err instanceof Error ? err.message : String(err)}`);
 			}
 		},
+		renderResult: (result, options, theme) => renderToolResult("Read Message History", result, options, theme),
 	});
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	return value as Record<string, unknown>;
+}
+
+function getResponseError(response: Record<string, unknown>, fallback: string): string {
+	return typeof response.error === "string" && response.error.trim()
+		? response.error.trim()
+		: typeof response.summary === "string" && response.summary.trim()
+			? response.summary.trim()
+			: fallback;
 }
 
 function sendRequest(sockPath: string, payload: unknown, timeoutMs = 1_500): Promise<UnknownRecord> {
