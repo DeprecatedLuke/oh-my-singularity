@@ -15,6 +15,7 @@ import type {
 	TaskStoreClient,
 	TaskUpdateInput,
 } from "../tasks/client";
+import { TaskCliError } from "../tasks/client";
 import type { BatchCreateIssueInput } from "../tasks/store/types";
 import type { TaskIssue } from "../tasks/types";
 import { asRecord, logger } from "../utils";
@@ -57,6 +58,11 @@ function isClosedTaskIssue(issue: TaskIssue): boolean {
 			.trim()
 			.toLowerCase() === "closed"
 	);
+}
+
+function isTaskNotFoundError(err: unknown): boolean {
+	const details = err instanceof TaskCliError ? [err.message, err.stdout, err.stderr].join(" ").toLowerCase() : "";
+	return /(not found|does not exist|no such)/.test(details);
 }
 
 function getTaskDependencyCount(issue: TaskIssue): number {
@@ -222,7 +228,7 @@ async function waitForRegistryAgentExit(
 	return { ok: false, timeout: true, agentId, error: `Timed out waiting for ${agentId}` };
 }
 
-const TASKS_MUTATION_ACTIONS = new Set(["create", "update", "close", "comment_add", "dep_add", "delete"]);
+const TASKS_MUTATION_ACTIONS = new Set(["create", "update", "close", "comment_add", "delete"]);
 
 function truncateForLog(value: string, max = 120): string {
 	const compact = value.replace(/\s+/g, " ").trim();
@@ -278,12 +284,6 @@ function logTasksMutationForSystem(
 		const reason = asString(params.reason);
 		if (reason) data.reason = truncateForLog(reason, 140);
 	}
-
-	if (action === "dep_add") {
-		const dependsOn = asString(params.dependsOn);
-		if (dependsOn) data.dependsOn = dependsOn;
-	}
-
 	if (response.ok) {
 		registry.pushEvent(systemAgentId, {
 			type: "log",
@@ -320,10 +320,11 @@ async function executeTasksToolAction(
 	const params = asRecord(rec.params) ?? rec;
 	const fallbackTaskId = asString(rec.defaultTaskId) ?? asString(params.defaultTaskId);
 	const issueId = asString(params.id) ?? fallbackTaskId;
+	const actor = asString(rec.actor) ?? asString(params.actor) ?? undefined;
 	const includeClosed = params.includeClosed === true;
 	const requestedStatus = asString(params.status);
 	const applyDefaultVisibility = !includeClosed && !requestedStatus;
-	const effectiveStatus = requestedStatus ?? (applyDefaultVisibility ? "open" : null);
+	const effectiveStatus = requestedStatus ?? null;
 	const parseListArgs = (): string[] => {
 		const args: string[] = [];
 		if (includeClosed) args.push("--all");
@@ -368,7 +369,7 @@ async function executeTasksToolAction(
 				if (!issueId) return { ok: false, error: "id is required for comment_add" };
 				const text = asString(params.text);
 				if (!text) return { ok: false, error: "text is required for comment_add" };
-				return { ok: true, data: await tasksClient.comment(issueId, text) };
+				return { ok: true, data: await tasksClient.comment(issueId, text, actor) };
 			}
 			case "create": {
 				if (Array.isArray(params.issues)) {
@@ -386,11 +387,15 @@ async function executeTasksToolAction(
 				const dependsOnArray = asStringArray(params.depends_on);
 				const dependsOnString = asString(params.depends_on);
 				const dependsOn = dependsOnArray.length > 0 ? dependsOnArray : (dependsOnString ?? undefined);
+				const referencesArray = asStringArray(params.references);
+				const referencesString = asString(params.references);
+				const references = referencesArray.length > 0 ? referencesArray : (referencesString ?? undefined);
 				const createInput: TaskCreateInput = {
 					type: asString(params.type) ?? "task",
 					labels: asStringArray(params.labels),
 					assignee: asString(params.assignee),
 					depends_on: dependsOn,
+					references,
 				};
 				const created = await tasksClient.create(title, description, priority ?? undefined, createInput);
 				return { ok: true, data: created };
@@ -405,12 +410,33 @@ async function executeTasksToolAction(
 				const status = asString(params.status);
 				if (status) patch.status = status;
 				if (Array.isArray(params.labels)) patch.labels = asStringArray(params.labels);
+				if (Object.hasOwn(params, "references")) {
+					if (Array.isArray(params.references)) {
+						patch.references = asStringArray(params.references);
+					} else if (typeof params.references === "string") {
+						patch.references = asString(params.references) ?? [];
+					}
+				}
 				const priority = asFiniteInt(params.priority);
 				if (typeof priority === "number") patch.priority = priority;
 				if (Object.hasOwn(params, "assignee")) {
 					patch.assignee = params.assignee === null ? null : asString(params.assignee);
 				}
 				await tasksClient.update(issueId, patch);
+				const dependsOnArray = asStringArray(params.depends_on);
+				const dependsOnString = asString(params.depends_on);
+				const dependsOn = dependsOnArray.length > 0 ? dependsOnArray : (dependsOnString ?? undefined);
+				if (dependsOn) {
+					const ids = Array.isArray(dependsOn) ? dependsOn : [dependsOn];
+					const seen = new Set<string>();
+					for (const depId of ids) {
+						const trimmed = depId.trim();
+						if (trimmed && !seen.has(trimmed)) {
+							seen.add(trimmed);
+							await tasksClient.depAdd(issueId, trimmed);
+						}
+					}
+				}
 				return { ok: true, data: await tasksClient.show(issueId) };
 			}
 			case "close": {
@@ -425,8 +451,7 @@ async function executeTasksToolAction(
 				const limit = asFiniteInt(params.limit);
 				const effectiveLimit = typeof limit === "number" ? limit : LIMIT_TASK_LIST_DEFAULT;
 				const options: TaskSearchInput = {
-					includeComments: params.includeComments === true,
-					status: effectiveStatus,
+					status: requestedStatus ?? null,
 					limit: effectiveLimit,
 				};
 				const issues = await tasksClient.search(query, options);
@@ -435,10 +460,7 @@ async function executeTasksToolAction(
 					const bTime = parseTimestampMs(b.updated_at);
 					return bTime - aTime;
 				});
-				const visibleIssues = applyDefaultVisibility
-					? sortedIssues.filter(issue => !isClosedTaskIssue(issue) && !isTerminalAgentStatus(issue.status))
-					: sortedIssues;
-				return { ok: true, data: visibleIssues.map(issue => toCompactTaskListIssue(issue)) };
+				return { ok: true, data: sortedIssues.map(issue => toCompactTaskListIssue(issue)) };
 			}
 			case "query": {
 				const query = asString(params.query);
@@ -460,12 +482,6 @@ async function executeTasksToolAction(
 					maxDepth: asFiniteInt(params.maxDepth) ?? undefined,
 				};
 				return { ok: true, data: await tasksClient.depTree(issueId, opts) };
-			}
-			case "dep_add": {
-				if (!issueId) return { ok: false, error: "id is required for dep_add" };
-				const dependsOn = asString(params.dependsOn);
-				if (!dependsOn) return { ok: false, error: "dependsOn is required for dep_add" };
-				return { ok: true, data: await tasksClient.depAdd(issueId, dependsOn) };
 			}
 			case "activity": {
 				const limit = asFiniteInt(params.limit);
@@ -536,6 +552,34 @@ export async function handleIpcMessage(opts: {
 		return result;
 	}
 
+	if (t === "finisher_advance_lifecycle") {
+		const taskId = typeof (rec as any)?.taskId === "string" ? (rec as any).taskId : "";
+		const action = typeof (rec as any)?.action === "string" ? (rec as any).action : "";
+		const msg = typeof rec?.message === "string" ? rec.message : "";
+		const reason = typeof rec?.reason === "string" ? rec.reason : "";
+		const agentId = typeof (rec as any)?.agentId === "string" ? (rec as any).agentId : "";
+		opts.registry.pushEvent(opts.systemAgentId, {
+			type: "log",
+			ts: Date.now(),
+			level: "info",
+			message: `IPC: finisher_advance_lifecycle taskId=${taskId} action=${action}`,
+			data: opts.payload,
+		});
+		if (!opts.loop) {
+			refresh();
+			return { ok: false, summary: "Agent loop unavailable" };
+		}
+		const result = opts.loop.advanceFinisherLifecycle({
+			taskId,
+			action,
+			message: msg,
+			reason,
+			agentId: agentId || undefined,
+		});
+		refresh();
+		return result;
+	}
+
 	if (t === "finisher_close_task") {
 		const taskId = typeof (rec as any)?.taskId === "string" ? (rec as any).taskId : "";
 		const reason = typeof rec?.reason === "string" ? rec.reason : "";
@@ -570,11 +614,13 @@ export async function handleIpcMessage(opts: {
 			data: opts.payload,
 		});
 
-		if (msg.trim()) {
-			void opts.loop?.broadcastToWorkers(msg, opts.payload);
+		if (!msg.trim()) {
+			refresh();
+			return { ok: false, error: "broadcast_to_workers: message is required" };
 		}
+		void opts.loop?.broadcastToWorkers(msg, opts.payload);
 		refresh();
-		return;
+		return { ok: true };
 	}
 
 	if (t === "interrupt_agent") {
@@ -589,7 +635,20 @@ export async function handleIpcMessage(opts: {
 		});
 
 		if (taskId.trim()) {
-			void opts.loop?.interruptAgent(taskId.trim(), msg.trim());
+			const normalizedTaskId = taskId.trim();
+			try {
+				await opts.tasksClient.show(normalizedTaskId);
+			} catch (err) {
+				refresh();
+				if (isTaskNotFoundError(err)) {
+					return { ok: false, error: `interrupt_agent: task ${normalizedTaskId} does not exist` };
+				}
+				return {
+					ok: false,
+					error: `interrupt_agent: failed to check task status: ${err instanceof Error ? err.message : err}`,
+				};
+			}
+			void opts.loop?.interruptAgent(normalizedTaskId, msg.trim());
 		}
 		refresh();
 		return;
@@ -605,14 +664,58 @@ export async function handleIpcMessage(opts: {
 			message: `IPC: steer_agent taskId=${taskId}`,
 			data: opts.payload,
 		});
-
-		if (taskId.trim()) {
-			void opts.loop?.steerAgent(taskId.trim(), msg.trim());
+		const normalizedTaskId = taskId.trim();
+		const normalizedMessage = msg.trim();
+		if (!normalizedTaskId) {
+			refresh();
+			return { ok: false, error: "steer_agent: taskId is required" };
 		}
+		if (!normalizedMessage) {
+			refresh();
+			return { ok: false, error: `steer_agent: message is required for task ${normalizedTaskId}` };
+		}
+		if (!opts.loop) {
+			refresh();
+			return { ok: false, error: `steer_agent: agent loop unavailable for task ${normalizedTaskId}` };
+		}
+		try {
+			await opts.tasksClient.show(normalizedTaskId);
+		} catch (err) {
+			refresh();
+			if (isTaskNotFoundError(err)) {
+				return { ok: false, error: `steer_agent: task ${normalizedTaskId} does not exist` };
+			}
+			return {
+				ok: false,
+				error: `steer_agent: failed to check task status: ${err instanceof Error ? err.message : err}`,
+			};
+		}
+		const activeAgents = opts.registry.getActiveByTask(normalizedTaskId);
+		if (activeAgents.length === 0) {
+			refresh();
+			return {
+				ok: false,
+				error: `steer_agent: no active agent for task ${normalizedTaskId} (current active agents: none)`,
+			};
+		}
+		const nonFinisherAgents = activeAgents.filter(agent => agent.role !== "finisher");
+		if (nonFinisherAgents.length === 0) {
+			refresh();
+			return {
+				ok: false,
+				error: `steer_agent: cannot steer finisher agent on task ${normalizedTaskId} (current active roles: finisher)`,
+			};
+		}
+		const steered = await opts.loop.steerAgent(normalizedTaskId, normalizedMessage);
 		refresh();
-		return;
+		if (!steered) {
+			return {
+				ok: false,
+				error: `steer_agent: steer request was not applied for task ${normalizedTaskId} (current active roles: ${activeAgents.map(agent => agent.role).join(", ")})`,
+			};
+		}
+		return { ok: true };
 	}
-
 	if (t === "replace_agent") {
 		const role = typeof (rec as any)?.role === "string" ? (rec as any).role : "";
 		const taskId = typeof (rec as any)?.taskId === "string" ? (rec as any).taskId : "";
@@ -624,15 +727,78 @@ export async function handleIpcMessage(opts: {
 			message: `IPC: replace_agent role=${role} taskId=${taskId}`,
 			data: opts.payload,
 		});
-		if (role.trim() && taskId.trim()) {
-			void opts.loop?.spawnAgentBySingularity({
-				role: role.trim() as "finisher" | "issuer" | "worker",
-				taskId: taskId.trim(),
-				context: context.trim() || undefined,
-			});
+		const normalizedRole = role.trim();
+		const normalizedTaskId = taskId.trim();
+		const normalizedContext = context.trim();
+		if (!normalizedRole || !["finisher", "issuer", "worker"].includes(normalizedRole)) {
+			refresh();
+			return { ok: false, error: "replace_agent: role must be one of finisher, issuer, worker" };
 		}
-		refresh();
-		return;
+		if (!normalizedTaskId) {
+			refresh();
+			return { ok: false, error: "replace_agent: taskId is required" };
+		}
+		if (!opts.loop) {
+			refresh();
+			return { ok: false, error: `replace_agent: agent loop unavailable for task ${normalizedTaskId}` };
+		}
+		if (opts.loop.isPaused()) {
+			refresh();
+			return { ok: false, error: "replace_agent: agent loop is paused" };
+		}
+
+		// Check task status - reject if closed, track if blocked for recovery
+		let taskIsBlocked = false;
+		try {
+			const task = await opts.tasksClient.show(normalizedTaskId);
+			if (task.status === "closed") {
+				refresh();
+				return { ok: false, error: "Task is closed. Create a new task instead." };
+			}
+			taskIsBlocked = task.status === "blocked";
+		} catch (err) {
+			refresh();
+			if (isTaskNotFoundError(err)) {
+				return { ok: false, error: `replace_agent: task ${normalizedTaskId} does not exist` };
+			}
+			return {
+				ok: false,
+				error: `replace_agent: failed to check task status: ${err instanceof Error ? err.message : err}`,
+			};
+		}
+		const activeAgents = opts.registry.getActiveByTask(normalizedTaskId);
+		if (activeAgents.length === 0 && !taskIsBlocked) {
+			refresh();
+			return {
+				ok: false,
+				error: `replace_agent: no active agent for task ${normalizedTaskId} (current active agents: none)`,
+			};
+		}
+		const nonFinisherAgents = activeAgents.filter(agent => agent.role !== "finisher");
+		if (nonFinisherAgents.length === 0 && !taskIsBlocked) {
+			refresh();
+			return {
+				ok: false,
+				error: `replace_agent: cannot replace finisher agent on task ${normalizedTaskId} (finisher manages its own lifecycle; current active roles: finisher)`,
+			};
+		}
+		try {
+			await opts.loop.spawnAgentBySingularity({
+				role: normalizedRole as "finisher" | "issuer" | "worker",
+				taskId: normalizedTaskId,
+				context: normalizedContext || undefined,
+			});
+			refresh();
+			return { ok: true };
+		} catch (err) {
+			refresh();
+			return {
+				ok: false,
+				error: `replace_agent: failed to spawn replacement for task ${normalizedTaskId}: ${
+					err instanceof Error ? err.message : String(err)
+				}`,
+			};
+		}
 	}
 
 	if (t === "stop_agents_for_task") {
