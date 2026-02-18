@@ -76,6 +76,21 @@ function buildTaskPrompt(opts: {
 	return lines.join("\n");
 }
 
+function createUserPromptEvent(promptText: string) {
+	return {
+		type: "rpc",
+		ts: Date.now(),
+		name: "message_end",
+		data: {
+			type: "message_end",
+			message: {
+				role: "user",
+				content: promptText,
+			},
+		},
+	};
+}
+
 function isActiveStatus(status: AgentInfo["status"]): boolean {
 	return !(
 		status === "done" ||
@@ -310,22 +325,21 @@ export class AgentSpawner {
 			rpc.start();
 
 			const task = await this.tasksClient.show(taskId);
-			await rpc.prompt(
-				buildTaskPrompt({
-					role: kind,
-					task: {
-						id: task.id,
-						title: task.title,
-						description: task.description,
-						acceptance: task.acceptance_criteria,
-						issueType: task.issue_type,
-						labels: task.labels,
-					},
-					extra: opts?.kickoffMessage?.trim()
-						? `## Implementation Guidance\n\n${opts.kickoffMessage.trim()}`
-						: undefined,
-				}),
-			);
+			const promptText = buildTaskPrompt({
+				role: kind,
+				task: {
+					id: task.id,
+					title: task.title,
+					description: task.description,
+					acceptance: task.acceptance_criteria,
+					issueType: task.issue_type,
+					labels: task.labels,
+				},
+				extra: opts?.kickoffMessage?.trim()
+					? `## Implementation Guidance\n\n${opts.kickoffMessage.trim()}`
+					: undefined,
+			});
+			await rpc.prompt(promptText);
 
 			await this.tasksClient.setSlot(tasksAgentId, "hook", taskId);
 			await this.tasksClient.setAgentState(tasksAgentId, "working");
@@ -347,6 +361,7 @@ export class AgentSpawner {
 			};
 
 			this.registry.register(info);
+			this.registry.pushEvent(agentId, createUserPromptEvent(promptText));
 			return info;
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
@@ -454,20 +469,19 @@ export class AgentSpawner {
 
 		const task = await this.tasksClient.show(taskId);
 		const finisherExtra = `Implementation output:\n\n${workerOutput?.trim() ? workerOutput.trim() : "(none)"}`;
-		await rpc.prompt(
-			buildTaskPrompt({
-				role: "finisher",
-				task: {
-					id: task.id,
-					title: task.title,
-					description: task.description,
-					acceptance: task.acceptance_criteria,
-					issueType: task.issue_type,
-					labels: task.labels,
-				},
-				extra: finisherExtra,
-			}),
-		);
+		const promptText = buildTaskPrompt({
+			role: "finisher",
+			task: {
+				id: task.id,
+				title: task.title,
+				description: task.description,
+				acceptance: task.acceptance_criteria,
+				issueType: task.issue_type,
+				labels: task.labels,
+			},
+			extra: finisherExtra,
+		});
+		await rpc.prompt(promptText);
 		await this.tasksClient.setSlot(tasksAgentId, "hook", taskId);
 		await this.tasksClient.setAgentState(tasksAgentId, "working");
 		const info: AgentInfo = {
@@ -486,6 +500,7 @@ export class AgentSpawner {
 			sessionId: this.getAgentSessionId(rpc),
 		};
 		this.registry.register(info);
+		this.registry.pushEvent(agentId, createUserPromptEvent(promptText));
 		return info;
 	}
 
@@ -565,9 +580,15 @@ export class AgentSpawner {
 			await this.tasksClient.setAgentState(tasksAgentId, "failed");
 			throw err;
 		}
-		const task = await this.tasksClient.show(taskId);
-		await rpc.prompt(
-			buildTaskPrompt({
+		let promptText: string | null = null;
+		if (normalizedResumeSessionId) {
+			if (typeof kickoffMessage === "string" && kickoffMessage.trim()) {
+				promptText = kickoffMessage;
+				await rpc.prompt(promptText);
+			}
+		} else {
+			const task = await this.tasksClient.show(taskId);
+			promptText = buildTaskPrompt({
 				role: "issuer",
 				task: {
 					id: task.id,
@@ -578,8 +599,9 @@ export class AgentSpawner {
 					labels: task.labels,
 				},
 				extra: kickoffMessage?.trim() ? `## Kickoff Context\n\n${kickoffMessage.trim()}` : undefined,
-			}),
-		);
+			});
+			await rpc.prompt(promptText);
+		}
 		await this.tasksClient.setSlot(tasksAgentId, "hook", taskId);
 		await this.tasksClient.setAgentState(tasksAgentId, "working");
 		const info: AgentInfo = {
@@ -598,6 +620,7 @@ export class AgentSpawner {
 			sessionId: this.getAgentSessionId(rpc) ?? normalizedResumeSessionId,
 		};
 		this.registry.register(info);
+		if (promptText) this.registry.pushEvent(agentId, createUserPromptEvent(promptText));
 		return info;
 	}
 
@@ -662,21 +685,18 @@ export class AgentSpawner {
 
 		const task = await this.tasksClient.show(taskId);
 
-		await rpc.prompt(
-			buildTaskPrompt({
-				role: "steering",
-				task: {
-					id: task.id,
-					title: task.title,
-					description: task.description,
-					acceptance: task.acceptance_criteria,
-					labels: task.labels,
-				},
-				extra:
-					"Recent messages (for steering context):\n\n" +
-					(recentMessages?.trim() ? recentMessages.trim() : "(none)"),
-			}),
-		);
+		const promptText = buildTaskPrompt({
+			role: "steering",
+			task: {
+				id: task.id,
+				title: task.title,
+				description: task.description,
+				acceptance: task.acceptance_criteria,
+				labels: task.labels,
+			},
+			extra: `Recent messages (for steering context):\n\n${recentMessages?.trim() ? recentMessages.trim() : "(none)"}`,
+		});
+		await rpc.prompt(promptText);
 
 		await this.tasksClient.setSlot(tasksAgentId, "hook", taskId);
 		await this.tasksClient.setAgentState(tasksAgentId, "working");
@@ -698,6 +718,7 @@ export class AgentSpawner {
 		};
 
 		this.registry.register(info);
+		this.registry.pushEvent(agentId, createUserPromptEvent(promptText));
 		return info;
 	}
 
@@ -779,19 +800,18 @@ export class AgentSpawner {
 			activeAgents: opts.activeAgents,
 		};
 
-		await rpc.prompt(
-			buildTaskPrompt({
-				role: "steering",
-				task: {
-					id: task.id,
-					title: task.title,
-					description: task.description,
-					acceptance: task.acceptance_criteria,
-					labels: task.labels,
-				},
-				extra: `Conflict complaint:\n\n${JSON.stringify(payload, null, 2)}`,
-			}),
-		);
+		const promptText = buildTaskPrompt({
+			role: "steering",
+			task: {
+				id: task.id,
+				title: task.title,
+				description: task.description,
+				acceptance: task.acceptance_criteria,
+				labels: task.labels,
+			},
+			extra: `Conflict complaint:\n\n${JSON.stringify(payload, null, 2)}`,
+		});
+		await rpc.prompt(promptText);
 
 		await this.tasksClient.setSlot(tasksAgentId, "hook", opts.complainantTaskId);
 		await this.tasksClient.setAgentState(tasksAgentId, "working");
@@ -813,6 +833,7 @@ export class AgentSpawner {
 		};
 
 		this.registry.register(info);
+		this.registry.pushEvent(agentId, createUserPromptEvent(promptText));
 		return info;
 	}
 
@@ -881,7 +902,8 @@ export class AgentSpawner {
 			workers: opts.workers,
 		};
 
-		await rpc.prompt(`Broadcast request:\n\n${JSON.stringify(payload, null, 2)}`);
+		const promptText = `Broadcast request:\n\n${JSON.stringify(payload, null, 2)}`;
+		await rpc.prompt(promptText);
 
 		await this.tasksClient.setAgentState(tasksAgentId, "working");
 
@@ -902,6 +924,7 @@ export class AgentSpawner {
 		};
 
 		this.registry.register(info);
+		this.registry.pushEvent(agentId, createUserPromptEvent(promptText));
 		return info;
 	}
 }
