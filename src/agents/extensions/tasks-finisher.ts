@@ -2,6 +2,7 @@ import net from "node:net";
 import { logger } from "../../utils";
 
 import { makeTasksExtension } from "./tasks-tool";
+import { renderToolCall, renderToolResult } from "./tool-renderers";
 import type { ExtensionAPI, UnknownRecord } from "./types";
 
 const registerFinisherTasksTool = makeTasksExtension({
@@ -39,28 +40,22 @@ export default async function tasksFinisherExtension(api: ExtensionAPI): Promise
 			},
 			{ additionalProperties: false },
 		),
+		mergeCallAndResult: true,
+		renderCall: (args, theme, options) => {
+			const reason = typeof args?.reason === "string" ? args.reason.trim() : "";
+			return renderToolCall("Close Task", reason ? [`reason=${reason}`] : ["reason=(missing)"], theme, options);
+		},
 		execute: async (_toolCallId, params) => {
 			if (!taskId) {
-				return {
-					content: [{ type: "text", text: "close_task: OMS_TASK_ID is missing" }],
-				};
+				throw new Error("close_task: OMS_TASK_ID is missing");
 			}
 			const reason = typeof params?.reason === "string" ? params.reason.trim() : "";
 			const effectiveReason = reason || "";
 			if (!effectiveReason) {
-				return {
-					content: [{ type: "text", text: "close_task: reason is required" }],
-				};
+				throw new Error("close_task: reason is required");
 			}
 			if (!sockPath.trim()) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: "close_task: OMS socket not configured (OMS_SINGULARITY_SOCK is empty).",
-						},
-					],
-				};
+				throw new Error("close_task: OMS socket not configured (OMS_SINGULARITY_SOCK is empty).");
 			}
 			const agentId = normalizeEnv(process.env.OMS_AGENT_ID);
 			const payload = {
@@ -78,10 +73,7 @@ export default async function tasksFinisherExtension(api: ExtensionAPI): Promise
 						typeof response?.error === "string" && response.error.trim()
 							? response.error.trim()
 							: "failed to notify OMS";
-					return {
-						content: [{ type: "text", text: `close_task: ${errMsg}` }],
-						details: response,
-					};
+					throw new Error(`close_task: ${errMsg}`);
 				}
 				const summary =
 					typeof response.summary === "string" && response.summary.trim()
@@ -92,13 +84,98 @@ export default async function tasksFinisherExtension(api: ExtensionAPI): Promise
 					details: response,
 				};
 			} catch (err) {
-				const errMsg = err instanceof Error ? err.message : String(err);
-				return {
-					content: [{ type: "text", text: `close_task IPC failed: ${errMsg}` }],
-					details: { sockPath, error: errMsg },
-				};
+				throw new Error(`close_task IPC failed: ${err instanceof Error ? err.message : String(err)}`);
 			}
 		},
+		renderResult: (result, options, theme) => renderToolResult("Close Task", result, options, theme),
+	});
+
+	api.registerTool({
+		name: "advance_lifecycle",
+		label: "Advance Lifecycle",
+		description:
+			"Record the finisher lifecycle decision for OMS. " +
+			"Use when the task needs additional work (worker), re-analysis (issuer), or must be deferred.",
+		parameters: Type.Object(
+			{
+				action: Type.Union([Type.Literal("worker"), Type.Literal("issuer"), Type.Literal("defer")], {
+					description: "Lifecycle action for this task",
+				}),
+				message: Type.Optional(
+					Type.String({
+						description: "Optional kickoff guidance for worker or context for issuer/defer",
+					}),
+				),
+				reason: Type.Optional(
+					Type.String({
+						description: "Optional reason for the lifecycle decision",
+					}),
+				),
+			},
+			{ additionalProperties: false },
+		),
+		mergeCallAndResult: true,
+		renderCall: (args, theme, options) => {
+			const action = typeof args?.action === "string" ? args.action.trim() : "";
+			const message = typeof args?.message === "string" ? args.message.trim() : "";
+			const reason = typeof args?.reason === "string" ? args.reason.trim() : "";
+			return renderToolCall(
+				"Advance Lifecycle",
+				[
+					action ? `action=${action}` : "action=(missing)",
+					message ? `message=${message}` : "message=(none)",
+					reason ? `reason=${reason}` : "reason=(none)",
+				],
+				theme,
+				options,
+			);
+		},
+		execute: async (_toolCallId, params) => {
+			if (!sockPath.trim()) {
+				throw new Error("advance_lifecycle: OMS socket not configured (OMS_SINGULARITY_SOCK is empty).");
+			}
+			if (!taskId) {
+				throw new Error("advance_lifecycle: OMS_TASK_ID is missing");
+			}
+			const action = typeof params?.action === "string" ? params.action.trim().toLowerCase() : "";
+			if (action !== "worker" && action !== "issuer" && action !== "defer") {
+				throw new Error(`advance_lifecycle: unsupported action '${action || "(empty)"}'`);
+			}
+			const message = typeof params?.message === "string" ? params.message.trim() : "";
+			const reason = typeof params?.reason === "string" ? params.reason.trim() : "";
+			const agentId = normalizeEnv(process.env.OMS_AGENT_ID);
+			const payload = {
+				type: "finisher_advance_lifecycle",
+				taskId,
+				action,
+				message: message || undefined,
+				reason: reason || undefined,
+				agentId,
+				ts: Date.now(),
+			};
+
+			try {
+				const response = await sendRequest(sockPath, payload, 30_000);
+				if (!response || response.ok !== true) {
+					const errMsg =
+						typeof response?.error === "string" && response.error.trim()
+							? response.error.trim()
+							: "failed to record lifecycle decision";
+					throw new Error(`advance_lifecycle: ${errMsg}`);
+				}
+				const summary =
+					typeof response.summary === "string" && response.summary.trim()
+						? response.summary.trim()
+						: `advance_lifecycle recorded for ${taskId}: ${action}`;
+				return {
+					content: [{ type: "text", text: summary }],
+					details: response,
+				};
+			} catch (err) {
+				throw new Error(`advance_lifecycle failed: ${err instanceof Error ? err.message : String(err)}`);
+			}
+		},
+		renderResult: (result, options, theme) => renderToolResult("Advance Lifecycle", result, options, theme),
 	});
 }
 
@@ -141,7 +218,7 @@ function sendRequest(sockPath: string, payload: unknown, timeoutMs = 1_500): Pro
 			reject(err);
 		});
 
-		client.on("close_task".slice(0, 5), () => {
+		client.on("close", () => {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timeout);

@@ -11,7 +11,6 @@ export default makeTasksExtension({
 		"comment_add",
 		"query",
 		"dep_tree",
-		"dep_add",
 		"types",
 		"create",
 		"update",
