@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 
-import type { TaskComment, TaskIssue } from "../types";
+import type { TaskComment, TaskIssue, TaskIssueScope } from "../types";
 import {
 	type ParsedListArgs,
 	STORE_VERSION,
@@ -34,6 +34,14 @@ export function normalizeString(value: unknown): string | null {
 export function clampPriority(value: number | undefined): number {
 	if (typeof value !== "number" || !Number.isFinite(value)) return 2;
 	return Math.max(0, Math.min(4, Math.trunc(value)));
+}
+
+const VALID_TASK_SCOPES: Set<string> = new Set(["tiny", "small", "medium", "large", "xlarge"]);
+
+export function normalizeTaskScope(value: unknown): TaskIssueScope | undefined {
+	if (typeof value !== "string") return undefined;
+	const normalized = value.trim().toLowerCase();
+	return VALID_TASK_SCOPES.has(normalized) ? (normalized as TaskIssueScope) : undefined;
 }
 
 export function compareIssueIds(a: string, b: string): number {
@@ -259,6 +267,18 @@ export function createEmptyStore(): StoreSnapshot {
 		activity: [],
 		agentLogs: {},
 	};
+}
+
+export function createAgentId(rolePrefix: string): string {
+	const normalizedRolePrefix =
+		typeof rolePrefix === "string" && rolePrefix.trim()
+			? rolePrefix
+					.trim()
+					.toLowerCase()
+					.replace(/[^a-z0-9._-]+/g, "-")
+					.replace(/^-+|-+$/g, "") || "agent"
+			: "agent";
+	return `${normalizedRolePrefix}-${crypto.randomBytes(3).toString("hex")}`;
 }
 
 export function createId(prefix: string): string {

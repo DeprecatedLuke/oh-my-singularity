@@ -66,6 +66,23 @@ import { createEmptyStore, normalizeToken, parseListArgs, sanitizeIssueId } from
 export { computeJsonTaskStoreDir };
 export type { JsonTaskStoreOptions };
 
+function hasOnlyClosedDependencies(issue: TaskIssue): boolean {
+	const dependencies = (issue as { dependencies?: unknown }).dependencies;
+	if (!Array.isArray(dependencies)) return true;
+	return dependencies.every(dependency => {
+		if (!dependency || typeof dependency !== "object") return false;
+		return normalizeToken((dependency as { status?: unknown }).status) === "closed";
+	});
+}
+
+function isReadyTask(issue: TaskIssue): boolean {
+	return (
+		normalizeToken(issue.issue_type) === "task" &&
+		normalizeToken(issue.status) === "open" &&
+		hasOnlyClosedDependencies(issue)
+	);
+}
+
 export class JsonTaskStore implements TaskStoreClient {
 	private readonly cwd: string;
 	private readonly actor: string;
@@ -273,9 +290,7 @@ export class JsonTaskStore implements TaskStoreClient {
 			type: null,
 			limit: null,
 		});
-		const ready = issues.filter(
-			issue => normalizeToken(issue.issue_type) === "task" && normalizeToken(issue.status) === "open",
-		);
+		const ready = issues.filter(isReadyTask);
 		this.events.emit("event", { type: "issues-changed", issues } satisfies TaskStoreEvent);
 		this.events.emit("event", { type: "ready-changed", ready } satisfies TaskStoreEvent);
 		if (activity) {
@@ -290,7 +305,7 @@ export class JsonTaskStore implements TaskStoreClient {
 			status: "open",
 			type: "task",
 			limit: null,
-		});
+		}).filter(isReadyTask);
 	}
 
 	async list(args?: readonly string[]): Promise<TaskIssue[]> {

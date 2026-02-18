@@ -1,10 +1,11 @@
 import { logger } from "../utils";
 import type { BatchCreateIssueInput, BatchCreateResult } from "./store/types";
-import type { TaskActivityEvent, TaskComment, TaskIssue } from "./types";
+import type { TaskActivityEvent, TaskComment, TaskIssue, TaskIssueScope } from "./types";
 
 export interface TaskCreateInput {
 	type?: string;
 	name?: string;
+	scope?: TaskIssueScope;
 	labels?: string[];
 	assignee?: string | null;
 	depends_on?: string | string[];
@@ -27,6 +28,7 @@ export interface TaskUpdateInput {
 	newStatus?: string;
 	claim?: boolean;
 	labels?: string[];
+	scope?: TaskIssueScope;
 	priority?: number;
 	assignee?: string | null;
 	references?: string | string[];
@@ -255,6 +257,7 @@ export class TaskClient implements TaskStoreClient {
 		const args = ["create", title, "--type", issueType, "--silent"];
 		if (options?.name?.trim()) args.push("--name", options.name.trim());
 		if (description?.trim()) args.push("--description", description.trim());
+		if (options?.scope?.trim()) args.push("--scope", options.scope.trim());
 		if (typeof priority === "number" && Number.isFinite(priority)) {
 			args.push("--priority", String(Math.max(0, Math.min(4, Math.trunc(priority)))));
 		}
@@ -304,6 +307,7 @@ export class TaskClient implements TaskStoreClient {
 	async update(id: string, patch: TaskUpdateInput): Promise<unknown> {
 		const args = ["update", id];
 		if (patch.claim === true) args.push("--claim");
+		if (patch.scope?.trim()) args.push("--scope", patch.scope.trim());
 		const nextStatus = patch.newStatus?.trim() || patch.status?.trim();
 		if (nextStatus) args.push("--status", nextStatus);
 		if (typeof patch.priority === "number" && Number.isFinite(patch.priority)) {

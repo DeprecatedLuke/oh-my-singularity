@@ -19,6 +19,8 @@ export type TaskIssueType =
 	| "slot"
 	| (string & {});
 
+export type TaskIssueScope = "tiny" | "small" | "medium" | "large" | "xlarge";
+
 export interface TaskIssue {
 	id: string;
 	title: string;
@@ -32,6 +34,7 @@ export interface TaskIssue {
 
 	labels: string[];
 	assignee: string | null;
+	scope?: TaskIssueScope;
 
 	created_at: string;
 	updated_at: string;

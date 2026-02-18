@@ -12,11 +12,13 @@ import {
 import {
 	clampPriority,
 	compareIssueIds,
+	createAgentId,
 	createId,
 	createSlugId,
 	generateSlug,
 	normalizeLabels,
 	normalizeString,
+	normalizeTaskScope,
 	normalizeToken,
 	nowIso,
 	sanitizeIssueId,
@@ -102,7 +104,7 @@ export function createIssue(
 
 	let id: string;
 	if (issueType === "agent") {
-		id = createId(issueType);
+		id = createAgentId(title.split("-")[0] || "agent");
 	} else {
 		const source = options?.name?.trim() || title;
 		const slug = generateSlug(source);
@@ -124,6 +126,7 @@ export function createIssue(
 		// Validate dependency references before mutating state for atomic create behavior.
 		requireIssue(state, dependencyId);
 	}
+	const issueScope = normalizeTaskScope(options?.scope);
 	const issue: StoredIssue = {
 		id,
 		title,
@@ -141,6 +144,7 @@ export function createIssue(
 		depends_on_ids: [],
 		dependencies: [],
 	};
+	if (issueScope) issue.scope = issueScope;
 	if (issueType === "agent") {
 		issue.agent_state = issue.status;
 		issue.last_activity = now;
@@ -364,6 +368,17 @@ export function updateIssue(state: StoreSnapshot, actor: string, id: string, pat
 
 	if (Array.isArray(patch.labels)) {
 		issue.labels = normalizeLabels(patch.labels);
+		changed = true;
+	}
+
+	if (patch.scope !== undefined) {
+		const normalizedScope = normalizeTaskScope(patch.scope);
+		if (!normalizedScope) {
+			throw new Error(
+				`Invalid scope "${patch.scope}" for issue ${issue.id}. Expected one of tiny, small, medium, large, xlarge.`,
+			);
+		}
+		issue.scope = normalizedScope;
 		changed = true;
 	}
 

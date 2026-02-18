@@ -132,6 +132,50 @@ describe("JsonTaskStore CRUD", () => {
 		});
 	});
 
+	test("ready returns only open tasks with closed dependencies", async () => {
+		await withStoreFixture(async ({ store }) => {
+			const taskA = await store.create("Task A");
+			const taskB = await store.create("Task B", null, undefined, { depends_on: taskA.id });
+			const taskC = await store.create("Task C", null, undefined, { depends_on: taskB.id });
+
+			const initialReady = await store.ready();
+			expect(initialReady.map(issue => issue.id)).toEqual([taskA.id]);
+
+			await store.close(taskA.id, "done");
+			const afterAClosed = await store.ready();
+			expect(afterAClosed.map(issue => issue.id)).toEqual([taskB.id]);
+
+			await store.close(taskB.id, "done");
+			const afterBClosed = await store.ready();
+			expect(afterBClosed.map(issue => issue.id)).toEqual([taskC.id]);
+		});
+	});
+
+	test("ready-changed events include only dependency-ready tasks", async () => {
+		await withStoreFixture(async ({ store }) => {
+			const readySnapshots: string[][] = [];
+			const unsubscribe = store.subscribe(event => {
+				if (event.type !== "ready-changed") return;
+				readySnapshots.push((event.ready ?? []).map(issue => issue.id));
+			});
+
+			try {
+				const taskA = await store.create("Event Task A");
+				const taskB = await store.create("Event Task B", null, undefined, { depends_on: taskA.id });
+				expect(taskB.id).toBeDefined();
+
+				const afterCreateSnapshot = readySnapshots[readySnapshots.length - 1] ?? [];
+				expect(afterCreateSnapshot).toEqual([taskA.id]);
+
+				await store.close(taskA.id, "done");
+				const afterCloseSnapshot = readySnapshots[readySnapshots.length - 1] ?? [];
+				expect(afterCloseSnapshot).toEqual([taskB.id]);
+			} finally {
+				unsubscribe();
+			}
+		});
+	});
+
 	test("search and query match expected issues", async () => {
 		await withStoreFixture(async ({ store }) => {
 			const alpha = await store.create("Alpha Task", "first fixture item");

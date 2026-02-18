@@ -22,6 +22,7 @@ import {
 	normalizeDependsOnIds,
 	normalizeLabels,
 	normalizeString,
+	normalizeTaskScope,
 	normalizeToken,
 	nowIso,
 	toStoredUsage,
@@ -49,6 +50,7 @@ function normalizeTaskIndexEntry(id: string, raw: unknown): TaskIndexEntry | nul
 	const labels = normalizeLabels(raw.labels);
 	const updatedAt = normalizeString(raw.updated_at) ?? nowIso();
 	const assignee = normalizeString(raw.assignee);
+	const scope = normalizeTaskScope(raw.scope);
 	return {
 		status,
 		priority,
@@ -56,6 +58,7 @@ function normalizeTaskIndexEntry(id: string, raw: unknown): TaskIndexEntry | nul
 		issue_type: issueType,
 		labels,
 		updated_at: updatedAt,
+		...(scope ? { scope } : {}),
 		...(assignee ? { assignee } : {}),
 	};
 }
@@ -89,6 +92,7 @@ export function toTaskIndexEntry(issue: StoredIssue): TaskIndexEntry {
 		issue_type: issue.issue_type,
 		labels: [...issue.labels],
 		updated_at: issue.updated_at,
+		...(issue.scope ? { scope: issue.scope } : {}),
 		...(issue.assignee ? { assignee: issue.assignee } : {}),
 	};
 }
@@ -287,6 +291,7 @@ export function normalizeIssue(raw: unknown): StoredIssue | null {
 		issue_type: issueType,
 		labels: normalizeLabels(raw.labels),
 		assignee: normalizeString(raw.assignee),
+		scope: normalizeTaskScope(raw.scope),
 		created_at: createdAt,
 		updated_at: updatedAt,
 		comments,

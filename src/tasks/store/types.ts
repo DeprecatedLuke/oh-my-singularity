@@ -113,6 +113,7 @@ export type TaskIndexEntry = {
 	issue_type: string;
 	labels: string[];
 	updated_at: string;
+	scope?: string;
 	assignee?: string | null;
 };
 
