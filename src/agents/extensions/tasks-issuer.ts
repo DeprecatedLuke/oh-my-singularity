@@ -1,7 +1,7 @@
 import { requireSockPath, sendIpc } from "./ipc-client";
 
 import { makeTasksExtension } from "./tasks-tool";
-import { renderToolCall, renderToolResult } from "./tool-renderers";
+import { createToolRenderers } from "./tool-renderers";
 import type { ExtensionAPI } from "./types";
 
 const registerIssuerTasksTool = makeTasksExtension({
@@ -12,6 +12,16 @@ const registerIssuerTasksTool = makeTasksExtension({
 export default async function tasksIssuerExtension(api: ExtensionAPI): Promise<void> {
 	await registerIssuerTasksTool(api);
 	const { Type } = api.typebox;
+	const { renderCall, renderResult } = createToolRenderers("Advance Lifecycle", args => {
+		const action = typeof args?.action === "string" ? args.action.trim() : "";
+		const message = typeof args?.message === "string" ? args.message.trim() : "";
+		const reason = typeof args?.reason === "string" ? args.reason.trim() : "";
+		return [
+			action ? `action=${action}` : "action=(missing)",
+			message ? `message=${message}` : "message=(none)",
+			reason ? `reason=${reason}` : "reason=(none)",
+		];
+	});
 	const sockPath = requireSockPath();
 	const taskId = normalizeEnv(process.env.OMS_TASK_ID);
 
@@ -39,22 +49,8 @@ export default async function tasksIssuerExtension(api: ExtensionAPI): Promise<v
 			},
 			{ additionalProperties: false },
 		),
-		mergeCallAndResult: true,
-		renderCall: (args, theme, options) => {
-			const action = typeof args?.action === "string" ? args.action.trim() : "";
-			const message = typeof args?.message === "string" ? args.message.trim() : "";
-			const reason = typeof args?.reason === "string" ? args.reason.trim() : "";
-			return renderToolCall(
-				"Advance Lifecycle",
-				[
-					action ? `action=${action}` : "action=(missing)",
-					message ? `message=${message}` : "message=(none)",
-					reason ? `reason=${reason}` : "reason=(none)",
-				],
-				theme,
-				options,
-			);
-		},
+		renderCall,
+		renderResult,
 		execute: async (_toolCallId, params) => {
 			if (!taskId) {
 				throw new Error("advance_lifecycle: OMS_TASK_ID is missing");
@@ -97,7 +93,6 @@ export default async function tasksIssuerExtension(api: ExtensionAPI): Promise<v
 				throw new Error(`advance_lifecycle failed: ${err instanceof Error ? err.message : String(err)}`);
 			}
 		},
-		renderResult: (result, options, theme) => renderToolResult("Advance Lifecycle", result, options, theme),
 	});
 }
 

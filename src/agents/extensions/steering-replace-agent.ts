@@ -1,5 +1,5 @@
 import { ipcError, requireSockPath, sendIpc } from "./ipc-client";
-import { renderToolCall, renderToolResult } from "./tool-renderers";
+import { createToolRenderers } from "./tool-renderers";
 import type { ExtensionAPI } from "./types";
 
 /**
@@ -13,6 +13,10 @@ import type { ExtensionAPI } from "./types";
  */
 export default async function steeringReplaceAgentExtension(api: ExtensionAPI): Promise<void> {
 	const { Type } = api.typebox;
+	const { renderCall, renderResult } = createToolRenderers("Resume Agent", args => {
+		const context = typeof args?.context === "string" ? args.context.trim() : "";
+		return [context ? `context=${context}` : "context=(none)"];
+	});
 
 	api.registerTool({
 		name: "resume_agent",
@@ -29,11 +33,8 @@ export default async function steeringReplaceAgentExtension(api: ExtensionAPI): 
 			},
 			{ additionalProperties: false },
 		),
-		mergeCallAndResult: true,
-		renderCall: (args, theme, options) => {
-			const context = typeof args?.context === "string" ? args.context.trim() : "";
-			return renderToolCall("Resume Agent", [context ? `context=${context}` : "context=(none)"], theme, options);
-		},
+		renderCall,
+		renderResult,
 		execute: async (_toolCallId, params) => {
 			const sockPath = requireSockPath();
 
@@ -68,7 +69,6 @@ export default async function steeringReplaceAgentExtension(api: ExtensionAPI): 
 				throw new Error(`Failed to request worker resume: ${err instanceof Error ? err.message : String(err)}`);
 			}
 		},
-		renderResult: (result, options, theme) => renderToolResult("Resume Agent", result, options, theme),
 	});
 }
 

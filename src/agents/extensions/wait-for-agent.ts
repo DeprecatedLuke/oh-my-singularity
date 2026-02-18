@@ -1,5 +1,5 @@
 import { ipcError, requireSockPath, sendIpc } from "./ipc-client";
-import { renderToolCall, renderToolResult } from "./tool-renderers";
+import { createToolRenderers } from "./tool-renderers";
 import type { ExtensionAPI } from "./types";
 
 /**
@@ -12,6 +12,11 @@ import type { ExtensionAPI } from "./types";
 export default async function waitForAgentExtension(api: ExtensionAPI): Promise<void> {
 	const { Type } = api.typebox;
 
+	const { renderCall, renderResult } = createToolRenderers("Wait For Agent", args => {
+		const agentId = typeof args?.agentId === "string" ? args.agentId.trim() : "";
+		return agentId ? [`agentId=${agentId}`] : ["agentId=(missing)"];
+	});
+
 	api.registerTool({
 		name: "wait_for_agent",
 		label: "Wait For Agent",
@@ -23,16 +28,7 @@ export default async function waitForAgentExtension(api: ExtensionAPI): Promise<
 			},
 			{ additionalProperties: false },
 		),
-		mergeCallAndResult: true,
-		renderCall: (args, theme, options) => {
-			const agentId = typeof args?.agentId === "string" ? args.agentId.trim() : "";
-			return renderToolCall(
-				"Wait For Agent",
-				agentId ? [`agentId=${agentId}`] : ["agentId=(missing)"],
-				theme,
-				options,
-			);
-		},
+		renderCall,
 		execute: async (_toolCallId, params) => {
 			const sockPath = requireSockPath();
 
@@ -61,7 +57,7 @@ export default async function waitForAgentExtension(api: ExtensionAPI): Promise<
 				throw new Error(`wait_for_agent failed: ${err instanceof Error ? err.message : String(err)}`);
 			}
 		},
-		renderResult: (result, options, theme) => renderToolResult("Wait For Agent", result, options, theme),
+		renderResult,
 	});
 }
 

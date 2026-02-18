@@ -1,5 +1,5 @@
 import { ipcError, requireSockPath, sendIpc } from "./ipc-client";
-import { renderToolCall, renderToolResult } from "./tool-renderers";
+import { createToolRenderers } from "./tool-renderers";
 import type { ExtensionAPI } from "./types";
 
 /**
@@ -15,14 +15,27 @@ import type { ExtensionAPI } from "./types";
 export default async function readTaskMessageHistoryExtension(api: ExtensionAPI): Promise<void> {
 	const { Type } = api.typebox;
 
+	const { renderCall: listRenderCall, renderResult: listRenderResult } = createToolRenderers(
+		"List Task Agents",
+		() => ["no args"],
+	);
+
+	const { renderCall: historyRenderCall, renderResult: historyRenderResult } = createToolRenderers(
+		"Read Message History",
+		args => {
+			const agentId = typeof args?.agentId === "string" ? args.agentId.trim() : "";
+			const limit = typeof args?.limit === "number" ? args.limit : 40;
+			return [agentId ? `agentId=${agentId}` : "agentId=(missing)", `limit=${limit}`];
+		},
+	);
+
 	api.registerTool({
 		name: "list_task_agents",
 		label: "List Task Agents",
 		description:
 			"List OMS agents assigned to the current task. Task-scoped: only shows agents on YOUR current task, cannot inspect unrelated tasks. Returns id, role, state, and lastActivity.",
 		parameters: Type.Object({}, { additionalProperties: false }),
-		mergeCallAndResult: true,
-		renderCall: (_args, theme, options) => renderToolCall("List Task Agents", ["no args"], theme, options),
+		renderCall: listRenderCall,
 		execute: async () => {
 			const sockPath = requireSockPath();
 
@@ -51,7 +64,7 @@ export default async function readTaskMessageHistoryExtension(api: ExtensionAPI)
 				throw new Error(`list_task_agents failed: ${err instanceof Error ? err.message : String(err)}`);
 			}
 		},
-		renderResult: (result, options, theme) => renderToolResult("List Task Agents", result, options, theme),
+		renderResult: listRenderResult,
 	});
 
 	api.registerTool({
@@ -72,13 +85,7 @@ export default async function readTaskMessageHistoryExtension(api: ExtensionAPI)
 			},
 			{ additionalProperties: false },
 		),
-		mergeCallAndResult: true,
-		renderCall: (args, theme, options) => {
-			const agentId = typeof args?.agentId === "string" ? args.agentId.trim() : "";
-			const limit = typeof args?.limit === "number" ? args.limit : 40;
-			const details = [agentId ? `agentId=${agentId}` : "agentId=(missing)", `limit=${limit}`];
-			return renderToolCall("Read Message History", details, theme, options);
-		},
+		renderCall: historyRenderCall,
 		execute: async (_toolCallId, params) => {
 			const sockPath = requireSockPath();
 
@@ -117,7 +124,7 @@ export default async function readTaskMessageHistoryExtension(api: ExtensionAPI)
 				throw new Error(`read_message_history failed: ${err instanceof Error ? err.message : String(err)}`);
 			}
 		},
-		renderResult: (result, options, theme) => renderToolResult("Read Message History", result, options, theme),
+		renderResult: historyRenderResult,
 	});
 }
 

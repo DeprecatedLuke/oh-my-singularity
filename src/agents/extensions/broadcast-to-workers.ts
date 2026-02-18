@@ -1,5 +1,5 @@
 import { ipcError, requireSockPath, sendIpc } from "./ipc-client";
-import { renderToolCall, renderToolResult } from "./tool-renderers";
+import { createToolRenderers } from "./tool-renderers";
 import type { ExtensionAPI } from "./types";
 
 /**
@@ -17,6 +17,12 @@ import type { ExtensionAPI } from "./types";
 export default async function broadcastToWorkersExtension(api: ExtensionAPI): Promise<void> {
 	const { Type } = api.typebox;
 
+	const { renderCall, renderResult } = createToolRenderers("Broadcast to Workers", args => {
+		const message = typeof args?.message === "string" ? args.message.trim() : "";
+		const urgency = typeof args?.urgency === "string" ? args.urgency : "normal";
+		return [message ? `message=${message}` : "", `urgency=${urgency}`].filter(Boolean);
+	});
+
 	api.registerTool({
 		name: "broadcast_to_workers",
 		label: "Broadcast to Workers",
@@ -29,14 +35,8 @@ export default async function broadcastToWorkersExtension(api: ExtensionAPI): Pr
 			},
 			{ additionalProperties: false },
 		),
-		mergeCallAndResult: true,
-		renderCall: (args, theme, options) => {
-			const message = typeof args?.message === "string" ? args.message.trim() : "";
-			const urgency = typeof args?.urgency === "string" ? args.urgency : "normal";
-			const details = [message ? `message=${message}` : "", `urgency=${urgency}`];
-			return renderToolCall("Broadcast to Workers", details.filter(Boolean), theme, options);
-		},
-		renderResult: (result, options, theme) => renderToolResult("Broadcast to Workers", result, options, theme),
+		renderCall,
+		renderResult,
 		execute: async (_toolCallId, params) => {
 			const sockPath = requireSockPath();
 

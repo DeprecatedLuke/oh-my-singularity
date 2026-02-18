@@ -1,6 +1,7 @@
 import { truncateToWidth } from "@oh-my-pi/pi-natives";
 import { wrapLine } from "../../tui/components/text-formatter";
 import type {
+	ToolParams,
 	ToolRenderCallOptions,
 	ToolRenderComponent,
 	ToolRenderResultOptions,
@@ -20,27 +21,35 @@ const BODY_INDENT = "  ";
  * - Non-streaming: concise one-line header.
  */
 export function renderToolCall(
-	toolLabel: string,
-	args: string[],
+	toolLabel: string | (() => string),
+	args: string[] | (() => string[]),
 	theme: ToolTheme,
 	options?: ToolRenderCallOptions,
 ): ToolRenderComponent {
-	const title = theme.fg("toolTitle", theme.bold ? theme.bold(toolLabel) : toolLabel);
 	const separator = theme.sep?.dot ? ` ${theme.sep.dot} ` : " · ";
-	const visibleArgs = args.map(arg => arg.trim()).filter(Boolean);
+	const resolveArgs = () => {
+		const resolved = typeof args === "function" ? args() : args;
+		return resolved.map(arg => arg.trim()).filter(Boolean);
+	};
+	const makeTitle = () => {
+		const resolved = typeof toolLabel === "function" ? toolLabel() : toolLabel;
+		return theme.fg("toolTitle", theme.bold ? theme.bold(resolved) : resolved);
+	};
 	return {
 		render(width: number): string[] {
-			const isStreaming = options?.isPartial === true;
 			const hasResult = Boolean(options?.result);
-			const status = isStreaming
-				? "running"
-				: hasResult
-					? options?.result?.isError === true
-						? "error"
-						: "success"
-					: "pending";
+			const isStreaming = !hasResult || options?.isPartial === true;
+			const status =
+				options?.isPartial === true
+					? "running"
+					: hasResult
+						? options?.result?.isError === true
+							? "error"
+							: "success"
+						: "pending";
 			const icon = styledIcon(status, theme, options?.spinnerFrame);
-			const header = `${icon} ${title}`;
+			const header = `${icon} ${makeTitle()}`;
+			const visibleArgs = resolveArgs();
 			if (isStreaming && visibleArgs.length > 0) {
 				const lines = [truncateToWidth(header, width)];
 				const wrappedWidth = Math.max(1, width - BODY_INDENT.length);
@@ -54,10 +63,10 @@ export function renderToolCall(
 				return lines;
 			}
 
-			const resultSummary = extractSummaryLine(options?.result);
-			const previewText = resultSummary || visibleArgs.join(separator);
+			const argsPreview = visibleArgs.join(separator);
+			const previewText = argsPreview || extractSummaryLine(options?.result);
 			const preview = truncateToWidth(previewText, MAX_ARG_PREVIEW);
-			const summaryScope = options?.result?.isError === true ? "error" : "muted";
+			const summaryScope = !argsPreview && options?.result?.isError === true ? "error" : "muted";
 			const suffix = preview ? `${separator}${theme.fg(summaryScope, preview)}` : "";
 			return [truncateToWidth(`${header}${suffix}`, width)];
 		},
@@ -66,6 +75,8 @@ export function renderToolCall(
 
 /**
  * renderResult: expandable body lines only.
+ * Short single-line results are suppressed here because they already
+ * appear in the renderCall header suffix.
  */
 export function renderToolResult(
 	_toolLabel: string,
@@ -75,6 +86,12 @@ export function renderToolResult(
 ): ToolRenderComponent {
 	const isError = result.isError === true;
 	const allLines = extractTextLines(result);
+
+	// Short single-line results appear in the header suffix; skip body
+	if (allLines.length <= 1 && (allLines[0]?.trim().length ?? 0) <= MAX_ARG_PREVIEW) {
+		return { render: () => [] };
+	}
+
 	const maxBody = options.expanded ? EXPANDED_LINES : COLLAPSED_LINES;
 	const visibleBody = allLines.slice(0, maxBody);
 	const hasMore = allLines.length > maxBody;
@@ -152,4 +169,69 @@ function extractSummaryLine(result: ToolResultWithError | undefined): string {
 		if (normalized.length > 0) return normalized;
 	}
 	return "";
+}
+
+/**
+ * Label config for createToolRenderers.
+ * - string: static label for both pending and done states.
+ * - { pending, done }: different labels per state; done may be a function
+ *   that receives the call args so it can vary by action.
+ */
+export type ToolLabelConfig =
+	| string
+	| {
+			pending: string | ((args: ToolParams) => string);
+			done: string | ((args: ToolParams, result?: ToolResultWithError) => string);
+	  };
+
+/**
+ * Create linked renderCall / renderResult pair with shared state.
+ *
+ * renderResult feeds result data back into renderCall's options so the
+ * call header automatically switches from a pending icon to a
+ * success/error icon with a result summary — no mergeCallAndResult needed.
+ */
+export function createToolRenderers(
+	label: ToolLabelConfig,
+	formatArgs: (args: ToolParams) => string[],
+): {
+	renderCall: (args: ToolParams, options: ToolRenderResultOptions, theme: ToolTheme) => ToolRenderComponent;
+	renderResult: (
+		result: ToolResultWithError,
+		options: ToolRenderResultOptions,
+		theme: ToolTheme,
+		args?: ToolParams,
+	) => ToolRenderComponent;
+} {
+	const state: ToolRenderCallOptions = {};
+	return {
+		renderCall: (args, options, theme) => {
+			const renderState: ToolRenderCallOptions = {
+				get isPartial() {
+					return options.isPartial;
+				},
+				get spinnerFrame() {
+					return options.spinnerFrame;
+				},
+				get result() {
+					return state.result;
+				},
+			};
+			const resolveLabel =
+				typeof label === "string"
+					? label
+					: () => {
+							if (!state.result || options.isPartial) {
+								return typeof label.pending === "function" ? label.pending(args) : label.pending;
+							}
+							return typeof label.done === "function" ? label.done(args, state.result) : label.done;
+						};
+			return renderToolCall(resolveLabel, () => formatArgs(args), theme, renderState);
+		},
+		renderResult: (result, options, theme) => {
+			state.result = result;
+			const resultLabel = typeof label === "string" ? label : label.done;
+			return renderToolResult(typeof resultLabel === "function" ? "" : resultLabel, result, options, theme);
+		},
+	};
 }

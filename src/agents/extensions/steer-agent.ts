@@ -1,5 +1,5 @@
 import { ipcError, requireSockPath, sendIpc } from "./ipc-client";
-import { renderToolCall, renderToolResult } from "./tool-renderers";
+import { createToolRenderers } from "./tool-renderers";
 import type { ExtensionAPI } from "./types";
 
 /**
@@ -12,6 +12,12 @@ import type { ExtensionAPI } from "./types";
  */
 export default async function steerAgentExtension(api: ExtensionAPI): Promise<void> {
 	const { Type } = api.typebox;
+
+	const { renderCall, renderResult } = createToolRenderers("Steer Agent", args => {
+		const taskId = typeof args?.taskId === "string" ? args.taskId.trim() : "";
+		const message = typeof args?.message === "string" ? args.message.trim() : "";
+		return [taskId ? `taskId=${taskId}` : "", message ? `message=${message}` : ""].filter(Boolean);
+	});
 
 	api.registerTool({
 		name: "steer_agent",
@@ -30,18 +36,8 @@ export default async function steerAgentExtension(api: ExtensionAPI): Promise<vo
 			},
 			{ additionalProperties: false },
 		),
-		mergeCallAndResult: true,
-		renderCall: (args, theme, options) => {
-			const taskId = typeof args?.taskId === "string" ? args.taskId.trim() : "";
-			const message = typeof args?.message === "string" ? args.message.trim() : "";
-			return renderToolCall(
-				"Steer Agent",
-				[taskId ? `taskId=${taskId}` : "", message ? `message=${message}` : ""],
-				theme,
-				options,
-			);
-		},
-		renderResult: (result, options, theme) => renderToolResult("Steer Agent", result, options, theme),
+		renderCall,
+		renderResult,
 		execute: async (_toolCallId, params) => {
 			const sockPath = requireSockPath();
 

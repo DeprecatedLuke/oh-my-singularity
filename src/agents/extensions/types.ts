@@ -106,7 +106,7 @@ export type ToolDefinition = {
 	parameters: unknown;
 	execute: (toolCallId: string, params: ToolParams) => Promise<ToolResult>;
 	mergeCallAndResult?: boolean;
-	renderCall?: (args: ToolParams, theme: ToolTheme, options?: ToolRenderCallOptions) => ToolRenderComponent;
+	renderCall?: (args: ToolParams, options: ToolRenderResultOptions, theme: ToolTheme) => ToolRenderComponent;
 	renderResult?: (
 		result: ToolResultWithError,
 		options: ToolRenderResultOptions,

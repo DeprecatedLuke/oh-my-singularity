@@ -1,5 +1,5 @@
 import { ipcError, requireSockPath, sendIpc } from "./ipc-client";
-import { renderToolCall, renderToolResult } from "./tool-renderers";
+import { createToolRenderers } from "./tool-renderers";
 import type { ExtensionAPI } from "./types";
 
 /**
@@ -14,13 +14,26 @@ import type { ExtensionAPI } from "./types";
 export default async function readMessageHistoryExtension(api: ExtensionAPI): Promise<void> {
 	const { Type } = api.typebox;
 
+	const { renderCall: listRenderCall, renderResult: listRenderResult } = createToolRenderers(
+		"List Active Agents",
+		() => ["no args"],
+	);
+
+	const { renderCall: historyRenderCall, renderResult: historyRenderResult } = createToolRenderers(
+		"Read Message History",
+		args => {
+			const agentId = typeof args?.agentId === "string" ? args.agentId.trim() : "";
+			const limit = typeof args?.limit === "number" ? args.limit : 40;
+			return [agentId ? `agentId=${agentId}` : "agentId=(missing)", `limit=${limit}`];
+		},
+	);
+
 	api.registerTool({
 		name: "list_active_agents",
 		label: "List Active Agents",
 		description: "List active OMS agents with role/task metadata.",
 		parameters: Type.Object({}, { additionalProperties: false }),
-		mergeCallAndResult: true,
-		renderCall: (_args, theme, options) => renderToolCall("List Active Agents", ["no args"], theme, options),
+		renderCall: listRenderCall,
 		execute: async () => {
 			const sockPath = requireSockPath();
 
@@ -36,7 +49,7 @@ export default async function readMessageHistoryExtension(api: ExtensionAPI): Pr
 				throw new Error(`list_active_agents failed: ${err instanceof Error ? err.message : String(err)}`);
 			}
 		},
-		renderResult: (result, options, theme) => renderToolResult("List Active Agents", result, options, theme),
+		renderResult: listRenderResult,
 	});
 
 	api.registerTool({
@@ -56,13 +69,7 @@ export default async function readMessageHistoryExtension(api: ExtensionAPI): Pr
 			},
 			{ additionalProperties: false },
 		),
-		mergeCallAndResult: true,
-		renderCall: (args, theme, options) => {
-			const agentId = typeof args?.agentId === "string" ? args.agentId.trim() : "";
-			const limit = typeof args?.limit === "number" ? args.limit : 40;
-			const details = [agentId ? `agentId=${agentId}` : "agentId=(missing)", `limit=${limit}`];
-			return renderToolCall("Read Message History", details, theme, options);
-		},
+		renderCall: historyRenderCall,
 		execute: async (_toolCallId, params) => {
 			const sockPath = requireSockPath();
 			const agentId = typeof params?.agentId === "string" ? params.agentId.trim() : "";
@@ -92,6 +99,6 @@ export default async function readMessageHistoryExtension(api: ExtensionAPI): Pr
 				throw new Error(`read_message_history failed: ${err instanceof Error ? err.message : String(err)}`);
 			}
 		},
-		renderResult: (result, options, theme) => renderToolResult("Read Message History", result, options, theme),
+		renderResult: historyRenderResult,
 	});
 }

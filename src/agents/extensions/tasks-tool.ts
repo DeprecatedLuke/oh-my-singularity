@@ -13,22 +13,14 @@ import {
 	extractTaskCommentPayload,
 	extractTaskIssuePayload,
 	extractToolPayload,
-	formatToolResultPreview,
 	getTasksAction,
 	normalizeTaskAction,
 	TASK_LIST_ACTIONS,
 	TASK_SINGLE_ACTIONS,
 } from "../../tui/components/tool-renderer";
 import { ipcError, requireSockPath, sendIpc } from "./ipc-client";
-import { renderToolCall, renderToolResult } from "./tool-renderers";
-import type {
-	ExtensionAPI,
-	ToolRenderCallOptions,
-	ToolRenderResultOptions,
-	ToolResultWithError,
-	ToolTheme,
-	UnknownRecord,
-} from "./types";
+import { createToolRenderers } from "./tool-renderers";
+import type { ExtensionAPI, ToolRenderResultOptions, ToolResultWithError, ToolTheme, UnknownRecord } from "./types";
 
 type TasksExtensionOptions = {
 	role?: string;
@@ -42,6 +34,82 @@ export function makeTasksExtension(opts: TasksExtensionOptions) {
 	return async function tasksExtension(api: ExtensionAPI): Promise<void> {
 		const { Type } = api.typebox;
 
+		const tasksRenderers = createToolRenderers(
+			{
+				pending: args => {
+					const action = typeof args?.action === "string" ? normalizeTaskAction(args.action) : "";
+					switch (action) {
+						case "create":
+							return "Creating Task";
+						case "list":
+							return "Listing Tasks";
+						case "update":
+							return "Updating Task";
+						case "show":
+							return "Loading Task";
+						case "close":
+							return "Closing Task";
+						case "search":
+							return "Searching Tasks";
+						case "query":
+							return "Querying Tasks";
+						case "comments":
+							return "Loading Comments";
+						case "comment_add":
+							return "Adding Comment";
+						case "dep_tree":
+							return "Loading Dependencies";
+						default:
+							return "Tasks";
+					}
+				},
+				done: (args, result) => {
+					const action = typeof args?.action === "string" ? normalizeTaskAction(args.action) : "";
+					const count = resultItemCount(result);
+					const countSuffix = count !== null ? ` ${count}` : "";
+					switch (action) {
+						case "create":
+							return "Created Task";
+						case "list":
+							return `Listed${countSuffix} Tasks`;
+						case "update":
+							return "Updated Task";
+						case "show":
+							return "Task Details";
+						case "close":
+							return "Closed Task";
+						case "search":
+							return `Task Search${countSuffix}`;
+						case "query":
+							return `Task Query${countSuffix}`;
+						case "comments":
+							return `Task Comments${countSuffix}`;
+						case "comment_add":
+							return "Added Comment";
+						case "dep_tree":
+							return "Dependency Tree";
+						default:
+							return "Tasks";
+					}
+				},
+			},
+			args => {
+				const action = typeof args?.action === "string" ? normalizeTaskAction(args.action) : "";
+				const parts: string[] = [];
+				const summary = formatTasksCallSummary(args, action);
+				if (summary) parts.push(summary);
+				const rec = toRecord(args, {});
+				if (action === "create" || action === "update") {
+					const description = sanitizeInline(rec.description);
+					if (description) parts.push(description);
+				}
+				if (action === "comment_add") {
+					const text = sanitizeInline(rec.text);
+					if (text) parts.push(text);
+				}
+				return parts;
+			},
+		);
 		const tool = {
 			name: "tasks",
 			label: "Tasks",
@@ -73,10 +141,12 @@ export function makeTasksExtension(opts: TasksExtensionOptions) {
 
 					// create
 					title: Type.Optional(Type.String({ description: "Title for new issue" })),
-					description: Type.Optional(Type.String({ description: "Description for new issue" })),
 					labels: Type.Optional(Type.Array(Type.String(), { description: "Labels" })),
 					priority: Type.Optional(Type.Number({ description: "Priority (0-4)" })),
 					assignee: Type.Optional(Type.String({ description: "Assignee" })),
+					scope: Type.Optional(
+						Type.String({ description: "Expected work size (tiny|small|medium|large|xlarge)" }),
+					),
 					depends_on: Type.Optional(
 						Type.Union([Type.String(), Type.Array(Type.String())], {
 							description: "Depends-on issue id(s) for create/update action",
@@ -106,29 +176,20 @@ export function makeTasksExtension(opts: TasksExtensionOptions) {
 					),
 					direction: Type.Optional(Type.String({ description: "Dependency tree direction (down|up|both)" })),
 					maxDepth: Type.Optional(Type.Number({ description: "Max dependency tree depth" })),
+
+					// description last so LLM fills structured fields first
+					description: Type.Optional(Type.String({ description: "Description for new issue" })),
 				},
 				{ additionalProperties: false },
 			),
-			mergeCallAndResult: true,
-			renderCall: (args: Record<string, unknown> | undefined, theme: ToolTheme, options?: ToolRenderCallOptions) => {
-				const action = typeof args?.action === "string" ? normalizeTaskAction(args.action) : "";
-				const isStreaming = options?.isPartial === true;
-				if (isStreaming) {
-					const label = action ? `Tasks · ${action}` : "Tasks";
-					return renderToolCall(label, formatTasksStreamingCallArgs(args), theme, options);
-				}
-				const summary = options?.result
-					? formatTasksResultHeader(options.result, args)
-					: formatTasksCallSummary(args, action);
-				return renderToolCall("Tasks", summary ? [summary] : [], theme, options);
-			},
+			renderCall: tasksRenderers.renderCall,
 			renderResult: (
 				result: ToolResultWithError,
 				options: ToolRenderResultOptions,
 				theme: ToolTheme,
 				args?: UnknownRecord,
 			) => {
-				const fallback = renderToolResult("Tasks", result, options, theme);
+				const fallback = tasksRenderers.renderResult(result, options, theme, args);
 				return {
 					render(width: number): string[] {
 						const structuredLines = formatTasksStructuredRenderLines(result, args, width, options, theme);
@@ -177,7 +238,7 @@ export function makeTasksExtension(opts: TasksExtensionOptions) {
 					);
 
 					const error = ipcError(response, "tasks request failed");
-					if (error) throw new Error(`tasks: ${error}`);
+					if (error) throw new Error(error);
 					const payload = response.data ?? null;
 					const text =
 						payload === null
@@ -199,159 +260,20 @@ export function makeTasksExtension(opts: TasksExtensionOptions) {
 
 const COLLAPSED_STRUCTURED_LINES = 3;
 const EXPANDED_STRUCTURED_LINES = 20;
-const TASK_STREAMING_ARG_ORDER = [
-	"action",
-	"id",
-	"title",
-	"description",
-	"text",
-	"priority",
-	"labels",
-	"depends_on",
-	"references",
-	"assignee",
-	"status",
-	"type",
-	"includeClosed",
-	"newStatus",
-	"reason",
-	"claim",
-	"dependsOn",
-	"query",
-	"direction",
-	"maxDepth",
-	"limit",
-] as const;
-const TASK_STREAMING_ARG_KEYS = new Set<string>(TASK_STREAMING_ARG_ORDER);
 type StructuredRenderResult = {
 	lines: string[];
 	truncated: boolean;
 };
-
-function formatTaskStreamingFieldValue(value: unknown): string {
-	if (typeof value === "string") return sanitizeRenderableText(value).trim();
-	if (typeof value === "number" || typeof value === "boolean" || value === null) return String(value);
-	if (Array.isArray(value)) {
-		const parts = value.map(item => formatTaskStreamingFieldValue(item)).filter(Boolean);
-		return parts.length > 0 ? parts.join(", ") : "[]";
-	}
-	try {
-		return sanitizeInline(JSON.stringify(value));
-	} catch {
-		return sanitizeInline(String(value));
-	}
-}
-
-function formatTasksStreamingCallArgs(args: UnknownRecord | undefined): string[] {
-	const rec = toRecord(args, {});
-	const keys = Object.keys(rec).filter(key => key !== "action" && rec[key] !== undefined);
-	if (keys.length === 0) return [];
-	const orderedKeys = [
-		...TASK_STREAMING_ARG_ORDER.filter(key => key !== "action" && key in rec && rec[key] !== undefined),
-		...keys.filter(key => !TASK_STREAMING_ARG_KEYS.has(key)).sort((a, b) => a.localeCompare(b)),
-	];
-	const lines: string[] = [];
-	for (const key of orderedKeys) {
-		const value = formatTaskStreamingFieldValue(rec[key]);
-		if (!value) continue;
-		lines.push(`${key}: ${value}`);
-	}
-	return lines;
-}
 
 function formatTasksCallSummary(args: UnknownRecord | undefined, action: string): string {
 	const contextHint = formatTasksActionContextHint(action, args);
 	const rec = toRecord(args, {});
 	if (action === "create") {
 		const priority = formatPriorityValue(rec.priority);
-		return joinHeaderParts([action, priority ? `P:${priority}` : "", contextHint]);
+		return joinHeaderParts([priority ? `P:${priority}` : "", contextHint]);
 	}
-	if (!action) {
-		return contextHint;
-	}
-	return joinHeaderParts([action, contextHint]);
+	return contextHint || action;
 }
-
-function formatTasksResultHeader(result: ToolResultWithError, args: UnknownRecord | undefined): string {
-	const action = normalizeTaskAction(getTasksAction(result, args));
-	if (result.isError === true) {
-		return formatToolResultPreview(result, 120, {
-			toolName: "tasks",
-			args,
-			isError: true,
-		});
-	}
-	const { payload } = extractToolPayload(result);
-	const payloadRec = toRecord(payload, {});
-	const argsRec = toRecord(args, {});
-	const issues = extractTaskIssuePayload(payload);
-	const comments = extractTaskCommentPayload(payload);
-	const issueId =
-		sanitizeInline(payloadRec.id) ||
-		sanitizeInline(argsRec.id) ||
-		(issues && issues.length > 0 ? sanitizeInline(issues[0]!.id) : "");
-
-	switch (action) {
-		case "create": {
-			const priority = formatPriorityValue(payloadRec.priority ?? argsRec.priority);
-			return joinHeaderParts([action, priority ? `P:${priority}` : "", issueId]);
-		}
-		case "search":
-		case "query": {
-			const query = sanitizeInline(argsRec.query);
-			const queryHint = query ? quoteHintText(query) : "";
-			const count = issues ? issues.length : formatCollectionCount(payload);
-			const prefix = joinHeaderParts([action, queryHint], " ");
-			return `${prefix || action} — ${count} result${count === 1 ? "" : "s"}`;
-		}
-		case "comment_add": {
-			const count = comments ? comments.length : formatCommentCount(payload);
-			return joinHeaderParts([action, issueId, `(${Math.max(1, count)})`]);
-		}
-		case "comments": {
-			const count = comments ? comments.length : formatCommentCount(payload);
-			const prefix = joinHeaderParts([action, issueId]);
-			return `${prefix} (${count})`;
-		}
-		case "list":
-		case "ready": {
-			const count = issues ? issues.length : formatCollectionCount(payload);
-			return `${action} — ${count} task${count === 1 ? "" : "s"}`;
-		}
-		case "show":
-		case "update":
-		case "close":
-			return joinHeaderParts([action, issueId]);
-		default: {
-			const fallback = formatToolResultPreview(result, 120, {
-				toolName: "tasks",
-				args,
-				isError: false,
-			});
-			const normalizedFallback = sanitizeInline(fallback);
-			if (normalizedFallback) return normalizedFallback;
-			const contextHint = formatTasksActionContextHint(action, args);
-			return joinHeaderParts([action || "tasks", contextHint], " ");
-		}
-	}
-}
-
-function formatCollectionCount(payload: unknown): number {
-	if (Array.isArray(payload)) return payload.length;
-	const rec = toRecord(payload, {});
-	if (Array.isArray(rec.tasks)) return rec.tasks.length;
-	if (Array.isArray(rec.issues)) return rec.issues.length;
-	if (Array.isArray(rec.results)) return rec.results.length;
-	return 0;
-}
-
-function formatCommentCount(payload: unknown): number {
-	if (Array.isArray(payload)) return payload.length;
-	const rec = toRecord(payload, {});
-	if (Array.isArray(rec.comments)) return rec.comments.length;
-	return 0;
-}
-
 function formatPriorityValue(value: unknown): string {
 	if (typeof value !== "number" || !Number.isFinite(value)) return "";
 	return String(Math.trunc(value));
@@ -686,4 +608,15 @@ function formatPriority(value: unknown): string {
 function toRecord(value: unknown, fallback: UnknownRecord): UnknownRecord {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return fallback;
 	return value as UnknownRecord;
+}
+
+function resultItemCount(result: ToolResultWithError | undefined): number | null {
+	if (!result) return null;
+	const { payload } = extractToolPayload(result);
+	if (payload === null || payload === undefined) return null;
+	const issues = extractTaskIssuePayload(payload);
+	if (issues) return issues.length;
+	const comments = extractTaskCommentPayload(payload);
+	if (comments) return comments.length;
+	return null;
 }

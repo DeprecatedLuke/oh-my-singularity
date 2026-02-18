@@ -1,5 +1,5 @@
 import { ipcError, requireSockPath, sendIpc } from "./ipc-client";
-import { renderToolCall, renderToolResult } from "./tool-renderers";
+import { createToolRenderers } from "./tool-renderers";
 import type { ExtensionAPI, UnknownRecord } from "./types";
 
 /**
@@ -13,6 +13,30 @@ import type { ExtensionAPI, UnknownRecord } from "./types";
  */
 export default async function complainExtension(api: ExtensionAPI): Promise<void> {
 	const { Type } = api.typebox;
+
+	const { renderCall: complainRenderCall, renderResult: complainRenderResult } = createToolRenderers(
+		"Complain",
+		args => {
+			const files = normalizeFiles(args?.files);
+			const reason = typeof args?.reason === "string" ? args.reason.trim() : "";
+			const details: string[] = [];
+			if (files.length > 0) {
+				details.push(`files=${files.join(", ")}`);
+			}
+			if (reason) {
+				details.push(`reason=${reason}`);
+			}
+			return details;
+		},
+	);
+
+	const { renderCall: revokeRenderCall, renderResult: revokeRenderResult } = createToolRenderers(
+		"Revoke Complaint",
+		args => {
+			const files = normalizeFiles(args?.files);
+			return files.length > 0 ? [`files=${files.join(", ")}`] : ["no files"];
+		},
+	);
 
 	api.registerTool({
 		name: "complain",
@@ -31,20 +55,8 @@ export default async function complainExtension(api: ExtensionAPI): Promise<void
 			},
 			{ additionalProperties: false },
 		),
-		mergeCallAndResult: true,
-		renderCall: (args, theme, options) => {
-			const files = normalizeFiles(args?.files);
-			const reason = typeof args?.reason === "string" ? args.reason.trim() : "";
-			const details: string[] = [];
-			if (files.length > 0) {
-				details.push(`files=${files.join(", ")}`);
-			}
-			if (reason) {
-				details.push(`reason=${reason}`);
-			}
-			return renderToolCall("Complain", details, theme, options);
-		},
-		renderResult: (result, options, theme) => renderToolResult("Complain", result, options, theme),
+		renderCall: complainRenderCall,
+		renderResult: complainRenderResult,
 		execute: async (_toolCallId, params) => {
 			const sockPath = requireSockPath();
 
@@ -97,17 +109,8 @@ export default async function complainExtension(api: ExtensionAPI): Promise<void
 			},
 			{ additionalProperties: false },
 		),
-		mergeCallAndResult: true,
-		renderCall: (args, theme, options) => {
-			const files = normalizeFiles(args?.files);
-			return renderToolCall(
-				"Revoke Complaint",
-				files.length > 0 ? [`files=${files.join(", ")}`] : ["no files"],
-				theme,
-				options,
-			);
-		},
-		renderResult: (result, options, theme) => renderToolResult("Revoke Complaint", result, options, theme),
+		renderCall: revokeRenderCall,
+		renderResult: revokeRenderResult,
 		execute: async (_toolCallId, params) => {
 			const sockPath = requireSockPath();
 

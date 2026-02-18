@@ -1,7 +1,7 @@
 import { ipcError, requireSockPath, sendIpc } from "./ipc-client";
 
 import { makeTasksExtension } from "./tasks-tool";
-import { renderToolCall, renderToolResult } from "./tool-renderers";
+import { createToolRenderers } from "./tool-renderers";
 import type { ExtensionAPI } from "./types";
 
 const registerFinisherTasksTool = makeTasksExtension({
@@ -27,6 +27,25 @@ export default async function tasksFinisherExtension(api: ExtensionAPI): Promise
 	const sockPath = requireSockPath();
 	const taskId = normalizeEnv(process.env.OMS_TASK_ID);
 
+	const { renderCall: closeRenderCall, renderResult: closeRenderResult } = createToolRenderers("Close Task", args => {
+		const reason = typeof args?.reason === "string" ? args.reason.trim() : "";
+		return reason ? [`reason=${reason}`] : ["reason=(missing)"];
+	});
+
+	const { renderCall: advanceRenderCall, renderResult: advanceRenderResult } = createToolRenderers(
+		"Advance Lifecycle",
+		args => {
+			const action = typeof args?.action === "string" ? args.action.trim() : "";
+			const message = typeof args?.message === "string" ? args.message.trim() : "";
+			const reason = typeof args?.reason === "string" ? args.reason.trim() : "";
+			return [
+				action ? `action=${action}` : "action=(missing)",
+				message ? `message=${message}` : "message=(none)",
+				reason ? `reason=${reason}` : "reason=(none)",
+			];
+		},
+	);
+
 	api.registerTool({
 		name: "close_task",
 		label: "Close Task",
@@ -39,11 +58,7 @@ export default async function tasksFinisherExtension(api: ExtensionAPI): Promise
 			},
 			{ additionalProperties: false },
 		),
-		mergeCallAndResult: true,
-		renderCall: (args, theme, options) => {
-			const reason = typeof args?.reason === "string" ? args.reason.trim() : "";
-			return renderToolCall("Close Task", reason ? [`reason=${reason}`] : ["reason=(missing)"], theme, options);
-		},
+		renderCall: closeRenderCall,
 		execute: async (_toolCallId, params) => {
 			if (!taskId) {
 				throw new Error("close_task: OMS_TASK_ID is missing");
@@ -78,7 +93,7 @@ export default async function tasksFinisherExtension(api: ExtensionAPI): Promise
 				throw new Error(`close_task IPC failed: ${err instanceof Error ? err.message : String(err)}`);
 			}
 		},
-		renderResult: (result, options, theme) => renderToolResult("Close Task", result, options, theme),
+		renderResult: closeRenderResult,
 	});
 
 	api.registerTool({
@@ -105,22 +120,7 @@ export default async function tasksFinisherExtension(api: ExtensionAPI): Promise
 			},
 			{ additionalProperties: false },
 		),
-		mergeCallAndResult: true,
-		renderCall: (args, theme, options) => {
-			const action = typeof args?.action === "string" ? args.action.trim() : "";
-			const message = typeof args?.message === "string" ? args.message.trim() : "";
-			const reason = typeof args?.reason === "string" ? args.reason.trim() : "";
-			return renderToolCall(
-				"Advance Lifecycle",
-				[
-					action ? `action=${action}` : "action=(missing)",
-					message ? `message=${message}` : "message=(none)",
-					reason ? `reason=${reason}` : "reason=(none)",
-				],
-				theme,
-				options,
-			);
-		},
+		renderCall: advanceRenderCall,
 		execute: async (_toolCallId, params) => {
 			if (!taskId) {
 				throw new Error("advance_lifecycle: OMS_TASK_ID is missing");
@@ -158,7 +158,7 @@ export default async function tasksFinisherExtension(api: ExtensionAPI): Promise
 				throw new Error(`advance_lifecycle failed: ${err instanceof Error ? err.message : String(err)}`);
 			}
 		},
-		renderResult: (result, options, theme) => renderToolResult("Advance Lifecycle", result, options, theme),
+		renderResult: advanceRenderResult,
 	});
 }
 

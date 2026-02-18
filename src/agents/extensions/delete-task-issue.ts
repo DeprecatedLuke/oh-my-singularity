@@ -1,5 +1,5 @@
 import { requireSockPath, sendIpc } from "./ipc-client";
-import { renderToolCall, renderToolResult } from "./tool-renderers";
+import { createToolRenderers } from "./tool-renderers";
 import type { ExtensionAPI, UnknownRecord } from "./types";
 
 const TOMBSTONE_REASON = "tombstone: cancelled by user via delete_task_issue";
@@ -20,6 +20,11 @@ type TasksRequestResult = {
 export default async function deleteTaskIssueExtension(api: ExtensionAPI): Promise<void> {
 	const { Type } = api.typebox;
 
+	const { renderCall, renderResult } = createToolRenderers("Delete Task Issue", args => {
+		const id = typeof args?.id === "string" ? args.id.trim() : "";
+		return id ? [`id=${id}`] : [];
+	});
+
 	api.registerTool({
 		name: "delete_task_issue",
 		label: "Delete Task Issue",
@@ -35,12 +40,8 @@ export default async function deleteTaskIssueExtension(api: ExtensionAPI): Promi
 			},
 			{ additionalProperties: false },
 		),
-		mergeCallAndResult: true,
-		renderCall: (args, theme, options) => {
-			const id = typeof args?.id === "string" ? args.id.trim() : "";
-			return renderToolCall("Delete Task Issue", id ? [`id=${id}`] : [], theme, options);
-		},
-		renderResult: (result, options, theme) => renderToolResult("Delete Task Issue", result, options, theme),
+		renderCall,
+		renderResult,
 		execute: async (_toolCallId, params) => {
 			const sockPath = requireSockPath();
 

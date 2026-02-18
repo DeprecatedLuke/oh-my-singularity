@@ -1,5 +1,5 @@
 import { ipcError, requireSockPath, sendIpc } from "./ipc-client";
-import { renderToolCall, renderToolResult } from "./tool-renderers";
+import { createToolRenderers } from "./tool-renderers";
 import type { ExtensionAPI } from "./types";
 
 /**
@@ -13,6 +13,14 @@ import type { ExtensionAPI } from "./types";
  */
 export default async function replaceAgentExtension(api: ExtensionAPI): Promise<void> {
 	const { Type } = api.typebox;
+	const { renderCall, renderResult } = createToolRenderers("Replace Agent", args => {
+		const role = typeof args?.role === "string" ? args.role.trim() : "";
+		const taskId = typeof args?.taskId === "string" ? args.taskId.trim() : "";
+		const context = typeof args?.context === "string" ? args.context.trim() : "";
+		return [role ? `role=${role}` : "", taskId ? `taskId=${taskId}` : "", context ? `context=${context}` : ""].filter(
+			Boolean,
+		);
+	});
 
 	api.registerTool({
 		name: "replace_agent",
@@ -43,19 +51,8 @@ export default async function replaceAgentExtension(api: ExtensionAPI): Promise<
 			},
 			{ additionalProperties: false },
 		),
-		mergeCallAndResult: true,
-		renderCall: (args, theme, options) => {
-			const role = typeof args?.role === "string" ? args.role.trim() : "";
-			const taskId = typeof args?.taskId === "string" ? args.taskId.trim() : "";
-			const context = typeof args?.context === "string" ? args.context.trim() : "";
-			const details = [
-				role ? `role=${role}` : "",
-				taskId ? `taskId=${taskId}` : "",
-				context ? `context=${context}` : "",
-			];
-			return renderToolCall("Replace Agent", details.filter(Boolean), theme, options);
-		},
-		renderResult: (result, options, theme) => renderToolResult("Replace Agent", result, options, theme),
+		renderCall,
+		renderResult,
 		execute: async (_toolCallId, params) => {
 			const sockPath = requireSockPath();
 

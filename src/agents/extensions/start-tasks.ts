@@ -1,5 +1,5 @@
 import { ipcError, requireSockPath, sendIpc } from "./ipc-client";
-import { renderToolCall, renderToolResult } from "./tool-renderers";
+import { createToolRenderers } from "./tool-renderers";
 import type { ExtensionAPI } from "./types";
 /**
  * OMS extension for omp.
@@ -11,6 +11,10 @@ import type { ExtensionAPI } from "./types";
  */
 export default async function omsStartTasksExtension(api: ExtensionAPI): Promise<void> {
 	const { Type } = api.typebox;
+	const { renderCall, renderResult } = createToolRenderers({ pending: "Start Tasks", done: "Started Tasks" }, args => {
+		const count = typeof args?.count === "number" ? `count: ${args.count}` : "";
+		return count ? [count] : [];
+	});
 	api.registerTool({
 		name: "start_tasks",
 		label: "Start Tasks",
@@ -27,24 +31,8 @@ export default async function omsStartTasksExtension(api: ExtensionAPI): Promise
 			},
 			{ additionalProperties: false },
 		),
-		mergeCallAndResult: true,
-		renderCall: (args, theme, options) => {
-			const count = typeof args?.count === "number" ? `count: ${args.count}` : "";
-			const isStreaming = options?.isPartial === true;
-			const label = isStreaming ? "Starting Tasks..." : "Started Tasks";
-			return renderToolCall(label, isStreaming && count ? [count] : [], theme, options);
-		},
-		renderResult: (result, options, theme) => {
-			const body = renderToolResult("Start Tasks", result, options, theme);
-			return {
-				render(width: number): string[] {
-					const textBlock = result.content.find(block => block.type === "text" && typeof block.text === "string");
-					const summaryText = typeof textBlock?.text === "string" ? textBlock.text.trim().toLowerCase() : "";
-					if (!summaryText || summaryText === "ok") return [];
-					return body.render(width);
-				},
-			};
-		},
+		renderCall,
+		renderResult,
 		execute: async (_toolCallId, params) => {
 			const sockPath = requireSockPath();
 			const count = typeof params?.count === "number" ? params.count : undefined;
