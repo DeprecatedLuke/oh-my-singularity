@@ -10,6 +10,12 @@ type TerminalLike = {
 
 type Region = { x: number; y: number; width: number; height: number };
 
+function coerceOmsVisibility(state: unknown): boolean {
+	if (!state || typeof state !== "object" || Array.isArray(state)) return false;
+	const rec = state as { omsMessagesVisible?: unknown };
+	return rec.omsMessagesVisible === true;
+}
+
 function clipPadAnsi(text: string, width: number): string {
 	if (width <= 0) return "";
 	const clipped = clipAnsi(text, width);
@@ -74,10 +80,17 @@ export class SystemPane {
 		return true;
 	}
 
-	render(term: TerminalLike, region: Region): void {
+	render(term: TerminalLike, region: Region, state?: unknown): void {
 		const width = Math.max(0, region.width);
 		const height = Math.max(0, region.height);
 		if (width <= 0 || height <= 0) return;
+		if (!coerceOmsVisibility(state)) {
+			for (let row = 0; row < height; row += 1) {
+				term.moveTo(region.x, region.y + row);
+				term(clipPadAnsi("", width));
+			}
+			return;
+		}
 
 		const agent = this.#registry.get(this.#agentId);
 		const events = agent?.events ?? [];

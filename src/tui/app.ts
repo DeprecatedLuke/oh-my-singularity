@@ -138,6 +138,7 @@ export class OmsTuiApp {
 	#running = false;
 	readonly #onQuit?: () => void;
 	readonly #layoutOpts: ComputeLayoutOptions;
+	#savedSystemHeightRatio: number | undefined;
 
 	#lastCols: number;
 	#lastRows: number;
@@ -168,6 +169,7 @@ export class OmsTuiApp {
 		loopPaused: false,
 		mouseCaptureEnabled: true,
 		profilingActive: false,
+		omsMessagesVisible: false,
 	};
 
 	readonly #keybinds = new KeybindDispatcher<OmsTuiUiState>();
@@ -182,6 +184,7 @@ export class OmsTuiApp {
 				toggleDoneAgents?: () => void;
 				toggleMouseCapture?: () => void;
 				toggleProfiling?: () => void;
+				toggleOmsMessages?: () => void;
 				toggleSettings?: () => void;
 		  }
 		| undefined;
@@ -211,6 +214,8 @@ export class OmsTuiApp {
 			const allowGlobal =
 				name === "SHIFT_ALT_O" ||
 				name === "ALT_SHIFT_O" ||
+				name === "SHIFT_ALT_L" ||
+				name === "ALT_SHIFT_L" ||
 				name === "SHIFT_ALT_Q" ||
 				name === "ALT_SHIFT_Q" ||
 				name === "CTRL_Q" ||
@@ -324,6 +329,11 @@ export class OmsTuiApp {
 		this.#lastCols = cols;
 		this.#lastRows = rows;
 		this.#layoutOpts = opts?.layout ?? {};
+		this.#savedSystemHeightRatio = this.#layoutOpts.systemHeightRatio;
+		// If OMS messages start hidden, ensure systemHeightRatio is 0 so the pane is not visible
+		if (!this.#uiState.omsMessagesVisible) {
+			this.#layoutOpts.systemHeightRatio = 0;
+		}
 		this.#layout = computeLayout(cols, rows, this.#layoutOpts);
 		this.#onQuit = opts?.onQuit;
 
@@ -354,6 +364,7 @@ export class OmsTuiApp {
 		toggleDoneAgents?: () => void;
 		toggleMouseCapture?: () => void;
 		toggleProfiling?: () => void;
+		toggleOmsMessages?: () => void;
 		toggleSettings?: () => void;
 	}): void {
 		this.#keybindActions = actions;
@@ -407,6 +418,25 @@ export class OmsTuiApp {
 		this.#uiState = {
 			...this.#uiState,
 			profilingActive: nowActive,
+		};
+		this.requestRedraw();
+	}
+	toggleOmsMessages(): void {
+		const currentlyVisible = this.#uiState.omsMessagesVisible;
+		if (currentlyVisible) {
+			this.#savedSystemHeightRatio = this.#layoutOpts.systemHeightRatio;
+			this.#layoutOpts.systemHeightRatio = 0;
+		} else {
+			this.#layoutOpts.systemHeightRatio = this.#savedSystemHeightRatio ?? 0.3;
+		}
+		this.#layout = computeLayout(this.#lastCols, this.#lastRows, this.#layoutOpts);
+		this.#fullClearPending = true;
+		this.#bordersDirty = true;
+		const singularityInner = innerRegion(this.#layout.singularity);
+		this.#panes.singularity?.resize?.(singularityInner.width, singularityInner.height);
+		this.#uiState = {
+			...this.#uiState,
+			omsMessagesVisible: !currentlyVisible,
 		};
 		this.requestRedraw();
 	}
@@ -672,7 +702,9 @@ export class OmsTuiApp {
 
 		this.#profiler.startPhase("pane:system");
 		try {
-			this.#panes.system?.render(bt, innerRegion(this.#layout.system));
+			this.#panes.system?.render(bt, innerRegion(this.#layout.system), {
+				omsMessagesVisible: this.#uiState.omsMessagesVisible,
+			});
 		} catch (err) {
 			logger.debug(
 				"tui/app.ts: best-effort failure after this.#panes.system?.render(bt, innerRegion(this.#layout.system));",

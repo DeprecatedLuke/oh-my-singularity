@@ -7,6 +7,7 @@ export type StatusBarState = {
 	loopPaused: boolean;
 	mouseCaptureEnabled: boolean;
 	profilingActive: boolean;
+	omsMessagesVisible: boolean;
 };
 
 function formatClockHHMM(d: Date): string {
@@ -30,13 +31,12 @@ export function renderStatusBar(state: StatusBarState, width: number): string {
 	const ready = `${FG.dim}R:${RESET_FG}${state.readyCount}`;
 
 	// Keybind hints (compact)
-	const mouse = `${FG.dim}mouse:${RESET_FG}${state.mouseCaptureEnabled ? "on" : "off"}`;
-	const keys = `${FG.dim}SA-↑↓${RESET_FG} Tasks ${FG.dim}SA-←→${RESET_FG} Agent ${FG.dim}SA-S${RESET_FG} Stop ${FG.dim}SA-X${RESET_FG} StopAll ${FG.dim}SA-C${RESET_FG} Closed ${FG.dim}SA-D${RESET_FG} Done ${FG.dim}SA-A${RESET_FG} Auto ${FG.dim}SA-M${RESET_FG} Mouse ${FG.dim}SA-P${RESET_FG} Prof ${FG.dim}SA-O${RESET_FG} Settings ${FG.dim}SA-Q${RESET_FG} Quit`;
+	const keys = `${FG.dim}SA-↑↓${RESET_FG} Tasks ${FG.dim}SA-←→${RESET_FG} Agent ${FG.dim}SA-S${RESET_FG} Stop ${FG.dim}SA-X${RESET_FG} StopAll ${FG.dim}SA-C${RESET_FG} ToggleClosed ${FG.dim}SA-D${RESET_FG} Done ${FG.dim}SA-A${RESET_FG} Auto ${FG.dim}SA-M${RESET_FG} Mouse ${FG.dim}SA-O${RESET_FG} OMS ${FG.dim}SA-Q${RESET_FG} Quit`;
 	// Clock
 	const clock = `${FG.dim}${formatClockHHMM(new Date())}${RESET_FG}`;
 
 	// Assemble left side
-	const leftParts = [mode, workers, ready, mouse, keys];
+	const leftParts = [mode, workers, ready, keys];
 	if (state.profilingActive) {
 		leftParts.push(`${FG.error}● PROFILING${RESET_FG}`);
 	}
