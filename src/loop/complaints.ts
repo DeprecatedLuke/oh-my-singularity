@@ -207,7 +207,7 @@ export class ComplaintManager {
 		}
 
 		try {
-			await resolverRpc.waitForAgentEnd(120_000);
+			await resolverRpc.waitForAgentEnd(600_000);
 		} catch {
 			await this.finishAgent(resolver, "dead");
 			complaint.resolverStatus = "error";

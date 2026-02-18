@@ -24,6 +24,7 @@ function createLoopFixture() {
 		setAgentState: [] as Array<{ id: string; state: string }>,
 		clearSlot: [] as Array<{ id: string; slot: string }>,
 		updateStatus: [] as Array<{ taskId: string; status: string }>,
+		comment: [] as Array<{ taskId: string; text: string }>,
 	};
 	const tasksClient = {
 		close: async (taskId: string, reason?: string) => {
@@ -31,6 +32,9 @@ function createLoopFixture() {
 		},
 		updateStatus: async (taskId: string, status: string) => {
 			calls.updateStatus.push({ taskId, status });
+		},
+		comment: async (taskId: string, text: string) => {
+			calls.comment.push({ taskId, text });
 		},
 		setAgentState: async (id: string, state: string) => {
 			calls.setAgentState.push({ id, state });
@@ -124,6 +128,27 @@ describe("AgentLoop delegation", () => {
 		const result = loop.advanceIssuerLifecycle({ taskId: "task-1", action: "promote" });
 		expect(result).toEqual({ ok: true, source: "pipeline" });
 		expect(delegated).toEqual([{ taskId: "task-1", action: "promote" }]);
+	});
+
+	test("advanceFinisherLifecycle delegates to pipeline manager", () => {
+		const { loop } = createLoopFixture();
+		const delegated: unknown[] = [];
+		(
+			loop as unknown as {
+				pipelineManager: {
+					advanceFinisherLifecycle: (opts: unknown) => unknown;
+				};
+			}
+		).pipelineManager = {
+			advanceFinisherLifecycle: (opts: unknown) => {
+				delegated.push(opts);
+				return { ok: true, source: "pipeline-finisher" };
+			},
+		} as never;
+
+		const result = loop.advanceFinisherLifecycle({ taskId: "task-1", action: "worker" });
+		expect(result).toEqual({ ok: true, source: "pipeline-finisher" });
+		expect(delegated).toEqual([{ taskId: "task-1", action: "worker" }]);
 	});
 
 	test("spawnAgentBySingularity replaces worker by stopping all active roles on the task first", async () => {
@@ -562,6 +587,160 @@ describe("AgentLoop delegation", () => {
 		(loop as unknown as { running: boolean }).running = true;
 		expect(await loop.startTasks(1)).toEqual({ spawned: 1, taskIds: ["task-free"] });
 		expect(manualSpawned).toEqual(["task-free"]);
+	});
+});
+
+describe("AgentLoop finisher exit routing", () => {
+	const registerRunningFinisher = (fixture: ReturnType<typeof createLoopFixture>, taskId: string, id: string) =>
+		fixture.registry.register({
+			id,
+			role: "finisher",
+			taskId,
+			tasksAgentId: `agent-${id}`,
+			status: "running",
+			usage: createEmptyAgentUsage(),
+			events: [],
+			spawnedAt: 1,
+			lastActivity: 2,
+			rpc: makeRpc({
+				forceKill: () => {},
+				getLastAssistantText: async () => "finisher output",
+			}),
+		});
+
+	test("finisher exit without close/advance respawns a finisher", async () => {
+		const fixture = createLoopFixture();
+		const { loop, calls } = fixture;
+		(loop as unknown as { running: boolean }).running = true;
+		const respawns: Array<{ taskId: string; workerOutput: string }> = [];
+
+		(
+			loop as unknown as {
+				steeringManager: {
+					spawnFinisherAfterStoppingSteering: (taskId: string, workerOutput: string) => Promise<unknown>;
+				};
+			}
+		).steeringManager.spawnFinisherAfterStoppingSteering = async (taskId: string, workerOutput: string) => {
+			respawns.push({ taskId, workerOutput });
+			return {
+				id: `finisher:${taskId}:retry`,
+				role: "finisher",
+				taskId,
+				tasksAgentId: `agent-finisher-${taskId}-retry`,
+				status: "running",
+				usage: createEmptyAgentUsage(),
+				events: [],
+				spawnedAt: 3,
+				lastActivity: 4,
+			};
+		};
+
+		const finisher = registerRunningFinisher(fixture, "task-respawn", "finisher:task-respawn:old");
+		await (
+			loop as unknown as {
+				rpcHandlerManager: { onAgentEnd: (agent: unknown) => Promise<void> };
+			}
+		).rpcHandlerManager.onAgentEnd(finisher);
+
+		expect(respawns).toHaveLength(1);
+		expect(respawns[0]?.taskId).toBe("task-respawn");
+		expect(respawns[0]?.workerOutput).toContain("[SYSTEM RECOVERY]");
+		expect(calls.setAgentState).toContainEqual({ id: "agent-finisher:task-respawn:old", state: "done" });
+	});
+
+	test("finisher advance_lifecycle routes worker, issuer, and defer actions", async () => {
+		const runCase = async (action: "worker" | "issuer" | "defer") => {
+			const fixture = createLoopFixture();
+			const { loop, calls } = fixture;
+			(loop as unknown as { running: boolean }).running = true;
+			const workerSpawns: Array<{ taskId: string; kickoffMessage: string | null | undefined }> = [];
+			const issuerKickoffs: string[] = [];
+
+			(
+				loop as unknown as {
+					tasksClient: {
+						show: (taskId: string) => Promise<{ id: string; title: string; status: string; issue_type: string }>;
+					};
+				}
+			).tasksClient.show = async taskId => ({
+				id: taskId,
+				title: `Task ${taskId}`,
+				status: "in_progress",
+				issue_type: "task",
+			});
+
+			(
+				loop as unknown as {
+					pipelineManager: {
+						spawnTaskWorker: (
+							task: { id: string },
+							opts?: { claim?: boolean; kickoffMessage?: string | null },
+						) => Promise<unknown>;
+						kickoffResumePipeline: (task: { id: string }) => void;
+					};
+				}
+			).pipelineManager.spawnTaskWorker = async (
+				task: { id: string },
+				opts?: { kickoffMessage?: string | null },
+			) => {
+				workerSpawns.push({ taskId: task.id, kickoffMessage: opts?.kickoffMessage });
+				return {
+					id: `worker:${task.id}:new`,
+					role: "worker",
+					taskId: task.id,
+					tasksAgentId: `agent-worker-${task.id}`,
+					status: "running",
+					usage: createEmptyAgentUsage(),
+					events: [],
+					spawnedAt: 3,
+					lastActivity: 4,
+				};
+			};
+			(
+				loop as unknown as {
+					pipelineManager: {
+						kickoffResumePipeline: (task: { id: string }) => void;
+					};
+				}
+			).pipelineManager.kickoffResumePipeline = (task: { id: string }) => {
+				issuerKickoffs.push(task.id);
+			};
+
+			const finisher = registerRunningFinisher(fixture, `task-${action}`, `finisher:task-${action}:old`);
+			loop.advanceFinisherLifecycle({
+				taskId: `task-${action}`,
+				action,
+				message: `message-${action}`,
+				reason: `reason-${action}`,
+				agentId: "fin-1",
+			});
+
+			await (
+				loop as unknown as {
+					rpcHandlerManager: { onAgentEnd: (agent: unknown) => Promise<void> };
+				}
+			).rpcHandlerManager.onAgentEnd(finisher);
+
+			return { workerSpawns, issuerKickoffs, calls };
+		};
+
+		const workerCase = await runCase("worker");
+		expect(workerCase.workerSpawns).toEqual([{ taskId: "task-worker", kickoffMessage: "message-worker" }]);
+		expect(workerCase.issuerKickoffs).toEqual([]);
+		expect(workerCase.calls.updateStatus).toEqual([]);
+
+		const issuerCase = await runCase("issuer");
+		expect(issuerCase.workerSpawns).toEqual([]);
+		expect(issuerCase.issuerKickoffs).toEqual(["task-issuer"]);
+		expect(issuerCase.calls.updateStatus).toEqual([]);
+
+		const deferCase = await runCase("defer");
+		expect(deferCase.workerSpawns).toEqual([]);
+		expect(deferCase.issuerKickoffs).toEqual([]);
+		expect(deferCase.calls.updateStatus).toEqual([{ taskId: "task-defer", status: "blocked" }]);
+		expect(deferCase.calls.comment).toEqual([
+			{ taskId: "task-defer", text: "Blocked by finisher advance_lifecycle. reason-defer\nmessage: message-defer" },
+		]);
 	});
 });
 

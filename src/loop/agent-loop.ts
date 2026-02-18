@@ -38,6 +38,7 @@ export class AgentLoop {
 	private readonly rpcHandlerManager: RpcHandlerManager;
 	private readonly pipelineManager: PipelineManager;
 	private readonly spawnAgentInFlight = new Set<string>();
+	private readonly lifecycleTransitionInFlight = new Set<string>();
 
 	constructor(opts: {
 		tasksClient: TaskStoreClient;
@@ -70,12 +71,29 @@ export class AgentLoop {
 			isPaused: () => this.paused,
 			wake: this.wake.bind(this),
 			revokeComplaint: opts => this.complaintManager.revokeComplaint(opts),
-			spawnFinisherAfterStoppingSteering: (taskId, workerOutput) =>
-				this.steeringManager.spawnFinisherAfterStoppingSteering(taskId, workerOutput),
+			spawnFinisherAfterStoppingSteering: (taskId, workerOutput, resumeSessionId) =>
+				this.withLifecycleTransition(taskId, () =>
+					this.steeringManager.spawnFinisherAfterStoppingSteering(taskId, workerOutput, resumeSessionId),
+				),
 			getLastAssistantText: this.lifecycleHelpers.getLastAssistantText.bind(this.lifecycleHelpers),
 			logAgentStart: this.lifecycleHelpers.logAgentStart.bind(this.lifecycleHelpers),
 			logAgentFinished: this.lifecycleHelpers.logAgentFinished.bind(this.lifecycleHelpers),
 			writeAgentCrashLog: this.lifecycleHelpers.writeAgentCrashLog.bind(this.lifecycleHelpers),
+			takeFinisherLifecycleAdvance: taskId => this.pipelineManager.takeFinisherLifecycleAdvance(taskId),
+			takeFinisherCloseRecord: taskId => this.pipelineManager.takeFinisherCloseRecord(taskId),
+			spawnWorkerFromFinisherAdvance: async (taskId, kickoffMessage) =>
+				this.withLifecycleTransition(taskId, async () => {
+					const task = await this.tasksClient.show(taskId);
+					return await this.pipelineManager.spawnTaskWorker(task, {
+						claim: false,
+						kickoffMessage: kickoffMessage ?? null,
+					});
+				}),
+			kickoffIssuerFromFinisherAdvance: async (taskId, _kickoffMessage) =>
+				this.withLifecycleTransition(taskId, async () => {
+					const task = await this.tasksClient.show(taskId);
+					this.pipelineManager.kickoffResumePipeline(task);
+				}),
 		});
 
 		const attachRpcHandlers = this.rpcHandlerManager.attachRpcHandlers.bind(this.rpcHandlerManager);
@@ -122,8 +140,10 @@ export class AgentLoop {
 			hasPendingInterruptKickoff: taskId => this.steeringManager.hasPendingInterruptKickoff(taskId),
 			takePendingInterruptKickoff: taskId => this.steeringManager.takePendingInterruptKickoff(taskId),
 			hasFinisherTakeover: taskId => this.steeringManager.hasFinisherTakeover(taskId),
-			spawnFinisherAfterStoppingSteering: (taskId, workerOutput) =>
-				this.steeringManager.spawnFinisherAfterStoppingSteering(taskId, workerOutput),
+			spawnFinisherAfterStoppingSteering: (taskId, workerOutput, resumeSessionId) =>
+				this.withLifecycleTransition(taskId, () =>
+					this.steeringManager.spawnFinisherAfterStoppingSteering(taskId, workerOutput, resumeSessionId),
+				),
 			isRunning: () => this.running,
 			isPaused: () => this.paused,
 		});
@@ -141,6 +161,24 @@ export class AgentLoop {
 			data,
 		});
 		this.onDirty?.();
+	}
+
+	private isLifecycleTransitionInFlight(taskId: string): boolean {
+		const normalizedTaskId = taskId.trim();
+		if (!normalizedTaskId) return false;
+		return this.lifecycleTransitionInFlight.has(normalizedTaskId);
+	}
+
+	private async withLifecycleTransition<T>(taskId: string, callback: () => Promise<T>): Promise<T> {
+		const normalizedTaskId = taskId.trim();
+		if (!normalizedTaskId) return callback();
+
+		this.lifecycleTransitionInFlight.add(normalizedTaskId);
+		try {
+			return await callback();
+		} finally {
+			this.lifecycleTransitionInFlight.delete(normalizedTaskId);
+		}
 	}
 
 	start(): void {
@@ -303,7 +341,9 @@ export class AgentLoop {
 
 		for (const task of candidates) {
 			if (slots <= 0 || this.paused) break;
-			if (this.pipelineManager.isPipelineInFlight(task.id)) continue;
+			if (this.pipelineManager.isPipelineInFlight(task.id) || this.isLifecycleTransitionInFlight(task.id)) {
+				continue;
+			}
 			this.pipelineManager.kickoffNewTaskPipeline(task);
 			spawned.push(task.id);
 			slots -= 1;
@@ -328,6 +368,16 @@ export class AgentLoop {
 		return this.pipelineManager.advanceIssuerLifecycle(opts);
 	}
 
+	advanceFinisherLifecycle(opts: {
+		taskId?: string;
+		action?: string;
+		message?: string;
+		reason?: string;
+		agentId?: string;
+	}): Record<string, unknown> {
+		return this.pipelineManager.advanceFinisherLifecycle(opts);
+	}
+
 	async handleFinisherCloseTask(opts: {
 		taskId?: string;
 		reason?: string;
@@ -340,6 +390,11 @@ export class AgentLoop {
 
 		const reason = typeof opts.reason === "string" ? opts.reason.trim() : "";
 		const agentId = typeof opts.agentId === "string" ? opts.agentId.trim() : "";
+		this.pipelineManager.recordFinisherClose?.({
+			taskId,
+			reason: reason || undefined,
+			agentId: agentId || undefined,
+		});
 
 		let taskClosed = false;
 		try {
@@ -546,15 +601,13 @@ export class AgentLoop {
 		try {
 			const task = await this.tasksClient.show(taskId);
 			if (task.status === "blocked") {
-				await this.tasksClient.updateStatus(taskId, "open");
+				await this.tasksClient.updateStatus(taskId, "in_progress");
 				this.loopLog(`replace_agent: unblocked task ${taskId}`, "info", { taskId });
 			}
 		} catch (err) {
-			this.loopLog(
-				`replace_agent: failed to check/unblock task ${taskId}: ${err instanceof Error ? err.message : err}`,
-				"warn",
-				{ taskId },
-			);
+			const message = err instanceof Error ? err.message : String(err);
+			this.loopLog(`replace_agent: failed to check/unblock task ${taskId}: ${message}`, "warn", { taskId });
+			throw new Error(`replace_agent: failed to check/unblock task ${taskId}: ${message}`);
 		}
 
 		// Duplicate detection: if any active agent exists for this task,
@@ -653,6 +706,7 @@ export class AgentLoop {
 				role,
 				error: message,
 			});
+			throw err;
 		} finally {
 			this.spawnAgentInFlight.delete(key);
 			this.pipelineManager.removePipelineInFlight(taskId);
@@ -774,7 +828,9 @@ export class AgentLoop {
 				const resumeCandidates = await this.scheduler.getInProgressTasksWithoutAgent(resumeBudget);
 				for (const task of resumeCandidates) {
 					if (slots <= 1 || this.paused) break;
-					if (this.pipelineManager.isPipelineInFlight(task.id)) continue;
+					if (this.pipelineManager.isPipelineInFlight(task.id) || this.isLifecycleTransitionInFlight(task.id)) {
+						continue;
+					}
 					this.pipelineManager.kickoffResumePipeline(task);
 					slots--;
 				}
@@ -785,7 +841,9 @@ export class AgentLoop {
 				const resumeCandidates = await this.scheduler.getInProgressTasksWithoutAgent(slots);
 				for (const task of resumeCandidates) {
 					if (slots <= 0 || this.paused) break;
-					if (this.pipelineManager.isPipelineInFlight(task.id)) continue;
+					if (this.pipelineManager.isPipelineInFlight(task.id) || this.isLifecycleTransitionInFlight(task.id)) {
+						continue;
+					}
 					this.pipelineManager.kickoffResumePipeline(task);
 					slots--;
 				}
