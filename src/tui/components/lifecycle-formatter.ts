@@ -128,6 +128,15 @@ export function formatAgentLogSummary(
 		return `start ${agentId} for ${taskId} — ${context}`;
 	}
 
+	if (lifecycle === "started" && (role === "worker" || role === "designer-worker" || role === "finisher")) {
+		const started = parseStartedLifecycleMessage(safeMessage);
+		const agentId = started?.agentId || dataAgentId || `${role}:?`;
+		const context =
+			detailValue(started?.context) ||
+			detailValue(data?.context) ||
+			clipText(squashWhitespace(safeMessage), AGENT_SUMMARY_MAX);
+		return `start ${agentId} for ${taskId} — ${context}`;
+	}
 	if (lifecycle === "finished" && (role === "issuer" || role === "steering")) {
 		const finished = parseFinishedLifecycleMessage(safeMessage);
 		const summary = finished?.summary || "";
