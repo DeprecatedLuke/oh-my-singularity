@@ -3,6 +3,7 @@ import type { AgentRole, AgentStatus } from "../agents/types";
 import {
 	INTERVAL_WAIT_SLEEP_MS,
 	LIMIT_MESSAGE_HISTORY_DEFAULT,
+	LIMIT_TASK_LIST_DEFAULT,
 	TIMEOUT_AGENT_WAIT_MS,
 	TIMEOUT_MIN_MS,
 } from "../config/constants";
@@ -38,6 +39,43 @@ function asStringArray(value: unknown): string[] {
 function asFiniteInt(value: unknown): number | null {
 	if (typeof value !== "number" || !Number.isFinite(value)) return null;
 	return Math.trunc(value);
+}
+
+type CompactTaskListIssue = {
+	id: string;
+	title: string;
+	status: string;
+	priority: number;
+	assignee: string | null;
+	dependency_count: number;
+	issue_type: string;
+};
+
+function isClosedTaskIssue(issue: TaskIssue): boolean {
+	return (
+		String(issue.status ?? "")
+			.trim()
+			.toLowerCase() === "closed"
+	);
+}
+
+function getTaskDependencyCount(issue: TaskIssue): number {
+	const rec = asRecord(issue);
+	if (!rec) return 0;
+	const dependsOnIds = rec.depends_on_ids;
+	return Array.isArray(dependsOnIds) ? dependsOnIds.length : 0;
+}
+
+function toCompactTaskListIssue(issue: TaskIssue): CompactTaskListIssue {
+	return {
+		id: issue.id,
+		title: issue.title,
+		status: String(issue.status ?? ""),
+		priority: typeof issue.priority === "number" && Number.isFinite(issue.priority) ? Math.trunc(issue.priority) : 0,
+		assignee: typeof issue.assignee === "string" ? issue.assignee : null,
+		dependency_count: getTaskDependencyCount(issue),
+		issue_type: String(issue.issue_type ?? ""),
+	};
 }
 
 function isTerminalAgentStatus(status: unknown): boolean {
@@ -282,26 +320,38 @@ async function executeTasksToolAction(
 	const params = asRecord(rec.params) ?? rec;
 	const fallbackTaskId = asString(rec.defaultTaskId) ?? asString(params.defaultTaskId);
 	const issueId = asString(params.id) ?? fallbackTaskId;
-
+	const includeClosed = params.includeClosed === true;
+	const requestedStatus = asString(params.status);
+	const applyDefaultVisibility = !includeClosed && !requestedStatus;
+	const effectiveStatus = requestedStatus ?? (applyDefaultVisibility ? "open" : null);
 	const parseListArgs = (): string[] => {
 		const args: string[] = [];
-		if (params.includeClosed === true) args.push("--all");
-		const status = asString(params.status);
-		if (status) args.push("--status", status);
+		if (includeClosed) args.push("--all");
+		if (effectiveStatus) args.push("--status", effectiveStatus);
 		const type = asString(params.type);
 		if (type) args.push("--type", type);
 		const limit = asFiniteInt(params.limit);
-		if (typeof limit === "number") args.push("--limit", String(Math.max(0, limit)));
+		const effectiveLimit = typeof limit === "number" ? limit : LIMIT_TASK_LIST_DEFAULT;
+		args.push("--limit", String(Math.max(0, effectiveLimit)));
 		return args;
 	};
 
 	try {
 		switch (action) {
 			case "ready": {
-				return { ok: true, data: await tasksClient.ready() };
+				return { ok: true, data: (await tasksClient.ready()).map(issue => toCompactTaskListIssue(issue)) };
 			}
 			case "list": {
-				return { ok: true, data: await tasksClient.list(parseListArgs()) };
+				const issues = await tasksClient.list(parseListArgs());
+				const sortedIssues = [...issues].sort((a, b) => {
+					const aTime = parseTimestampMs(a.updated_at);
+					const bTime = parseTimestampMs(b.updated_at);
+					return bTime - aTime;
+				});
+				const visibleIssues = applyDefaultVisibility
+					? sortedIssues.filter(issue => !isClosedTaskIssue(issue) && !isTerminalAgentStatus(issue.status))
+					: sortedIssues;
+				return { ok: true, data: visibleIssues.map(issue => toCompactTaskListIssue(issue)) };
 			}
 			case "types": {
 				return { ok: true, data: await tasksClient.types() };
@@ -372,12 +422,23 @@ async function executeTasksToolAction(
 			case "search": {
 				const query = asString(params.query);
 				if (!query) return { ok: false, error: "query is required for search" };
+				const limit = asFiniteInt(params.limit);
+				const effectiveLimit = typeof limit === "number" ? limit : LIMIT_TASK_LIST_DEFAULT;
 				const options: TaskSearchInput = {
 					includeComments: params.includeComments === true,
-					status: asString(params.status),
-					limit: asFiniteInt(params.limit) ?? undefined,
+					status: effectiveStatus,
+					limit: effectiveLimit,
 				};
-				return { ok: true, data: await tasksClient.search(query, options) };
+				const issues = await tasksClient.search(query, options);
+				const sortedIssues = [...issues].sort((a, b) => {
+					const aTime = parseTimestampMs(a.updated_at);
+					const bTime = parseTimestampMs(b.updated_at);
+					return bTime - aTime;
+				});
+				const visibleIssues = applyDefaultVisibility
+					? sortedIssues.filter(issue => !isClosedTaskIssue(issue) && !isTerminalAgentStatus(issue.status))
+					: sortedIssues;
+				return { ok: true, data: visibleIssues.map(issue => toCompactTaskListIssue(issue)) };
 			}
 			case "query": {
 				const query = asString(params.query);
@@ -386,7 +447,10 @@ async function executeTasksToolAction(
 				if (params.includeClosed === true) queryArgs.push("--all");
 				const limit = asFiniteInt(params.limit);
 				if (typeof limit === "number") queryArgs.push("--limit", String(Math.max(0, limit)));
-				return { ok: true, data: await tasksClient.query(query, queryArgs) };
+				return {
+					ok: true,
+					data: (await tasksClient.query(query, queryArgs)).map(issue => toCompactTaskListIssue(issue)),
+				};
 			}
 			case "dep_tree": {
 				if (!issueId) return { ok: false, error: "id is required for dep_tree" };
