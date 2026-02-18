@@ -71,6 +71,7 @@ export class OmsRpcClient {
 
 	private stderrBuf = "";
 	private sessionId: string | null = null;
+	#suppressAgentEndCount = 0;
 
 	constructor(opts?: OmsRpcClientOptions) {
 		this.opts = {
@@ -217,6 +218,9 @@ export class OmsRpcClient {
 
 		this.rejectAllPending(new Error(this.formatErr("RPC process force-killed")));
 	}
+	suppressNextAgentEnd(): void {
+		this.#suppressAgentEndCount += 1;
+	}
 
 	waitForAgentEnd(timeoutMs = 60_000): Promise<void> {
 		return new Promise((resolve, reject) => {
@@ -231,6 +235,11 @@ export class OmsRpcClient {
 					if (timer) clearTimeout(timer);
 					unsubscribe();
 					resolve();
+				} else if (rec?.type === "rpc_exit") {
+					settled = true;
+					if (timer) clearTimeout(timer);
+					unsubscribe();
+					reject(new Error(this.formatErr("RPC process exited before agent_end")));
 				}
 			});
 
@@ -257,6 +266,10 @@ export class OmsRpcClient {
 
 	async abort(): Promise<void> {
 		await this.send({ type: "abort" });
+	}
+
+	async abortAndPrompt(message: string): Promise<void> {
+		await this.send({ type: "abort_and_prompt", message });
 	}
 
 	async getState(): Promise<unknown> {
@@ -452,6 +465,11 @@ export class OmsRpcClient {
 	private emitEvent(event: unknown): void {
 		const sessionId = extractSessionId(event);
 		if (sessionId) this.sessionId = sessionId;
+		const rec = event && typeof event === "object" && !Array.isArray(event) ? (event as { type?: unknown }) : null;
+		if (rec?.type === "agent_end" && this.#suppressAgentEndCount > 0) {
+			this.#suppressAgentEndCount -= 1;
+			return;
+		}
 		for (const listener of this.listeners) {
 			try {
 				listener(event);
