@@ -14,6 +14,7 @@ import { asRecord } from "../../utils";
 import { BOLD, clipAnsi, FG, RESET, visibleWidth } from "../colors";
 import { renderMarkdownLines } from "../components/markdown";
 import { formatTokens } from "../utils/format";
+import { formatIssuePriority, formatIssueStatusStyled } from "../utils/task-issue-format";
 import type { TasksPane } from "./tasks-pane";
 
 type TerminalLike = {
@@ -140,6 +141,14 @@ export class TasksDetailsPane {
 			lines.push(`${formatMetadataLabel("assignee:")} ${assignee}`);
 			if (issue.labels?.length) {
 				lines.push(`${formatMetadataLabel("labels:")} ${issue.labels.join(", ")}`);
+			}
+			const references = Array.isArray(issue.references)
+				? issue.references
+						.filter(referenceId => typeof referenceId === "string" && referenceId.trim().length > 0)
+						.map(referenceId => referenceId.trim())
+				: [];
+			if (references.length > 0) {
+				lines.push(`${formatMetadataLabel("references:")} ${references.join(", ")}`);
 			}
 			const liveAgents = this.#registry?.getByTask(issue.id) ?? [];
 			const persistedAgents = this.#selectedPersistedAgents;
@@ -328,55 +337,6 @@ function renderRelativeTime(iso: string): string {
 	return `${Math.max(0, s)}s ago`;
 }
 
-function formatIssueStatus(status: unknown): string {
-	return typeof status === "string" ? status : "(unknown)";
-}
-
-function formatIssueStatusStyled(status: unknown): string {
-	return `${issueStatusColor(status)}${formatIssueStatus(status)}${RESET}`;
-}
-
-function issueStatusColor(status: unknown): string {
-	const normalized = typeof status === "string" ? status.trim().toLowerCase() : "";
-	switch (normalized) {
-		case "closed":
-		case "done":
-		case "complete":
-		case "completed":
-			return FG.success;
-		case "in_progress":
-		case "in-progress":
-		case "running":
-		case "working":
-		case "started":
-			return FG.warning;
-		case "blocked":
-		case "dead":
-		case "failed":
-		case "aborted":
-		case "stuck":
-			return FG.error;
-		case "deferred":
-		case "paused":
-			return FG.warning;
-		case "open":
-			return FG.border;
-		default:
-			return FG.muted;
-	}
-}
-
-function formatIssuePriority(priority: unknown): string {
-	const text = priority == null ? "?" : String(priority);
-	if (typeof priority !== "number" || !Number.isFinite(priority)) {
-		return `${FG.muted}${text}${RESET}`;
-	}
-	if (priority <= 0) return `${BOLD}${FG.error}${text}${RESET}`;
-	if (priority <= 1) return `${BOLD}${FG.warning}${text}${RESET}`;
-	if (priority <= 2) return `${FG.accent}${text}${RESET}`;
-	return `${FG.dim}${text}${RESET}`;
-}
-
 function formatSectionHeader(value: string): string {
 	return `${BOLD}${FG.accent}${value}${RESET}`;
 }
@@ -387,7 +347,8 @@ function formatMetadataLabel(label: string): string {
 
 function taskIssueSnapshotKey(issue: TaskIssue): string {
 	const commentsCount = Array.isArray(issue.comments) ? issue.comments.length : 0;
-	return `${issue.id}|${issue.updated_at}|${String(issue.status ?? "")}|${commentsCount}`;
+	const referencesCount = Array.isArray(issue.references) ? issue.references.length : 0;
+	return `${issue.id}|${issue.updated_at}|${String(issue.status ?? "")}|${commentsCount}|${referencesCount}`;
 }
 
 function formatUsd(value: number): string {

@@ -11,7 +11,13 @@ import {
 } from "./lifecycle-formatter";
 import { renderMarkdownLines } from "./markdown";
 import { sanitizeChunk, wrapLine } from "./text-formatter";
-import { extractResultText, formatToolArgs, formatToolResultPreview, renderToolBlockLines } from "./tool-renderer";
+import {
+	extractResultText,
+	formatToolArgs,
+	formatToolResultPreview,
+	renderToolBlockLines,
+	type ToolBlock,
+} from "./tool-renderer";
 export type RenderRpcOptions = {
 	width: number;
 	height: number;
@@ -39,16 +45,6 @@ type TextBlock = {
 	level?: string;
 };
 
-type ToolBlock = {
-	kind: "tool";
-	toolName: string;
-	argsPreview: string;
-	resultPreview: string;
-	/** Full text content extracted from result.content — used for rich rendering. */
-	resultContent: string;
-	state: "pending" | "success" | "error";
-};
-
 type SepBlock = {
 	kind: "separator";
 	label: string;
@@ -60,13 +56,17 @@ type ToolExecState = {
 	blockIndex: number;
 	toolName: string;
 	args?: unknown;
+	rawArgsBuffer?: string;
+	argsComplete: boolean;
 };
-
 type StreamState = {
 	assistantBlockIndex: number | null;
 	thinkingBlockIndex: number | null;
 	userInputBlockIndex: number | null;
 	toolExecByCallId: Map<string, ToolExecState>;
+	activeToolCallId: string | null;
+	activeToolBlockIndex: number | null;
+	activeToolRawArgsBuffer?: string;
 };
 // ---- Block management ----
 
@@ -118,6 +118,82 @@ function extractMessageText(content: unknown): string {
 
 function formatUserPromptText(content: string): string {
 	return `Input: ${content}`;
+}
+
+function formatInitialPromptText(content: string): string {
+	return `Task Prompt: ${content}`;
+}
+
+function parseToolCallArgs(text: string): unknown | undefined {
+	const trimmed = text.trim();
+	if (!trimmed) return undefined;
+	try {
+		return JSON.parse(trimmed);
+	} catch {
+		return undefined;
+	}
+}
+
+function normalizeToolCallArgs(value: unknown): { args?: unknown; rawArgsBuffer?: string } | null {
+	if (value === undefined) return null;
+	if (typeof value === "string") {
+		const parsed = parseToolCallArgs(value);
+		if (parsed === undefined) return { rawArgsBuffer: value };
+		return { args: parsed, rawArgsBuffer: value };
+	}
+	return { args: value };
+}
+
+function extractToolCallArgsFromEvent(
+	event: Record<string, unknown>,
+	previousRawArgsBuffer?: string,
+): { args?: unknown; rawArgsBuffer?: string } | null {
+	const toolCall = asRecord(event.toolCall);
+	if (toolCall && "arguments" in toolCall) return normalizeToolCallArgs(toolCall.arguments);
+	if ("arguments" in event) return normalizeToolCallArgs(event.arguments);
+	const deltaRecord = asRecord(event.delta);
+	if (deltaRecord) {
+		if ("arguments" in deltaRecord) return normalizeToolCallArgs(deltaRecord.arguments);
+		return { args: deltaRecord };
+	}
+	if (typeof event.delta === "string") {
+		const rawArgsBuffer = `${previousRawArgsBuffer ?? ""}${event.delta}`;
+		const parsed = parseToolCallArgs(rawArgsBuffer);
+		return parsed === undefined ? { rawArgsBuffer } : { args: parsed, rawArgsBuffer };
+	}
+	return null;
+}
+
+function resolveToolCallId(
+	event: Record<string, unknown>,
+	toolCall: Record<string, unknown> | null,
+	state: StreamState,
+): string | null {
+	if (toolCall && typeof toolCall.id === "string" && toolCall.id.trim()) return toolCall.id;
+	if (typeof event.toolCallId === "string" && event.toolCallId.trim()) return event.toolCallId;
+	return state.activeToolCallId;
+}
+
+function mergeToolArgs(previousArgs: unknown, nextArgs: unknown): unknown {
+	const nextRecord = asRecord(nextArgs);
+	if (!nextRecord) return nextArgs;
+	const previousRecord = asRecord(previousArgs);
+	if (!previousRecord) return nextRecord;
+	return { ...previousRecord, ...nextRecord };
+}
+
+function createPendingToolBlock(toolName: string, args: unknown, argsComplete: boolean): ToolBlock {
+	return {
+		kind: "tool",
+		toolName,
+		argsPreview: args === undefined ? "" : formatToolArgs(toolName, args),
+		argsData: args,
+		resultPreview: "",
+		resultContent: "",
+		resultData: undefined,
+		state: "pending",
+		argsComplete,
+	};
 }
 
 // ---- Message event handlers ----
@@ -172,29 +248,119 @@ function handleAssistantMessageEvent(event: Record<string, unknown>, state: Stre
 		return;
 	}
 
-	// toolcall_end: create a pending ToolBlock (execution events update it later)
-	if (type === "toolcall_end") {
+	// toolcall_*: create/update pending ToolBlock while args stream in.
+	if (type === "toolcall_start") {
 		const toolCall = asRecord(event.toolCall);
+		const id = resolveToolCallId(event, toolCall, state);
 		const name = toolCall && typeof toolCall.name === "string" ? toolCall.name : "?";
-		const toolArgs = toolCall ? toolCall.arguments : undefined;
-		const args = toolCall ? formatToolArgs(name, toolArgs) : "";
-		const id = toolCall && typeof toolCall.id === "string" ? toolCall.id : null;
-		const block: ToolBlock = {
-			kind: "tool",
-			toolName: name,
-			argsPreview: args,
-			resultPreview: "",
-			resultContent: "",
-			state: "pending",
-		};
+		const initialArgs = extractToolCallArgsFromEvent(event);
+		const block = createPendingToolBlock(name, initialArgs?.args, false);
 		const idx = pushBlock(blocks, block);
-		if (id) state.toolExecByCallId.set(id, { blockIndex: idx, toolName: name, args: toolArgs });
+		state.activeToolCallId = id;
+		state.activeToolBlockIndex = idx;
+		state.activeToolRawArgsBuffer = initialArgs?.rawArgsBuffer;
+		if (id) {
+			state.toolExecByCallId.set(id, {
+				blockIndex: idx,
+				toolName: name,
+				args: initialArgs?.args,
+				rawArgsBuffer: initialArgs?.rawArgsBuffer,
+				argsComplete: false,
+			});
+		}
 		return;
 	}
 
-	// Suppress toolcall streaming (nothing to show until toolcall_end)
-	if (type === "toolcall_start" || type === "toolcall_delta") return;
-
+	if (type === "toolcall_delta") {
+		const toolCall = asRecord(event.toolCall);
+		const id = resolveToolCallId(event, toolCall, state);
+		const prev = id ? state.toolExecByCallId.get(id) : null;
+		const blockIndex = prev?.blockIndex ?? state.activeToolBlockIndex;
+		if (blockIndex === null) return;
+		const block = blocks[blockIndex];
+		if (block?.kind !== "tool") return;
+		const nextName =
+			toolCall && typeof toolCall.name === "string" ? toolCall.name : (prev?.toolName ?? block.toolName);
+		const argUpdate = extractToolCallArgsFromEvent(event, prev?.rawArgsBuffer ?? state.activeToolRawArgsBuffer);
+		if (!argUpdate) return;
+		const previousArgs = prev?.args ?? block.argsData;
+		const mergedArgs = argUpdate.args !== undefined ? mergeToolArgs(previousArgs, argUpdate.args) : previousArgs;
+		block.toolName = nextName;
+		if (mergedArgs !== undefined) {
+			block.argsData = mergedArgs;
+			block.argsPreview = formatToolArgs(nextName, mergedArgs);
+		}
+		block.argsComplete = false;
+		if (prev) {
+			prev.toolName = nextName;
+			prev.args = mergedArgs;
+			if (argUpdate.rawArgsBuffer !== undefined) prev.rawArgsBuffer = argUpdate.rawArgsBuffer;
+			prev.argsComplete = false;
+		} else if (id) {
+			state.toolExecByCallId.set(id, {
+				blockIndex,
+				toolName: nextName,
+				args: mergedArgs,
+				rawArgsBuffer: argUpdate.rawArgsBuffer ?? state.activeToolRawArgsBuffer,
+				argsComplete: false,
+			});
+			state.activeToolCallId = id;
+			state.activeToolRawArgsBuffer = argUpdate.rawArgsBuffer ?? state.activeToolRawArgsBuffer;
+		} else {
+			state.activeToolRawArgsBuffer = argUpdate.rawArgsBuffer ?? state.activeToolRawArgsBuffer;
+		}
+		return;
+	}
+	if (type === "toolcall_end") {
+		const toolCall = asRecord(event.toolCall);
+		const id = resolveToolCallId(event, toolCall, state);
+		const prev = id ? state.toolExecByCallId.get(id) : null;
+		const blockIndex = prev?.blockIndex ?? state.activeToolBlockIndex;
+		const name = toolCall && typeof toolCall.name === "string" ? toolCall.name : (prev?.toolName ?? "?");
+		const finalArgsUpdate = extractToolCallArgsFromEvent(event, prev?.rawArgsBuffer ?? state.activeToolRawArgsBuffer);
+		if (blockIndex !== null) {
+			const block = blocks[blockIndex];
+			if (block?.kind === "tool") {
+				const previousArgs = prev?.args ?? block.argsData;
+				const finalArgs =
+					finalArgsUpdate?.args !== undefined ? mergeToolArgs(previousArgs, finalArgsUpdate.args) : previousArgs;
+				block.toolName = name;
+				if (finalArgs !== undefined) {
+					block.argsData = finalArgs;
+					block.argsPreview = formatToolArgs(name, finalArgs);
+				}
+				block.argsComplete = true;
+				if (id) {
+					state.toolExecByCallId.set(id, {
+						blockIndex,
+						toolName: name,
+						args: finalArgs,
+						rawArgsBuffer: finalArgsUpdate?.rawArgsBuffer ?? prev?.rawArgsBuffer,
+						argsComplete: true,
+					});
+				}
+				state.activeToolCallId = null;
+				state.activeToolBlockIndex = null;
+				state.activeToolRawArgsBuffer = undefined;
+				return;
+			}
+		}
+		const block = createPendingToolBlock(name, finalArgsUpdate?.args, true);
+		const idx = pushBlock(blocks, block);
+		if (id) {
+			state.toolExecByCallId.set(id, {
+				blockIndex: idx,
+				toolName: name,
+				args: finalArgsUpdate?.args,
+				rawArgsBuffer: finalArgsUpdate?.rawArgsBuffer,
+				argsComplete: true,
+			});
+		}
+		state.activeToolCallId = null;
+		state.activeToolBlockIndex = null;
+		state.activeToolRawArgsBuffer = undefined;
+		return;
+	}
 	if (type === "done") {
 		state.assistantBlockIndex = null;
 		state.thinkingBlockIndex = null;
@@ -214,37 +380,42 @@ function handleToolExecutionEvent(event: Record<string, unknown>, state: StreamS
 	const type = typeof event.type === "string" ? event.type : "";
 	const toolName = typeof event.toolName === "string" ? event.toolName : "?";
 	const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : null;
-
 	if (type === "tool_execution_start") {
 		const eventArgs = event.args;
 		const args = formatToolArgs(toolName, eventArgs);
-		// Update existing block from toolcall_end if available
+		// Update existing block from toolcall_* if available
 		if (toolCallId) {
 			const prev = state.toolExecByCallId.get(toolCallId);
 			if (prev) {
 				const block = blocks[prev.blockIndex];
 				if (block?.kind === "tool") {
 					if (eventArgs !== undefined) prev.args = eventArgs;
+					prev.argsComplete = true;
 					if (args) block.argsPreview = args;
+					if (eventArgs !== undefined) block.argsData = eventArgs;
+					block.argsComplete = true;
+					if (state.activeToolCallId === toolCallId) {
+						state.activeToolCallId = null;
+						state.activeToolBlockIndex = null;
+						state.activeToolRawArgsBuffer = undefined;
+					}
 					return;
 				}
 			}
 		}
-
 		// No existing block — create new one
-		const block: ToolBlock = {
-			kind: "tool",
-			toolName,
-			argsPreview: args,
-			resultPreview: "",
-			resultContent: "",
-			state: "pending",
-		};
+		const block = createPendingToolBlock(toolName, eventArgs, true);
 		const idx = pushBlock(blocks, block);
-		if (toolCallId) state.toolExecByCallId.set(toolCallId, { blockIndex: idx, toolName, args: eventArgs });
+		if (toolCallId) {
+			state.toolExecByCallId.set(toolCallId, { blockIndex: idx, toolName, args: eventArgs, argsComplete: true });
+			if (state.activeToolCallId === toolCallId) {
+				state.activeToolCallId = null;
+				state.activeToolBlockIndex = null;
+				state.activeToolRawArgsBuffer = undefined;
+			}
+		}
 		return;
 	}
-
 	if (type === "tool_execution_update") {
 		const prev = toolCallId ? state.toolExecByCallId.get(toolCallId) : null;
 		const resultArgs = event.args !== undefined ? event.args : prev?.args;
@@ -254,24 +425,25 @@ function handleToolExecutionEvent(event: Record<string, unknown>, state: StreamS
 			const block = blocks[prev.blockIndex];
 			if (block?.kind === "tool") {
 				if (event.args !== undefined) prev.args = event.args;
+				prev.argsComplete = true;
+				block.argsData = resultArgs;
+				block.argsComplete = true;
 				block.resultContent = partialText;
 				block.resultPreview = partialText ? "" : partial || "…";
+				block.resultData = event.partialResult;
 				return;
 			}
 		}
-		const block: ToolBlock = {
-			kind: "tool",
-			toolName,
-			argsPreview: "",
-			resultPreview: partialText ? "" : partial || "…",
-			resultContent: partialText,
-			state: "pending",
-		};
+		const block = createPendingToolBlock(toolName, resultArgs, true);
+		block.resultPreview = partialText ? "" : partial || "…";
+		block.resultContent = partialText;
+		block.resultData = event.partialResult;
 		const idx = pushBlock(blocks, block);
-		if (toolCallId) state.toolExecByCallId.set(toolCallId, { blockIndex: idx, toolName, args: resultArgs });
+		if (toolCallId) {
+			state.toolExecByCallId.set(toolCallId, { blockIndex: idx, toolName, args: resultArgs, argsComplete: true });
+		}
 		return;
 	}
-
 	if (type === "tool_execution_end") {
 		const isError = event.isError === true;
 		const prev = toolCallId ? state.toolExecByCallId.get(toolCallId) : null;
@@ -281,22 +453,40 @@ function handleToolExecutionEvent(event: Record<string, unknown>, state: StreamS
 		if (prev) {
 			const block = blocks[prev.blockIndex];
 			if (block?.kind === "tool") {
+				if (resultArgs !== undefined) prev.args = resultArgs;
+				prev.argsComplete = true;
+				block.argsData = resultArgs;
+				block.argsComplete = true;
 				block.resultContent = resultText;
 				block.resultPreview = resultText ? "" : result;
+				block.resultData = event.result;
 				block.state = isError ? "error" : "success";
 				if (toolCallId) state.toolExecByCallId.delete(toolCallId);
+				if (state.activeToolCallId === toolCallId) {
+					state.activeToolCallId = null;
+					state.activeToolBlockIndex = null;
+					state.activeToolRawArgsBuffer = undefined;
+				}
 				return;
 			}
 		}
 		pushBlock(blocks, {
 			kind: "tool",
 			toolName,
-			argsPreview: "",
+			argsPreview: resultArgs === undefined ? "" : formatToolArgs(toolName, resultArgs),
+			argsData: resultArgs,
 			resultPreview: resultText ? "" : result,
 			resultContent: resultText,
+			resultData: event.result,
 			state: isError ? "error" : "success",
+			argsComplete: true,
 		});
 		if (toolCallId) state.toolExecByCallId.delete(toolCallId);
+		if (state.activeToolCallId === toolCallId) {
+			state.activeToolCallId = null;
+			state.activeToolBlockIndex = null;
+			state.activeToolRawArgsBuffer = undefined;
+		}
 	}
 }
 
@@ -306,9 +496,25 @@ function handleRpcEvent(event: Record<string, unknown>, state: StreamState, bloc
 
 	// Suppress structural noise
 	if (type === "agent_start" || type === "agent_end") return true;
+	if (type === "initial_prompt") {
+		const content = typeof event.text === "string" ? sanitizeChunk(event.text) : "";
+		if (!content.trim()) return true;
+		state.thinkingBlockIndex = null;
+		state.assistantBlockIndex = null;
+		state.userInputBlockIndex = null;
+		pushBlock(blocks, {
+			kind: "text",
+			text: formatInitialPromptText(content),
+			style: "status",
+			color: FG.accent,
+		});
+		return true;
+	}
 	if (type === "message_start" || type === "message_end") {
 		const message = asRecord(event.message);
-		if (!message || message.role !== "user") return true;
+		if (!message) return true;
+		const role = typeof message.role === "string" ? message.role.trim().toLowerCase() : "";
+		if (role !== "" && role !== "user") return true;
 		const content = extractMessageText(message.content);
 		const hasContent = content.trim().length > 0;
 		if (type === "message_start") {
@@ -385,6 +591,9 @@ function buildRenderBlocks(events: readonly unknown[]): RenderBlock[] {
 		thinkingBlockIndex: null,
 		userInputBlockIndex: null,
 		toolExecByCallId: new Map(),
+		activeToolCallId: null,
+		activeToolBlockIndex: null,
+		activeToolRawArgsBuffer: undefined,
 	};
 
 	for (const event of events) {

@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import * as fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { OmsConfigOverride } from "../config";
@@ -9,7 +10,6 @@ export function ensureDirExists(dir: string): void {
 	if (!fs.existsSync(dir)) {
 		throw new Error(`Target project path does not exist: ${dir}`);
 	}
-
 	const stat = fs.statSync(dir);
 	if (!stat.isDirectory()) {
 		throw new Error(`Target project path is not a directory: ${dir}`);
@@ -78,6 +78,47 @@ export function loadOmsConfigOverride(configPath: string): OmsConfigOverride | n
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
 		throw new Error(`Failed to parse OMS config override: ${configPath}\n${msg}`);
+	}
+}
+
+function mergeOmsConfigOverrides(base: OmsConfigOverride, patch: OmsConfigOverride): OmsConfigOverride {
+	const { layout, roles, ...topLevelPatch } = patch;
+	const merged: OmsConfigOverride = { ...base, ...topLevelPatch };
+
+	if (layout && Object.keys(layout).length > 0) {
+		merged.layout = { ...(merged.layout ?? {}), ...layout };
+	}
+
+	if (roles && Object.keys(roles).length > 0) {
+		const mergedRoles: NonNullable<OmsConfigOverride["roles"]> = { ...(merged.roles ?? {}) };
+		for (const roleKey of Object.keys(roles)) {
+			const rolePatch = roles[roleKey];
+			if (!rolePatch) continue;
+			mergedRoles[roleKey] = { ...(mergedRoles[roleKey] ?? {}), ...rolePatch };
+		}
+		merged.roles = mergedRoles;
+	}
+
+	return merged;
+}
+
+export async function saveOmsConfigOverride(configPath: string, override: OmsConfigOverride): Promise<void> {
+	if (Object.keys(override).length === 0) return;
+
+	const existing = loadOmsConfigOverride(configPath) ?? {};
+	const merged = mergeOmsConfigOverrides(existing, override);
+
+	const dir = path.dirname(configPath);
+	await fsp.mkdir(dir, { recursive: true });
+
+	const tempPath = `${configPath}.tmp-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1_000_000).toString(36)}`;
+	const text = `${JSON.stringify(merged, null, 2)}\n`;
+	await fsp.writeFile(tempPath, text, "utf8");
+	try {
+		await fsp.rename(tempPath, configPath);
+	} catch (err) {
+		await fsp.unlink(tempPath).catch(() => {});
+		throw err;
 	}
 }
 

@@ -1,4 +1,4 @@
-import type { AgentRole, OmsConfig, ThinkingLevel } from "../../config";
+import type { AgentRole, OmsConfig, OmsConfigOverride, RoleConfig, ThinkingLevel } from "../../config";
 import { BG, clipAnsi, FG, RESET, RESET_FG, visibleWidth } from "../colors";
 
 type TerminalLike = {
@@ -20,7 +20,7 @@ type SettingRow = {
 	readOnly?: boolean;
 };
 
-const MODEL_OPTIONS = ["codex", "haiku", "sonnet", "opus"] as const;
+const MODEL_OPTIONS = ["codex", "codex-spark", "haiku", "sonnet", "opus"] as const;
 const THINKING_OPTIONS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 const ROLE_ORDER: readonly Exclude<AgentRole, "singularity">[] = [
 	"worker",
@@ -88,11 +88,18 @@ function roleLabel(role: AgentRole): string {
 	}
 }
 
+function buildRoleOverride(role: Exclude<AgentRole, "singularity">, patch: Partial<RoleConfig>): OmsConfigOverride {
+	const roles: NonNullable<OmsConfigOverride["roles"]> = {};
+	roles[role] = patch;
+	return { roles };
+}
+
 export class SettingsPane {
 	readonly #config: OmsConfig;
 	readonly #onClose: () => void;
 	readonly #onLayoutChanged?: (layout: OmsConfig["layout"]) => void;
 	readonly #onPollIntervalChanged?: (intervalMs: number) => void;
+	readonly #onConfigOverrideChanged?: (override: OmsConfigOverride) => void;
 
 	#selectedIndex = 0;
 	#scrollTop = 0;
@@ -102,11 +109,17 @@ export class SettingsPane {
 		onClose: () => void;
 		onLayoutChanged?: (layout: OmsConfig["layout"]) => void;
 		onPollIntervalChanged?: (intervalMs: number) => void;
+		onConfigOverrideChanged?: (override: OmsConfigOverride) => void;
 	}) {
 		this.#config = opts.config;
 		this.#onClose = opts.onClose;
 		this.#onLayoutChanged = opts.onLayoutChanged;
 		this.#onPollIntervalChanged = opts.onPollIntervalChanged;
+		this.#onConfigOverrideChanged = opts.onConfigOverrideChanged;
+	}
+
+	#persistConfigOverride(override: OmsConfigOverride): void {
+		this.#onConfigOverrideChanged?.(override);
 	}
 
 	handleKey(name: string): boolean {
@@ -254,7 +267,9 @@ export class SettingsPane {
 				label: `${roleLabel(role)} model`,
 				getValue: () => roleCfg.model,
 				change: delta => {
-					roleCfg.model = cycleOption(roleCfg.model, MODEL_OPTIONS, delta);
+					const nextModel = cycleOption(roleCfg.model, MODEL_OPTIONS, delta);
+					roleCfg.model = nextModel;
+					this.#persistConfigOverride(buildRoleOverride(role, { model: nextModel }));
 				},
 			});
 		}
@@ -265,7 +280,9 @@ export class SettingsPane {
 				label: `${roleLabel(role)} thinking`,
 				getValue: () => roleCfg.thinking,
 				change: delta => {
-					roleCfg.thinking = cycleOption(roleCfg.thinking, THINKING_OPTIONS, delta);
+					const nextThinking = cycleOption(roleCfg.thinking, THINKING_OPTIONS, delta);
+					roleCfg.thinking = nextThinking;
+					this.#persistConfigOverride(buildRoleOverride(role, { thinking: nextThinking }));
 				},
 			});
 		}
@@ -275,7 +292,9 @@ export class SettingsPane {
 			getValue: () => String(this.#config.maxWorkers),
 			change: delta => {
 				const step = delta > 0 ? 1 : -1;
-				this.#config.maxWorkers = clampInt(this.#config.maxWorkers + step, 1, 10);
+				const next = clampInt(this.#config.maxWorkers + step, 1, 10);
+				this.#config.maxWorkers = next;
+				this.#persistConfigOverride({ maxWorkers: next });
 			},
 		});
 
@@ -284,7 +303,9 @@ export class SettingsPane {
 			getValue: () => this.#config.layout.tasksHeightRatio.toFixed(2),
 			change: delta => {
 				const step = delta > 0 ? 0.05 : -0.05;
-				this.#config.layout.tasksHeightRatio = round2(clamp(this.#config.layout.tasksHeightRatio + step, 0, 1));
+				const next = round2(clamp(this.#config.layout.tasksHeightRatio + step, 0, 1));
+				this.#config.layout.tasksHeightRatio = next;
+				this.#persistConfigOverride({ layout: { tasksHeightRatio: next } });
 				this.#onLayoutChanged?.(this.#config.layout);
 			},
 		});
@@ -294,7 +315,9 @@ export class SettingsPane {
 			getValue: () => this.#config.layout.agentsWidthRatio.toFixed(2),
 			change: delta => {
 				const step = delta > 0 ? 0.05 : -0.05;
-				this.#config.layout.agentsWidthRatio = round2(clamp(this.#config.layout.agentsWidthRatio + step, 0, 1));
+				const next = round2(clamp(this.#config.layout.agentsWidthRatio + step, 0, 1));
+				this.#config.layout.agentsWidthRatio = next;
+				this.#persistConfigOverride({ layout: { agentsWidthRatio: next } });
 				this.#onLayoutChanged?.(this.#config.layout);
 			},
 		});
@@ -304,7 +327,9 @@ export class SettingsPane {
 			getValue: () => this.#config.layout.systemHeightRatio.toFixed(2),
 			change: delta => {
 				const step = delta > 0 ? 0.05 : -0.05;
-				this.#config.layout.systemHeightRatio = round2(clamp(this.#config.layout.systemHeightRatio + step, 0, 1));
+				const next = round2(clamp(this.#config.layout.systemHeightRatio + step, 0, 1));
+				this.#config.layout.systemHeightRatio = next;
+				this.#persistConfigOverride({ layout: { systemHeightRatio: next } });
 				this.#onLayoutChanged?.(this.#config.layout);
 			},
 		});
@@ -316,6 +341,7 @@ export class SettingsPane {
 				const step = delta > 0 ? 250 : -250;
 				const next = clampInt(this.#config.pollIntervalMs + step, 100, 120_000);
 				this.#config.pollIntervalMs = next;
+				this.#persistConfigOverride({ pollIntervalMs: next });
 				this.#onPollIntervalChanged?.(next);
 			},
 		});
@@ -325,11 +351,9 @@ export class SettingsPane {
 			getValue: () => String(this.#config.steeringIntervalMs),
 			change: delta => {
 				const step = delta > 0 ? 60_000 : -60_000;
-				this.#config.steeringIntervalMs = clampInt(
-					this.#config.steeringIntervalMs + step,
-					1_000,
-					24 * 60 * 60 * 1000,
-				);
+				const next = clampInt(this.#config.steeringIntervalMs + step, 1_000, 24 * 60 * 60 * 1000);
+				this.#config.steeringIntervalMs = next;
+				this.#persistConfigOverride({ steeringIntervalMs: next });
 			},
 		});
 

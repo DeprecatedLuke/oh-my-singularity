@@ -30,6 +30,46 @@ function keyDataToString(data: any): string | null {
 	return null;
 }
 
+export function viewportHasRenderableText(term: Terminal, rows: number): boolean {
+	if (rows <= 0) return false;
+
+	try {
+		const buf = term.buffer.active;
+		const startY = buf.viewportY;
+
+		for (let row = 0; row < rows; row += 1) {
+			const line = buf.getLine(startY + row);
+			const text = line ? line.translateToString(true) : "";
+			if (text.trim().length > 0) return true;
+		}
+
+		return false;
+	} catch {
+		return true; // assume visible to avoid getting stuck in "starting" state
+	}
+}
+
+export function buildSingularityPtyEnv(
+	baseEnv: NodeJS.ProcessEnv,
+	extraEnv: Record<string, string> | undefined,
+	cols: number,
+	rows: number,
+): Record<string, string> {
+	const merged: Record<string, string | undefined> = {
+		...baseEnv,
+		...(extraEnv ?? {}),
+		TERM: "xterm-256color",
+		COLORTERM: "truecolor",
+		COLUMNS: String(Math.max(1, cols)),
+		LINES: String(Math.max(1, rows)),
+	};
+	const env: Record<string, string> = {};
+	for (const [key, value] of Object.entries(merged)) {
+		if (typeof value === "string") env[key] = value;
+	}
+	return env;
+}
+
 export class SingularityPane {
 	readonly #ompCli: string;
 	readonly #args: string[];
@@ -137,12 +177,7 @@ export class SingularityPane {
 				cwd: this.#cwd,
 				cols: this.#cols,
 				rows: this.#rows,
-				env: {
-					...process.env,
-					TERM: "xterm-256color",
-					COLORTERM: "truecolor",
-					...(this.#extraEnv ?? {}),
-				},
+				env: buildSingularityPtyEnv(process.env, this.#extraEnv, this.#cols, this.#rows),
 			});
 		} catch (err) {
 			this.#lastError = err instanceof Error ? err.message : String(err);
@@ -225,21 +260,7 @@ export class SingularityPane {
 	}
 
 	#detectVisibleOutput(): boolean {
-		try {
-			const buf = this.#term.buffer.active;
-			const startY = buf.viewportY;
-			const maxRows = Math.min(this.#rows, 6);
-
-			for (let row = 0; row < maxRows; row += 1) {
-				const line = buf.getLine(startY + row);
-				const text = line ? line.translateToString(true) : "";
-				if (text.trim().length > 0) return true;
-			}
-
-			return false;
-		} catch {
-			return true; // assume visible to avoid getting stuck in "starting" state
-		}
+		return viewportHasRenderableText(this.#term, this.#rows);
 	}
 
 	#getTailPlainLines(maxLines: number): string[] {
@@ -369,96 +390,121 @@ function formatCmd(cmd: readonly string[]): string {
 		.join(" ");
 }
 
-function renderBufferLineAnsi(line: any | undefined, nullCell: any, width: number): string {
-	// Render xterm buffer cells into ANSI SGR sequences (colors/styles) + chars.
-	// Always emit exactly `width` columns worth of characters.
+const XTERM_COLOR_MODE_ANSI16 = 1 << 24;
 
+function pushAnsi16ColorCode(codes: string[], color: number, dimBase: number, brightBase: number): boolean {
+	if (!Number.isInteger(color)) return false;
+	if (color >= 0 && color <= 7) {
+		codes.push(String(dimBase + color));
+		return true;
+	}
+	if (color >= 8 && color <= 15) {
+		codes.push(String(brightBase + (color - 8)));
+		return true;
+	}
+	return false;
+}
+
+export function renderBufferLineAnsi(line: any | undefined, nullCell: any, width: number): string {
+	// Render xterm buffer cells into ANSI SGR sequences (colors/styles) + chars.
+	// Emit exactly `width` visible columns by terminal display width.
 	let out = "\x1b[0m";
 	let prevKey = "d";
-
 	const defaultCell = null;
+	let x = 0;
+	let renderedWidth = 0;
 
-	for (let x = 0; x < width; ) {
+	const appendDefaultSpaces = (count: number) => {
+		if (count <= 0) return;
+		if (prevKey !== "d") {
+			out += "\x1b[0m";
+			prevKey = "d";
+		}
+		out += " ".repeat(count);
+		renderedWidth += count;
+	};
+
+	const getDisplayWidth = (chars: string, fallbackWidth: number): number => {
+		if (chars.length === 1) {
+			const code = chars.charCodeAt(0);
+			if (code >= 0x20 && code <= 0x7e) return 1;
+		}
+		const displayWidth = Bun.stringWidth(chars);
+		if (displayWidth > 0) return displayWidth;
+		return Math.max(1, fallbackWidth);
+	};
+
+	while (x < width && renderedWidth < width) {
 		const cell = line?.getCell ? line.getCell(x, nullCell) : defaultCell;
-
 		if (!cell) {
-			if (prevKey !== "d") {
-				out += "\x1b[0m";
-				prevKey = "d";
-			}
-			out += " ";
+			appendDefaultSpaces(1);
 			x += 1;
 			continue;
 		}
-
 		const w = typeof cell.getWidth === "function" ? cell.getWidth() : 1;
 		if (w <= 0) {
 			x += 1;
 			continue;
 		}
-
 		if (x + w > width) {
 			// Wide char clipped by viewport width.
-			if (prevKey !== "d") {
-				out += "\x1b[0m";
-				prevKey = "d";
-			}
-			out += " ";
+			appendDefaultSpaces(1);
 			x += 1;
 			continue;
 		}
-
 		const key = styleKey(cell);
 		if (key !== prevKey) {
 			out += sgrForCell(cell);
 			prevKey = key;
 		}
-
 		let chars = typeof cell.getChars === "function" ? cell.getChars() : "";
 		if (!chars) {
 			chars = w > 1 ? " ".repeat(w) : " ";
 		}
-
 		if (typeof cell.isInvisible === "function" && cell.isInvisible()) {
-			chars = " ".repeat(w);
+			chars = " ".repeat(Math.max(1, w));
 		}
-
+		const displayWidth = getDisplayWidth(chars, w);
+		const remaining = width - renderedWidth;
+		if (displayWidth > remaining) {
+			appendDefaultSpaces(remaining);
+			break;
+		}
 		out += chars;
+		renderedWidth += displayWidth;
 		x += w;
+	}
+
+	if (renderedWidth < width) {
+		appendDefaultSpaces(width - renderedWidth);
 	}
 
 	out += "\x1b[0m";
 	return out;
 }
-
 function styleKey(cell: any): string {
 	if (!cell) return "d";
 	if (typeof cell.isAttributeDefault === "function" && cell.isAttributeDefault()) return "d";
-
 	const fgMode = typeof cell.getFgColorMode === "function" ? cell.getFgColorMode() : 0;
 	const bgMode = typeof cell.getBgColorMode === "function" ? cell.getBgColorMode() : 0;
 	const fg = typeof cell.getFgColor === "function" ? cell.getFgColor() : 0;
 	const bg = typeof cell.getBgColor === "function" ? cell.getBgColor() : 0;
-
 	const flags = [
 		typeof cell.isBold === "function" && cell.isBold() ? 1 : 0,
 		typeof cell.isDim === "function" && cell.isDim() ? 1 : 0,
 		typeof cell.isItalic === "function" && cell.isItalic() ? 1 : 0,
 		typeof cell.isUnderline === "function" && cell.isUnderline() ? 1 : 0,
+		typeof cell.isBlink === "function" && cell.isBlink() ? 1 : 0,
 		typeof cell.isInverse === "function" && cell.isInverse() ? 1 : 0,
 		typeof cell.isStrikethrough === "function" && cell.isStrikethrough() ? 1 : 0,
 		typeof cell.isOverline === "function" && cell.isOverline() ? 1 : 0,
 	].join("");
-
 	return `${fgMode}:${fg}:${bgMode}:${bg}:${flags}`;
 }
-
 function sgrForCell(cell: any): string {
 	if (!cell) return "\x1b[0m";
 	if (typeof cell.isAttributeDefault === "function" && cell.isAttributeDefault()) return "\x1b[0m";
-
 	const codes: string[] = ["0"]; // start with reset
-
 	if (typeof cell.isBold === "function" && cell.isBold()) codes.push("1");
 	if (typeof cell.isDim === "function" && cell.isDim()) codes.push("2");
 	if (typeof cell.isItalic === "function" && cell.isItalic()) codes.push("3");
@@ -467,30 +513,43 @@ function sgrForCell(cell: any): string {
 	if (typeof cell.isInverse === "function" && cell.isInverse()) codes.push("7");
 	if (typeof cell.isStrikethrough === "function" && cell.isStrikethrough()) codes.push("9");
 	if (typeof cell.isOverline === "function" && cell.isOverline()) codes.push("53");
-
-	// Foreground
-	if (typeof cell.isFgRGB === "function" && cell.isFgRGB()) {
+	const hasFgRgb = typeof cell.isFgRGB === "function" && cell.isFgRGB();
+	const hasFgPalette = typeof cell.isFgPalette === "function" && cell.isFgPalette();
+	if (hasFgRgb) {
 		const c = typeof cell.getFgColor === "function" ? cell.getFgColor() : 0;
 		const r = (c >> 16) & 0xff;
 		const g = (c >> 8) & 0xff;
 		const b = c & 0xff;
 		codes.push(`38;2;${r};${g};${b}`);
-	} else if (typeof cell.isFgPalette === "function" && cell.isFgPalette()) {
+	} else if (hasFgPalette) {
+		const mode = typeof cell.getFgColorMode === "function" ? cell.getFgColorMode() : 0;
 		const n = typeof cell.getFgColor === "function" ? cell.getFgColor() : 0;
-		codes.push(`38;5;${n}`);
+		if (mode === XTERM_COLOR_MODE_ANSI16) {
+			if (!pushAnsi16ColorCode(codes, n, 30, 90)) codes.push(`38;5;${n}`);
+		} else {
+			codes.push(`38;5;${n}`);
+		}
 	}
-
+	const hasBgRgb = typeof cell.isBgRGB === "function" && cell.isBgRGB();
+	const hasBgPalette = typeof cell.isBgPalette === "function" && cell.isBgPalette();
+	if ((hasBgRgb || hasBgPalette) && !hasFgRgb && !hasFgPalette) {
+		codes.push("97");
+	}
 	// Background
-	if (typeof cell.isBgRGB === "function" && cell.isBgRGB()) {
+	if (hasBgRgb) {
 		const c = typeof cell.getBgColor === "function" ? cell.getBgColor() : 0;
 		const r = (c >> 16) & 0xff;
 		const g = (c >> 8) & 0xff;
 		const b = c & 0xff;
 		codes.push(`48;2;${r};${g};${b}`);
-	} else if (typeof cell.isBgPalette === "function" && cell.isBgPalette()) {
+	} else if (hasBgPalette) {
+		const mode = typeof cell.getBgColorMode === "function" ? cell.getBgColorMode() : 0;
 		const n = typeof cell.getBgColor === "function" ? cell.getBgColor() : 0;
-		codes.push(`48;5;${n}`);
+		if (mode === XTERM_COLOR_MODE_ANSI16) {
+			if (!pushAnsi16ColorCode(codes, n, 40, 100)) codes.push(`48;5;${n}`);
+		} else {
+			codes.push(`48;5;${n}`);
+		}
 	}
-
 	return `\x1b[${codes.join(";")}m`;
 }
