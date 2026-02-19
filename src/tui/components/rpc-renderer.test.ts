@@ -53,7 +53,6 @@ describe("rpc renderer tool and wake rendering", () => {
 		expect(output).toContain("list (1)");
 		expect(output).toContain("task-1");
 		expect(output).not.toContain('{"id":"task-1"');
-		expect(output).toContain("─── list (1)");
 		expect(output).not.toContain("│ │");
 	});
 
@@ -359,6 +358,7 @@ describe("rpc renderer tool and wake rendering", () => {
 		expect(output).toContain("alice");
 		expect(output).toContain("Needs retry");
 		expect(output).not.toContain('"issue_id":"task-1"');
+		expect(output).not.toContain("───");
 	});
 
 	test("renders tasks no-output and error responses", () => {

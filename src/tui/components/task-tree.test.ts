@@ -48,6 +48,26 @@ describe("renderTaskTreeLines", () => {
 		expect(readyLine?.text).toContain("(ready)");
 	});
 
+	test("shows scope in task rows when present", () => {
+		const scoped = makeIssue("task-scope", {
+			title: "Scoped",
+			scope: "small",
+		});
+		const plain = makeIssue("task-plain", {
+			title: "Plain",
+		});
+
+		const rendered = renderTaskTreeLines([scoped, plain], 1000).map(line => ({
+			id: line.issue.id,
+			text: stripAnsi(line.text),
+		}));
+
+		const scopedLine = rendered.find(line => line.id === "task-scope");
+		expect(scopedLine?.text).toContain("Scoped [small]");
+		const plainLine = rendered.find(line => line.id === "task-plain");
+		expect(plainLine?.text).not.toContain("Plain [");
+	});
+
 	test("excludes closed/done dependencies from tree edges", () => {
 		const closedDependency = makeIssue("task-closed", { status: "closed" });
 		const doneDependency = makeIssue("task-done", { status: "done" });

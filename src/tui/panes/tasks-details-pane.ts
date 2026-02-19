@@ -14,7 +14,7 @@ import { asRecord } from "../../utils";
 import { BOLD, clipAnsi, FG, RESET, visibleWidth } from "../colors";
 import { renderMarkdownLines } from "../components/markdown";
 import { formatTokens } from "../utils/format";
-import { formatIssuePriority, formatIssueStatusStyled } from "../utils/task-issue-format";
+import { formatIssuePriority, formatIssueScope, formatIssueStatusStyled } from "../utils/task-issue-format";
 import type { TasksPane } from "./tasks-pane";
 
 type TerminalLike = {
@@ -134,9 +134,15 @@ export class TasksDetailsPane {
 			lines.push(issue.title);
 			const statusLabel = formatMetadataLabel("status:");
 			const priorityLabel = formatMetadataLabel("prio:");
-			lines.push(
-				`${statusLabel} ${formatIssueStatusStyled(issue.status)}  ${priorityLabel} ${formatIssuePriority(issue.priority)}`,
-			);
+			const metadataParts = [
+				`${statusLabel} ${formatIssueStatusStyled(issue.status)}`,
+				`${priorityLabel} ${formatIssuePriority(issue.priority)}`,
+			];
+			const scope = formatIssueScope(issue.scope);
+			if (scope) {
+				metadataParts.push(`${formatMetadataLabel("scope:")} ${scope}`);
+			}
+			lines.push(metadataParts.join("  "));
 			const assignee = issue.assignee ? issue.assignee : "(none)";
 			lines.push(`${formatMetadataLabel("assignee:")} ${assignee}`);
 			if (issue.labels?.length) {

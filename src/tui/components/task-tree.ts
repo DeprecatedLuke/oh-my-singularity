@@ -202,7 +202,9 @@ export function renderTaskTreeLines(issues: readonly TaskIssue[], width: number)
 		const marker = statusMarker(String(issue.status));
 		const prefix = depth > 0 ? `${"  ".repeat(depth)}\u21b3 ` : "";
 		const hasActiveDeps = (activeDependenciesByIssueId.get(issue.id) ?? []).length > 0;
-		const base = `${prefix}${marker} ${issue.title}${renderStatusHint(issue, hasActiveDeps)}`;
+		const scope = typeof issue.scope === "string" ? issue.scope.trim() : "";
+		const scopeText = scope ? ` ${FG.dim}[${scope}]${RESET}` : "";
+		const base = `${prefix}${marker} ${issue.title}${scopeText}${renderStatusHint(issue, hasActiveDeps)}`;
 		lines.push({ issue, depth, text: clip(base, width) });
 		const children = childrenByIssueId.get(issue.id) ?? [];
 		for (const child of children) {

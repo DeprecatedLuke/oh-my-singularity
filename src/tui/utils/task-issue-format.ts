@@ -48,3 +48,22 @@ export function formatIssuePriority(priority: unknown): string {
 	if (priority <= 2) return `${FG.accent}${text}${RESET}`;
 	return `${FG.dim}${text}${RESET}`;
 }
+
+export function formatIssueScope(scope: unknown): string {
+	const text = typeof scope === "string" ? scope.trim() : "";
+	if (!text) return "";
+	const normalized = text.toLowerCase();
+	switch (normalized) {
+		case "tiny":
+		case "small":
+			return `${FG.success}${text}${RESET}`;
+		case "medium":
+			return `${FG.accent}${text}${RESET}`;
+		case "large":
+			return `${FG.warning}${text}${RESET}`;
+		case "xlarge":
+			return `${BOLD}${FG.error}${text}${RESET}`;
+		default:
+			return `${FG.muted}${text}${RESET}`;
+	}
+}

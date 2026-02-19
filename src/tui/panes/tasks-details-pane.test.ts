@@ -125,6 +125,36 @@ describe("TasksDetailsPane", () => {
 		expect(rendered).toContain("task-a, task-b");
 	});
 
+	test("renders scope metadata when present", async () => {
+		const selectedIssue = makeIssue({
+			scope: "large",
+		});
+		const tasksClient = {
+			show: async () => ({ ...selectedIssue }),
+		} as unknown as TaskStoreClient;
+
+		const tasksPane = {
+			getSelectedIssueId: () => selectedIssue.id,
+			getSelectedIssue: () => selectedIssue,
+		};
+
+		const pane = new TasksDetailsPane({
+			tasksClient,
+			tasksPane: tasksPane as never,
+		});
+
+		const term = createTerminalStub();
+		const region: Region = { x: 1, y: 1, width: 100, height: 20 };
+
+		pane.render(term.term, region);
+		await Bun.sleep(0);
+		term.reset();
+		pane.render(term.term, region);
+		const rendered = term.text();
+		expect(rendered).toContain("scope:");
+		expect(rendered).toContain("large");
+	});
+
 	test("shows per-agent full usage and cost breakdown for selected task", async () => {
 		const selectedIssue = makeIssue();
 		const tasksClient = {
