@@ -53,6 +53,7 @@ function createLoopStub(overrides: Record<string, unknown> = {}) {
 		advanceFastWorkerLifecycle: (opts: unknown) => ({ ok: true, opts }),
 		advanceFinisherLifecycle: (opts: unknown) => ({ ok: true, opts }),
 		handleFinisherCloseTask: async (opts: unknown) => ({ ok: true, opts }),
+		handleFastWorkerCloseTask: async (opts: unknown) => ({ ok: true, opts }),
 		handleExternalTaskClose: async (_taskId: string) => {},
 		broadcastToWorkers: async (_message: string, _meta?: unknown) => {},
 		interruptAgent: async (_taskId: string, _message: string) => true,
@@ -1290,7 +1291,7 @@ describe("handleIpcMessage", () => {
 		}
 	});
 
-	test("issuer_advance_lifecycle, fast_worker_advance_lifecycle, and finisher_advance_lifecycle return unavailable when loop is missing", async () => {
+	test("issuer/fast-worker/finisher lifecycle IPC and fast_worker_close_task return unavailable when loop is missing", async () => {
 		const tasksClient = {} as unknown as TaskStoreClient;
 		const registry = createRegistry(tasksClient);
 		const issuerResponse = await handleIpcMessage({
@@ -1307,6 +1308,13 @@ describe("handleIpcMessage", () => {
 			tasksClient,
 			systemAgentId: "system",
 		});
+		const fastWorkerCloseResponse = await handleIpcMessage({
+			payload: { type: "fast_worker_close_task", taskId: "task-1", reason: "done", agentId: "fast-1" },
+			loop: null,
+			registry,
+			tasksClient,
+			systemAgentId: "system",
+		});
 		const finisherResponse = await handleIpcMessage({
 			payload: { type: "finisher_advance_lifecycle", taskId: "task-1", action: "worker" },
 			loop: null,
@@ -1316,18 +1324,21 @@ describe("handleIpcMessage", () => {
 		});
 		expect(issuerResponse).toEqual({ ok: false, summary: "Agent loop unavailable" });
 		expect(fastWorkerResponse).toEqual({ ok: false, summary: "Agent loop unavailable" });
+		expect(fastWorkerCloseResponse).toEqual({ ok: false, summary: "Agent loop unavailable" });
 		expect(finisherResponse).toEqual({ ok: false, summary: "Agent loop unavailable" });
 	});
 
-	test("issuer_advance_lifecycle, fast_worker_advance_lifecycle, finisher_advance_lifecycle, and finisher_close_task delegate to loop", async () => {
+	test("issuer/fast-worker/finisher lifecycle IPC and close-task IPC delegate to loop", async () => {
 		const calls: {
 			issuer: unknown[];
 			fastWorkerAdvance: unknown[];
+			fastWorkerClose: unknown[];
 			finisherAdvance: unknown[];
 			finisherClose: unknown[];
 		} = {
 			issuer: [],
 			fastWorkerAdvance: [],
+			fastWorkerClose: [],
 			finisherAdvance: [],
 			finisherClose: [],
 		};
@@ -1339,6 +1350,10 @@ describe("handleIpcMessage", () => {
 			advanceFastWorkerLifecycle: (opts: unknown) => {
 				calls.fastWorkerAdvance.push(opts);
 				return { ok: true, kind: "fast-worker-advance" };
+			},
+			handleFastWorkerCloseTask: async (opts: unknown) => {
+				calls.fastWorkerClose.push(opts);
+				return { ok: true, kind: "fast-worker-close" };
 			},
 			advanceFinisherLifecycle: (opts: unknown) => {
 				calls.finisherAdvance.push(opts);
@@ -1379,6 +1394,13 @@ describe("handleIpcMessage", () => {
 			tasksClient,
 			systemAgentId: "system",
 		});
+		const fastWorkerClose = await handleIpcMessage({
+			payload: { type: "fast_worker_close_task", taskId: "task-1", reason: "done", agentId: "fast-1" },
+			loop: loop as never,
+			registry,
+			tasksClient,
+			systemAgentId: "system",
+		});
 		const finisherAdvance = await handleIpcMessage({
 			payload: {
 				type: "finisher_advance_lifecycle",
@@ -1402,10 +1424,12 @@ describe("handleIpcMessage", () => {
 		});
 		expect(issuer).toEqual({ ok: true, kind: "issuer" });
 		expect(fastWorkerAdvance).toEqual({ ok: true, kind: "fast-worker-advance" });
+		expect(fastWorkerClose).toEqual({ ok: true, kind: "fast-worker-close" });
 		expect(finisherAdvance).toEqual({ ok: true, kind: "finisher-advance" });
 		expect(finisherClose).toEqual({ ok: true, kind: "finisher-close" });
 		expect(calls.issuer).toHaveLength(1);
 		expect(calls.fastWorkerAdvance).toHaveLength(1);
+		expect(calls.fastWorkerClose).toHaveLength(1);
 		expect(calls.finisherAdvance).toHaveLength(1);
 		expect(calls.finisherClose).toHaveLength(1);
 	});

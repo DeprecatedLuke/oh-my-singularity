@@ -41,6 +41,13 @@ export interface FastWorkerAdvanceLifecycleMessage extends IPCMessageBase {
 	agentId: string;
 }
 
+export interface FastWorkerCloseTaskMessage extends IPCMessageBase {
+	type: "fast_worker_close_task";
+	taskId: string;
+	reason: string;
+	agentId: string;
+}
+
 export interface FinisherAdvanceLifecycleMessage extends IPCMessageBase {
 	type: "finisher_advance_lifecycle";
 	taskId: string;
@@ -146,6 +153,7 @@ export interface IPCMessageMap {
 	tasks_request: TasksRequestMessage;
 	issuer_advance_lifecycle: IssuerAdvanceLifecycleMessage;
 	fast_worker_advance_lifecycle: FastWorkerAdvanceLifecycleMessage;
+	fast_worker_close_task: FastWorkerCloseTaskMessage;
 	finisher_advance_lifecycle: FinisherAdvanceLifecycleMessage;
 	finisher_close_task: FinisherCloseTaskMessage;
 	merger_complete: MergerCompleteMessage;
@@ -181,6 +189,7 @@ const CORE_IPC_MESSAGE_TYPES = [
 	"tasks_request",
 	"issuer_advance_lifecycle",
 	"fast_worker_advance_lifecycle",
+	"fast_worker_close_task",
 	"finisher_advance_lifecycle",
 	"finisher_close_task",
 	"merger_complete",
@@ -412,6 +421,25 @@ export function parseIPCMessage(payload: unknown): ParseIPCMessageResult {
 					taskId: taskId.value,
 					action: action.value,
 					message: message.value,
+					reason: reason.value,
+					agentId: agentId.value,
+				},
+			};
+		}
+
+		case "fast_worker_close_task": {
+			const taskId = readStringField(rec, rawType, "taskId");
+			if (!taskId.ok) return taskId;
+			const reason = readStringField(rec, rawType, "reason");
+			if (!reason.ok) return reason;
+			const agentId = readStringField(rec, rawType, "agentId");
+			if (!agentId.ok) return agentId;
+			return {
+				ok: true,
+				message: {
+					...rec,
+					type: rawType,
+					taskId: taskId.value,
 					reason: reason.value,
 					agentId: agentId.value,
 				},

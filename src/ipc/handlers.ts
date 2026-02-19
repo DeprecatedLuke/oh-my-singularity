@@ -609,6 +609,29 @@ export async function handleIpcMessage(opts: {
 		return result;
 	}
 
+	if (t === "fast_worker_close_task") {
+		const taskId = typeof (rec as any)?.taskId === "string" ? (rec as any).taskId : "";
+		const reason = typeof rec?.reason === "string" ? rec.reason : "";
+		const agentId = typeof (rec as any)?.agentId === "string" ? (rec as any).agentId : "";
+		opts.registry.pushEvent(opts.systemAgentId, {
+			type: "log",
+			ts: Date.now(),
+			level: "info",
+			message: `IPC: fast_worker_close_task taskId=${taskId}`,
+			data: opts.payload,
+		});
+		if (!opts.loop) {
+			refresh();
+			return { ok: false, summary: "Agent loop unavailable" };
+		}
+		const result = opts.loop.handleFastWorkerCloseTask({
+			taskId,
+			reason,
+			agentId: agentId || undefined,
+		});
+		refresh();
+		return result;
+	}
 	if (t === "finisher_advance_lifecycle") {
 		const taskId = typeof (rec as any)?.taskId === "string" ? (rec as any).taskId : "";
 		const action = typeof (rec as any)?.action === "string" ? (rec as any).action : "";

@@ -590,6 +590,36 @@ describe("AgentLoop delegation", () => {
 		expect(calls.updateStatus).toEqual([]);
 		expect(calls.comment).toEqual([]);
 	});
+	test("handleFastWorkerCloseTask validates task id, closes task, and aborts active fast-worker rpc", async () => {
+		const { loop, registry, calls } = createLoopFixture();
+		const abortCalls: string[] = [];
+		registry.register({
+			id: "fast-worker:task-1",
+			role: "fast-worker",
+			taskId: "task-1",
+			tasksAgentId: "agent-fast-worker",
+			status: "running",
+			usage: createEmptyAgentUsage(),
+			events: [],
+			spawnedAt: 1,
+			lastActivity: 2,
+			rpc: makeRpc({ abort: async () => abortCalls.push("fast-worker:task-1") }),
+		});
+
+		const invalid = await loop.handleFastWorkerCloseTask({ taskId: "   " });
+		expect(invalid).toEqual({ ok: false, summary: "fast_worker_close_task rejected: taskId is required" });
+
+		const result = (await loop.handleFastWorkerCloseTask({
+			taskId: "task-1",
+			reason: "tiny done",
+			agentId: "fast-1",
+		})) as { ok: boolean; abortedFastWorkerCount: number };
+		expect(result.ok).toBe(true);
+		expect(result.abortedFastWorkerCount).toBe(1);
+		expect(calls.close).toEqual([{ taskId: "task-1", reason: "tiny done" }]);
+		expect(abortCalls).toEqual(["fast-worker:task-1"]);
+	});
+
 	test("handleFinisherCloseTask validates task id, closes task, and aborts active finisher rpc", async () => {
 		const { loop, registry, calls } = createLoopFixture();
 		const abortCalls: string[] = [];

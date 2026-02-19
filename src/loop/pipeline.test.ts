@@ -634,6 +634,44 @@ describe("PipelineManager finisher lifecycle tracking", () => {
 		expect(pipeline.takeFinisherLifecycleAdvance("task-finish")).toBeNull();
 	});
 
+	test("records and retrieves fast-worker close markers and clears fast-worker lifecycle advance", () => {
+		type FastWorkerCloseRecord = {
+			taskId: string;
+			reason: string | null;
+			agentId: string | null;
+			ts: number;
+		};
+		type FastWorkerLifecycleAdvanceRecord = {
+			taskId: string;
+			action: "done" | "escalate";
+			message: string | null;
+			reason: string | null;
+			agentId: string | null;
+			ts: number;
+		};
+		const pipeline = createLifecyclePipeline();
+		pipeline.advanceFastWorkerLifecycle({
+			taskId: "task-fast",
+			action: "done",
+			message: "completed",
+			reason: "ready",
+			agentId: "fast-1",
+		});
+		pipeline.recordFastWorkerClose({ taskId: "task-fast", reason: "done", agentId: "fast-1" });
+		const fastWorkerLifecycleApi = pipeline as unknown as {
+			takeFastWorkerCloseRecord: (taskId: string) => FastWorkerCloseRecord | null;
+			takeFastWorkerLifecycleAdvance: (taskId: string) => FastWorkerLifecycleAdvanceRecord | null;
+		};
+
+		const closeRecord = fastWorkerLifecycleApi.takeFastWorkerCloseRecord("task-fast");
+		expect(closeRecord).toMatchObject({
+			taskId: "task-fast",
+			reason: "done",
+			agentId: "fast-1",
+		});
+		expect(fastWorkerLifecycleApi.takeFastWorkerCloseRecord("task-fast")).toBeNull();
+		expect(fastWorkerLifecycleApi.takeFastWorkerLifecycleAdvance("task-fast")).toBeNull();
+	});
 	test("records and retrieves finisher close markers", () => {
 		const pipeline = createLifecyclePipeline();
 		pipeline.recordFinisherClose({ taskId: "task-finish", reason: "done", agentId: "finisher-1" });
@@ -653,6 +691,7 @@ describe("PipelineManager tiny-scope fast-worker routing", () => {
 		runFastWorkerForTask: () => Promise<{
 			done: boolean;
 			escalate: boolean;
+			closed: boolean;
 			message: string | null;
 			reason: string | null;
 			raw: string | null;
@@ -717,6 +756,7 @@ describe("PipelineManager tiny-scope fast-worker routing", () => {
 				runFastWorkerForTask: (task: TaskIssue) => Promise<{
 					done: boolean;
 					escalate: boolean;
+					closed: boolean;
 					message: string | null;
 					reason: string | null;
 					raw: string | null;
@@ -745,6 +785,7 @@ describe("PipelineManager tiny-scope fast-worker routing", () => {
 			runFastWorkerForTask: async () => ({
 				done: true,
 				escalate: false,
+				closed: false,
 				message: "tiny change complete",
 				reason: null,
 				raw: "{}",
@@ -766,11 +807,39 @@ describe("PipelineManager tiny-scope fast-worker routing", () => {
 		expect(calls.finisherOutputs).toEqual(["tiny change complete"]);
 	});
 
+	test("tiny scope fast-worker close path skips issuer/worker/finisher spawn", async () => {
+		const { pipeline, calls } = createTinyScopeFixture({
+			runFastWorkerForTask: async () => ({
+				done: true,
+				escalate: false,
+				closed: true,
+				message: "closed directly",
+				reason: null,
+				raw: "{}",
+			}),
+			runIssuerForTask: async () => {
+				throw new Error("issuer should not run");
+			},
+		});
+		const task: TaskIssue = { ...makeTask("tiny-closed"), scope: "tiny" };
+
+		await (pipeline as unknown as { runNewTaskPipeline: (task: TaskIssue) => Promise<void> }).runNewTaskPipeline(
+			task,
+		);
+
+		expect(calls.runFastWorkerForTask).toBe(1);
+		expect(calls.runIssuerForTask).toBe(0);
+		expect(calls.spawnWorker).toBe(0);
+		expect(calls.spawnFinisher).toBe(0);
+		expect(calls.finisherOutputs).toEqual([]);
+	});
+
 	test("tiny scope escalation falls through to issuer and spawns worker", async () => {
 		const { pipeline, calls } = createTinyScopeFixture({
 			runFastWorkerForTask: async () => ({
 				done: false,
 				escalate: true,
+				closed: false,
 				message: "touches broader lifecycle code",
 				reason: "requires decomposition",
 				raw: "{}",

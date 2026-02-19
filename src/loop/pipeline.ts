@@ -32,6 +32,12 @@ type FastWorkerLifecycleAdvanceRecord = {
 	agentId: string | null;
 	ts: number;
 };
+type FastWorkerCloseRecord = {
+	taskId: string;
+	reason: string | null;
+	agentId: string | null;
+	ts: number;
+};
 type FinisherLifecycleAction = "worker" | "issuer" | "defer";
 type FinisherLifecycleAdvanceRecord = {
 	taskId: string;
@@ -82,6 +88,7 @@ export class PipelineManager {
 	private readonly pipelineInFlight = new Set<string>();
 	private readonly issuerLifecycleByTask = new Map<string, IssuerLifecycleAdvanceRecord>();
 	private readonly fastWorkerLifecycleByTask = new Map<string, FastWorkerLifecycleAdvanceRecord>();
+	private readonly fastWorkerCloseByTask = new Map<string, FastWorkerCloseRecord>();
 	private readonly finisherLifecycleByTask = new Map<string, FinisherLifecycleAdvanceRecord>();
 	private readonly finisherCloseByTask = new Map<string, FinisherCloseRecord>();
 
@@ -292,6 +299,35 @@ export class PipelineManager {
 			reason: next.reason,
 			agentId: next.agentId,
 		};
+	}
+
+	recordFastWorkerClose(opts: { taskId?: string; reason?: string; agentId?: string }): FastWorkerCloseRecord | null {
+		const taskId = typeof opts.taskId === "string" ? opts.taskId.trim() : "";
+		if (!taskId) return null;
+
+		const reason = typeof opts.reason === "string" ? opts.reason.trim() : "";
+		const agentId = typeof opts.agentId === "string" ? opts.agentId.trim() : "";
+		const current = this.fastWorkerCloseByTask.get(taskId);
+		const next: FastWorkerCloseRecord = {
+			taskId,
+			reason: reason || null,
+			agentId: agentId || null,
+			ts: Date.now(),
+		};
+		this.fastWorkerLifecycleByTask.delete(taskId);
+		this.fastWorkerCloseByTask.set(taskId, next);
+
+		this.loopLog(
+			current ? `Fast-worker close marker updated for ${taskId}` : `Fast-worker close marker recorded for ${taskId}`,
+			current ? "warn" : "info",
+			{
+				taskId,
+				reason: next.reason,
+				agentId: next.agentId,
+			},
+		);
+
+		return next;
 	}
 
 	advanceFinisherLifecycle(opts: {
@@ -698,6 +734,7 @@ export class PipelineManager {
 	): Promise<{
 		done: boolean;
 		escalate: boolean;
+		closed: boolean;
 		message: string | null;
 		reason: string | null;
 		raw: string | null;
@@ -705,6 +742,7 @@ export class PipelineManager {
 		type FastWorkerResult = {
 			done: boolean;
 			escalate: boolean;
+			closed: boolean;
 			message: string | null;
 			reason: string | null;
 			raw: string | null;
@@ -726,11 +764,11 @@ export class PipelineManager {
 			} catch {
 				raw = null;
 			}
-
 			if (advance.action === "escalate") {
 				return {
 					done: false,
 					escalate: true,
+					closed: false,
 					message: advance.message,
 					reason: advance.reason,
 					raw,
@@ -740,8 +778,31 @@ export class PipelineManager {
 			return {
 				done: true,
 				escalate: false,
+				closed: false,
 				message: advance.message,
 				reason: advance.reason,
+				raw,
+			};
+		};
+		const toFastWorkerCloseResult = (closeRecord: FastWorkerCloseRecord): FastWorkerResult => {
+			let raw: string | null = null;
+			try {
+				raw = JSON.stringify({
+					action: "close",
+					reason: closeRecord.reason,
+					agentId: closeRecord.agentId,
+					ts: closeRecord.ts,
+				});
+			} catch {
+				raw = null;
+			}
+
+			return {
+				done: true,
+				escalate: false,
+				closed: true,
+				message: closeRecord.reason,
+				reason: null,
 				raw,
 			};
 		};
@@ -754,8 +815,9 @@ export class PipelineManager {
 		const buildMissingAdvanceNudge = (): string => {
 			const lines = [
 				"[SYSTEM RECOVERY]",
-				"Your previous fast-worker run ended without calling `advance_lifecycle`, so OMS could not continue.",
-				'Resume this task and call `advance_lifecycle` exactly once with action="done" or "escalate".',
+				"Your previous fast-worker run ended without calling `close_task` or `advance_lifecycle`, so OMS could not continue.",
+				"If the task is complete, call `close_task` with a concise reason.",
+				'If the task must continue in pipeline mode, call `advance_lifecycle` exactly once with action="done" or "escalate".',
 				"Then stop.",
 			];
 			if (kickoffMessage) {
@@ -767,7 +829,8 @@ export class PipelineManager {
 			const lines = [
 				"[SYSTEM RESUME]",
 				"Your previous fast-worker process exited unexpectedly before lifecycle completion.",
-				'Resume this task and call `advance_lifecycle` exactly once with action="done" or "escalate".',
+				"If the task is complete, call `close_task` with a concise reason.",
+				'If the task must continue in pipeline mode, call `advance_lifecycle` exactly once with action="done" or "escalate".',
 				"Then stop.",
 			];
 			if (kickoffMessage) {
@@ -783,6 +846,7 @@ export class PipelineManager {
 			let fastWorker: AgentInfo;
 			const normalizedResumeSessionId = normalizeSessionId(resumeSessionId);
 			this.fastWorkerLifecycleByTask.delete(task.id);
+			this.fastWorkerCloseByTask.delete(task.id);
 
 			try {
 				fastWorker = await this.spawner.spawnFastWorker(task.id, {
@@ -828,6 +892,18 @@ export class PipelineManager {
 			try {
 				await fastWorkerRpc.waitForAgentEnd(900_000);
 			} catch {
+				const closeRecord = this.takeFastWorkerCloseRecord(task.id);
+				if (closeRecord) {
+					let text: string | null = null;
+					try {
+						text = await fastWorkerRpc.getLastAssistantText();
+					} catch {
+						text = null;
+					}
+					await this.finishAgent(fastWorker, "done");
+					await this.logAgentFinished(fastWorker, text ?? "");
+					return { ok: true, result: toFastWorkerCloseResult(closeRecord) };
+				}
 				const advance = this.takeFastWorkerLifecycleAdvance(task.id);
 				if (advance) {
 					let text: string | null = null;
@@ -851,24 +927,27 @@ export class PipelineManager {
 				text = null;
 			}
 
-			const advance = this.takeFastWorkerLifecycleAdvance(task.id);
+			const closeRecord = this.takeFastWorkerCloseRecord(task.id);
+			const advance = closeRecord ? null : this.takeFastWorkerLifecycleAdvance(task.id);
 			await this.finishAgent(fastWorker, "done");
 			await this.logAgentFinished(fastWorker, text ?? "");
+			if (closeRecord) {
+				return { ok: true, result: toFastWorkerCloseResult(closeRecord) };
+			}
 			if (!advance) {
 				const sessionId = captureSessionId();
-				this.loopLog(`Fast-worker exited without advance_lifecycle for ${task.id}`, "warn", {
+				this.loopLog(`Fast-worker exited without close_task or advance_lifecycle for ${task.id}`, "warn", {
 					taskId: task.id,
 					sessionId,
 					mode,
 				});
 				return {
 					ok: false,
-					reason: "fast-worker exited without advance_lifecycle tool call",
+					reason: "fast-worker exited without close_task or advance_lifecycle tool call",
 					sessionId,
 					missingAdvanceTool: true,
 				};
 			}
-
 			return { ok: true, result: toFastWorkerResult(advance) };
 		};
 
@@ -887,6 +966,7 @@ export class PipelineManager {
 				return {
 					done: false,
 					escalate: false,
+					closed: false,
 					message: null,
 					reason:
 						currentTask.status === "blocked"
@@ -904,6 +984,7 @@ export class PipelineManager {
 			return {
 				done: false,
 				escalate: false,
+				closed: false,
 				message: null,
 				reason: "task deleted during fast-worker execution",
 				raw: null,
@@ -947,6 +1028,7 @@ export class PipelineManager {
 		return {
 			done: false,
 			escalate: false,
+			closed: false,
 			message: null,
 			reason: `fast-worker failed after recovery attempts (${reasonParts.join(", ")})`,
 			raw: null,
@@ -1030,6 +1112,17 @@ export class PipelineManager {
 		const decision = this.fastWorkerLifecycleByTask.get(normalizedTaskId) ?? null;
 		if (decision) this.fastWorkerLifecycleByTask.delete(normalizedTaskId);
 		return decision;
+	}
+
+	private takeFastWorkerCloseRecord(taskId: string): FastWorkerCloseRecord | null {
+		const normalizedTaskId = taskId.trim();
+		if (!normalizedTaskId) return null;
+		const closeRecord = this.fastWorkerCloseByTask.get(normalizedTaskId) ?? null;
+		if (closeRecord) {
+			this.fastWorkerCloseByTask.delete(normalizedTaskId);
+			this.fastWorkerLifecycleByTask.delete(normalizedTaskId);
+		}
+		return closeRecord;
 	}
 
 	takeFinisherLifecycleAdvance(taskId: string): FinisherLifecycleAdvanceRecord | null {
@@ -1148,6 +1241,13 @@ export class PipelineManager {
 		if (task.scope === "tiny") {
 			const fastWorkerResult = await this.runFastWorkerForTask(task);
 			if (fastWorkerResult.done) {
+				if (fastWorkerResult.closed) {
+					this.loopLog(`Fast-worker closed tiny task ${task.id}`, "info", {
+						taskId: task.id,
+						reason: fastWorkerResult.message ?? fastWorkerResult.reason,
+					});
+					return;
+				}
 				const fastWorkerOutput =
 					typeof fastWorkerResult.message === "string" && fastWorkerResult.message.trim()
 						? fastWorkerResult.message.trim()

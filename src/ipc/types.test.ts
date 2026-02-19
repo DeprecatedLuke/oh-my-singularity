@@ -173,6 +173,18 @@ describe("parseIPCMessage", () => {
 		});
 	});
 
+	test("parses fast_worker_close_task and rejects non-string reason", () => {
+		expect(
+			expectParseOk({ type: "fast_worker_close_task", taskId: "task-1", reason: "done", agentId: "fast-1" }),
+		).toEqual({
+			type: "fast_worker_close_task",
+			taskId: "task-1",
+			reason: "done",
+			agentId: "fast-1",
+		});
+		expectParseError({ type: "fast_worker_close_task", reason: false }, /"reason" must be a string/);
+	});
+
 	test("parses finisher_close_task and rejects non-string reason", () => {
 		expect(
 			expectParseOk({ type: "finisher_close_task", taskId: "task-1", reason: "done", agentId: "fin-1" }),

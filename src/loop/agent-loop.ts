@@ -673,6 +673,44 @@ export class AgentLoop {
 			this.#mergerQueueRunning = false;
 		}
 	}
+
+	async handleFastWorkerCloseTask(opts: {
+		taskId?: string;
+		reason?: string;
+		agentId?: string;
+	}): Promise<Record<string, unknown>> {
+		const taskId = typeof opts.taskId === "string" ? opts.taskId.trim() : "";
+		if (!taskId) {
+			return { ok: false, summary: "fast_worker_close_task rejected: taskId is required" };
+		}
+
+		const reason = typeof opts.reason === "string" ? opts.reason.trim() : "";
+		const agentId = typeof opts.agentId === "string" ? opts.agentId.trim() : "";
+		this.pipelineManager.recordFastWorkerClose?.({
+			taskId,
+			reason: reason || undefined,
+			agentId: agentId || undefined,
+		});
+
+		await this.#closeTaskAndUnblockDependents(taskId, reason || "Closed by fast-worker");
+		const abortedFastWorkerCount = this.#abortActiveAgentsByRole(taskId, "fast-worker");
+		this.loopLog(`Fast-worker close recorded for ${taskId}`, "info", {
+			taskId,
+			reason: reason || null,
+			agentId: agentId || null,
+			abortedFastWorkerCount,
+		});
+
+		return {
+			ok: true,
+			summary: `fast_worker_close_task recorded for ${taskId}`,
+			taskId,
+			reason: reason || null,
+			agentId: agentId || null,
+			abortedFastWorkerCount,
+		};
+	}
+
 	async handleFinisherCloseTask(opts: {
 		taskId?: string;
 		reason?: string;
