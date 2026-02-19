@@ -298,14 +298,6 @@ function padAnsi(text: string, width: number): string {
 	return `${clipped}${padding}`;
 }
 
-function makeSectionSeparator(width: number, label = ""): string {
-	const safeWidth = Math.max(1, width);
-	if (!label) return BOX.h.repeat(safeWidth);
-	const head = `${BOX.h.repeat(CAP_LEN)} ${label} `;
-	const clipped = clipAnsi(head, safeWidth);
-	return `${clipped}${BOX.h.repeat(Math.max(0, safeWidth - visibleWidth(clipped)))}`;
-}
-
 function makeIndentedRow(width: number, text: string): string {
 	const safeWidth = Math.max(1, width);
 	const innerWidth = Math.max(1, safeWidth - 2);
@@ -341,14 +333,12 @@ export function buildIssueCardLines(issue: TaskIssue, width: number, action = "t
 	const typeSegment = issueType ? ` ${FG.dim}(${issueType})${RESET}` : "";
 	const metaLine = `status: ${status}${typeSegment}  deps:${FG.dim}${deps}${RESET} refs:${FG.dim}${refs}${RESET}`;
 	const actionLabel = sanitizeInline(action, "task");
-	const lines = [
-		makeSectionSeparator(width, `${FG.accent}${actionLabel} (1)${RESET}`),
+	return [
+		`${FG.accent}${actionLabel} (1)${RESET}`,
 		makeIndentedRow(width, `task: ${taskId}  P:${priority}`),
 		makeIndentedRow(width, metaLine),
 		...detailLines.map(line => makeIndentedRow(width, line)),
-		makeSectionSeparator(width),
-	];
-	return lines.slice(0, RESULT_MAX_LINES);
+	].slice(0, RESULT_MAX_LINES);
 }
 export function buildIssueTableLines(action: string, issues: readonly TaskIssue[], width: number): string[] {
 	if (width < 12) {
@@ -383,10 +373,7 @@ export function buildIssueTableLines(action: string, issues: readonly TaskIssue[
 		}
 	}
 	const label = action ? `${action} (${issues.length})` : `tasks (${issues.length})`;
-	return [makeSectionSeparator(width, `${FG.accent}${label}${RESET}`), ...rows, makeSectionSeparator(width)].slice(
-		0,
-		RESULT_MAX_LINES,
-	);
+	return [`${FG.accent}${label}${RESET}`, ...rows].slice(0, RESULT_MAX_LINES);
 }
 export function buildCommentTableLines(comments: readonly TaskComment[], width: number): string[] {
 	if (width < 12) {
@@ -411,11 +398,7 @@ export function buildCommentTableLines(comments: readonly TaskComment[], width: 
 			rows.push(makeIndentedRow(width, `${FG.dim}… ${remaining} more comment${remaining === 1 ? "" : "s"}${RESET}`));
 		}
 	}
-	return [
-		makeSectionSeparator(width, `${FG.accent}comments (${comments.length})${RESET}`),
-		...rows,
-		makeSectionSeparator(width),
-	].slice(0, RESULT_MAX_LINES);
+	return [`${FG.accent}comments (${comments.length})${RESET}`, ...rows].slice(0, RESULT_MAX_LINES);
 }
 
 function formatTasksStructuredResultLines(
@@ -728,71 +711,48 @@ function formatStructuredToolResultLines(block: ToolBlock, contentWidth: number)
 	}
 	return null;
 }
+function isTaskCommentsResult(block: ToolBlock): boolean {
+	if (getToolBaseName(block.toolName) !== "tasks") return false;
+	const action = normalizeTaskAction(getTasksAction(block.resultData, block.argsData));
+	return action === "comments";
+}
+
+
 
 export function renderToolBlockLines(block: ToolBlock, width: number): string[] {
 	if (width < 8) return [];
+	const isTaskComments = isTaskCommentsResult(block);
 
-	// State-based colors
-	const borderFg = block.state === "error" ? FG.error : block.state === "pending" ? FG.accent : FG.dim;
-	const bgAnsi = block.state === "error" ? BG.toolError : block.state === "pending" ? BG.toolPending : BG.toolSuccess;
-	const icon = block.state === "error" ? ICON.error : block.state === "pending" ? ICON.pending : ICON.success;
-
-	const bc = (text: string) => `${borderFg}${text}${RESET_FG}`;
-	const cap = BOX.h.repeat(CAP_LEN);
-
-	// ---- Header label ----
-	const argsClipped = block.argsPreview ? clipText(block.argsPreview, Math.max(0, width - 25)) : "";
-	const argsStr = argsClipped ? ` ${FG.dim}${ICON.dot}${RESET_FG} ${FG.dim}${argsClipped}${RESET_FG}` : "";
-	const labelContent = `${icon} ${BOLD}${block.toolName}${UNBOLD}${argsStr}`;
-	const rawLabelPadded = ` ${labelContent} `;
-
-	// ---- Top bar ----
-	const topLeftStr = bc(`${BOX.tl}${cap}`);
-	const topRightStr = bc(BOX.tr);
-	const topLeftVW = 1 + CAP_LEN;
-	const topRightVW = 1;
-	const labelMaxVW = Math.max(0, width - topLeftVW - topRightVW);
-	const labelPadded = clipAnsi(rawLabelPadded, labelMaxVW);
-	const labelVW = visibleWidth(labelPadded);
-	const topFillCount = Math.max(0, width - topLeftVW - labelVW - topRightVW);
-	const topLine = `${topLeftStr}${labelPadded}${bc(BOX.h.repeat(topFillCount))}${topRightStr}`;
-
-	// ---- Content ----
-	const prefixStr = bc(`${BOX.v} `);
-	const suffixStr = bc(BOX.v);
 	const prefixVW = 2;
 	const suffixVW = 1;
 	const contentWidth = Math.max(1, width - prefixVW - suffixVW);
-
-	const contentLines: string[] = [];
 	const pendingTaskArgs =
 		block.state === "pending" && block.argsComplete === false && getToolBaseName(block.toolName) === "tasks"
 			? formatPendingTasksCallArgs(block.argsData, contentWidth)
 			: null;
 	const structuredLines = pendingTaskArgs ? null : formatStructuredToolResultLines(block, contentWidth);
+	const contentTextLines: string[] = [];
+
+	const pushTextLine = (text: string): void => {
+		const clipped = clipAnsi(text, contentWidth);
+		const pad = " ".repeat(Math.max(0, contentWidth - visibleWidth(clipped)));
+		contentTextLines.push(`${clipped}${pad}`);
+	};
 	if (pendingTaskArgs && pendingTaskArgs.length > 0) {
 		const maxLines = RESULT_MAX_LINES;
 		for (const line of pendingTaskArgs.slice(0, maxLines)) {
-			const clipped = clipAnsi(line, contentWidth);
-			const pad = " ".repeat(Math.max(0, contentWidth - visibleWidth(clipped)));
-			contentLines.push(`${prefixStr}${FG.muted}${clipped}${RESET_FG}${pad}${suffixStr}`);
+			pushTextLine(`${FG.muted}${line}${RESET_FG}`);
 		}
 		if (pendingTaskArgs.length > maxLines) {
-			const more = `… ${pendingTaskArgs.length - maxLines} more lines`;
-			const pad = " ".repeat(Math.max(0, contentWidth - visibleWidth(more)));
-			contentLines.push(`${prefixStr}${FG.dim}${more}${RESET_FG}${pad}${suffixStr}`);
+			pushTextLine(`${FG.dim}… ${pendingTaskArgs.length - maxLines} more lines${RESET_FG}`);
 		}
 	} else if (structuredLines && structuredLines.length > 0) {
 		const maxLines = RESULT_MAX_LINES;
 		for (const line of structuredLines.slice(0, maxLines)) {
-			const clipped = clipAnsi(line, contentWidth);
-			const pad = " ".repeat(Math.max(0, contentWidth - visibleWidth(clipped)));
-			contentLines.push(`${prefixStr}${clipped}${pad}${suffixStr}`);
+			pushTextLine(line);
 		}
 		if (structuredLines.length > maxLines) {
-			const more = `… ${structuredLines.length - maxLines} more lines`;
-			const pad = " ".repeat(Math.max(0, contentWidth - visibleWidth(more)));
-			contentLines.push(`${prefixStr}${FG.dim}${more}${RESET_FG}${pad}${suffixStr}`);
+			pushTextLine(`${FG.dim}… ${structuredLines.length - maxLines} more lines${RESET_FG}`);
 		}
 	} else {
 		const rawText = block.resultContent || block.resultPreview;
@@ -812,30 +772,48 @@ export function renderToolBlockLines(block: ToolBlock, width: number): string[] 
 			const isError = block.state === "error";
 			const textColor = isError ? FG.error : FG.muted;
 			for (const line of allWrapped.slice(0, maxLines)) {
-				const clipped = clipAnsi(line, contentWidth);
-				const pad = " ".repeat(Math.max(0, contentWidth - visibleWidth(clipped)));
-				contentLines.push(`${prefixStr}${textColor}${clipped}${RESET_FG}${pad}${suffixStr}`);
+				pushTextLine(`${textColor}${line}${RESET_FG}`);
 			}
 			if (allWrapped.length > maxLines) {
-				const more = `… ${allWrapped.length - maxLines} more lines`;
-				const pad = " ".repeat(Math.max(0, contentWidth - visibleWidth(more)));
-				contentLines.push(`${prefixStr}${FG.dim}${more}${RESET_FG}${pad}${suffixStr}`);
+				pushTextLine(`${FG.dim}… ${allWrapped.length - maxLines} more lines${RESET_FG}`);
 			}
 		} else {
 			const fallback = block.state === "error" ? "(error; no output)" : "(no output)";
 			const textColor = block.state === "error" ? FG.error : FG.dim;
-			const clipped = clipAnsi(fallback, contentWidth);
-			const pad = " ".repeat(Math.max(0, contentWidth - visibleWidth(clipped)));
-			contentLines.push(`${prefixStr}${textColor}${clipped}${RESET_FG}${pad}${suffixStr}`);
+			pushTextLine(`${textColor}${fallback}${RESET_FG}`);
 		}
 	}
+	if (isTaskComments) {
+		return contentTextLines;
+	}
 
-	// ---- Bottom bar ----
+	// State-based colors
+	const borderFg = block.state === "error" ? FG.error : block.state === "pending" ? FG.accent : FG.dim;
+	const icon = block.state === "error" ? ICON.error : block.state === "pending" ? ICON.pending : ICON.success;
+	const bgAnsi = block.state === "error" ? BG.toolError : block.state === "pending" ? BG.toolPending : BG.toolSuccess;
+	const bc = (text: string) => `${borderFg}${text}${RESET_FG}`;
+	const cap = BOX.h.repeat(CAP_LEN);
+	const argsClipped = block.argsPreview ? clipText(block.argsPreview, Math.max(0, width - 25)) : "";
+	const argsStr = argsClipped ? ` ${FG.dim}${ICON.dot}${RESET_FG} ${FG.dim}${argsClipped}${RESET_FG}` : "";
+	const labelContent = `${icon} ${BOLD}${block.toolName}${UNBOLD}${argsStr}`;
+	const rawLabelPadded = ` ${labelContent} `;
+	// ---- Top bar ----
+	const topLeftStr = bc(`${BOX.tl}${cap}`);
+	const topRightStr = bc(BOX.tr);
+	const topLeftVW = 1 + CAP_LEN;
+	const topRightVW = 1;
+	const labelMaxVW = Math.max(0, width - topLeftVW - topRightVW);
+	const labelPadded = clipAnsi(rawLabelPadded, labelMaxVW);
+	const labelVW = visibleWidth(labelPadded);
+	const topFillCount = Math.max(0, width - topLeftVW - labelVW - topRightVW);
+	const topLine = `${topLeftStr}${labelPadded}${bc(BOX.h.repeat(topFillCount))}${topRightStr}`;
+	const prefixStr = bc(`${BOX.v} `);
+	const suffixStr = bc(BOX.v);
+	const contentLines = contentTextLines.map(line => `${prefixStr}${line}${suffixStr}`);
 	const bottomLeftStr = bc(`${BOX.bl}${cap}`);
 	const bottomRightStr = bc(BOX.br);
 	const bottomFillCount = Math.max(0, width - (1 + CAP_LEN) - 1);
 	const bottomLine = `${bottomLeftStr}${bc(BOX.h.repeat(bottomFillCount))}${bottomRightStr}`;
-
 	// ---- Apply background to all lines ----
 	const allLines = [topLine, ...contentLines, bottomLine];
 	return allLines.map(line => {
@@ -845,3 +823,4 @@ export function renderToolBlockLines(block: ToolBlock, width: number): string[] 
 		return `${bgAnsi}${clipped}${pad}${RESET}`;
 	});
 }
+

@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { makeTasksExtension } from "./tasks-tool";
-import type { ToolDefinition, TypeBuilder } from "./types";
+import type { ToolDefinition, ToolTheme, TypeBuilder } from "./types";
 
 type RegisteredTool = ToolDefinition;
 
@@ -21,6 +21,13 @@ function createMockTypebox(): TypeBuilder {
 		Array: (_itemSchema: unknown) => [],
 	};
 }
+
+const theme: ToolTheme = {
+	fg: (_scope: string, text: string) => text,
+	styledSymbol: (_name: string, _color: string) => "●",
+	sep: { dot: "·" },
+	spinnerFrames: ["⠋", "⠙", "⠹"],
+};
 
 async function startMockIpcServer(onRequest: (payload: unknown) => unknown | Promise<unknown>): Promise<{
 	sockPath: string;
@@ -61,6 +68,23 @@ async function startMockIpcServer(onRequest: (payload: unknown) => unknown | Pro
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		},
 	};
+}
+
+async function registerTasksTool(opts: { role: string; allowedActions: string[] }): Promise<RegisteredTool> {
+	let registeredTool: RegisteredTool | null = null;
+	const extension = makeTasksExtension(opts);
+	await extension({
+		typebox: { Type: createMockTypebox() },
+		registerTool: (tool: RegisteredTool) => {
+			registeredTool = tool;
+		},
+		on: () => {
+			// noop
+		},
+	});
+	const tool = registeredTool as RegisteredTool | null;
+	if (!tool) throw new Error("tasks tool was not registered");
+	return tool;
 }
 
 describe("tasks tool extension", () => {
@@ -191,5 +215,61 @@ describe("tasks tool extension", () => {
 			}
 			await server.close();
 		}
+	});
+
+	test("renderResult includes scope in create card output", async () => {
+		const tool = await registerTasksTool({ role: "worker", allowedActions: ["create"] });
+		if (!tool.renderResult) throw new Error("tasks tool renderResult was not registered");
+
+		const lines = tool
+			.renderResult(
+				{
+					content: [{ type: "text", text: "tasks create: ok" }],
+					details: [
+						{
+							id: "task-10",
+							title: "Scoped task",
+							status: "open",
+							issue_type: "task",
+							priority: 1,
+							scope: "medium",
+						},
+					],
+				},
+				{ expanded: false, isPartial: false },
+				theme,
+				{ action: "create" },
+			)
+			.render(160);
+
+		expect(lines.join("\n")).toContain("S:medium");
+	});
+
+	test("renderResult includes scope in list rows", async () => {
+		const tool = await registerTasksTool({ role: "worker", allowedActions: ["list"] });
+		if (!tool.renderResult) throw new Error("tasks tool renderResult was not registered");
+
+		const lines = tool
+			.renderResult(
+				{
+					content: [{ type: "text", text: "tasks list: ok" }],
+					details: [
+						{
+							id: "task-11",
+							title: "List scoped task",
+							status: "open",
+							issue_type: "task",
+							priority: 2,
+							scope: "small",
+						},
+					],
+				},
+				{ expanded: false, isPartial: false },
+				theme,
+				{ action: "list" },
+			)
+			.render(160);
+
+		expect(lines.join("\n")).toContain("S:small");
 	});
 });

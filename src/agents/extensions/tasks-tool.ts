@@ -387,6 +387,7 @@ function buildThemedIssueCardLines(
 	const deps = sanitizeInline(formatTaskDependencies(issue), "none");
 	const refs = sanitizeInline(formatTaskReferences(issue), "none");
 	const priority = formatPriority(rec.priority);
+	const scope = formatScope(rec.scope);
 	const description = sanitizeMultiline(rec.description);
 	const details = description || title;
 	const detailLimit = expanded ? EXPANDED_STRUCTURED_LINES : COLLAPSED_STRUCTURED_LINES;
@@ -400,7 +401,9 @@ function buildThemedIssueCardLines(
 	const contentWidth = Math.max(1, width - 2);
 	const dot = theme.sep?.dot ? ` ${theme.sep.dot} ` : " · ";
 	const detail = formatMultilinePreview(details, contentWidth, detailLimit);
-	const headerText = `task ${taskId}${dot}P:${priority}`;
+	const headerParts = [`task ${taskId}`, `P:${priority}`];
+	if (scope) headerParts.push(`S:${scope}`);
+	const headerText = headerParts.join(dot);
 	const statusText = `status ${status}${issueType ? ` (${issueType})` : ""}`;
 	const depsText = `deps ${deps}${dot}refs ${refs}`;
 	return {
@@ -442,10 +445,14 @@ function buildThemedIssueTableLines(
 			const id = sanitizeInline(issue.id, "(unknown)");
 			const status = sanitizeInline(rec.status, "(unknown)");
 			const priority = formatPriority(rec.priority);
+			const scope = formatScope(rec.scope);
 			const deps = sanitizeInline(formatTaskDependencies(issue), "none");
 			const title = sanitizeInline(issue.title, "(untitled)");
 			const dot = theme.sep?.dot ? ` ${theme.sep.dot} ` : " · ";
-			const text = `${id}${dot}${status}${dot}P:${priority}${dot}D:${deps}${dot}${title}`;
+			const textParts = [id, status, `P:${priority}`];
+			if (scope) textParts.push(`S:${scope}`);
+			textParts.push(`D:${deps}`, title);
+			const text = textParts.join(dot);
 			rows.push(makeIndentedRow(width, text, issueStatusScope(rec.status), theme));
 		}
 		if (issues.length > visibleCount) {
@@ -603,6 +610,10 @@ function padInline(text: string, width: number): string {
 function formatPriority(value: unknown): string {
 	if (typeof value !== "number" || !Number.isFinite(value)) return "?";
 	return String(Math.trunc(value));
+}
+
+function formatScope(value: unknown): string {
+	return sanitizeInline(value);
 }
 
 function toRecord(value: unknown, fallback: UnknownRecord): UnknownRecord {
