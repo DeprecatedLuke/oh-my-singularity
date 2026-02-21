@@ -32,6 +32,7 @@ export interface TaskUpdateInput {
 	priority?: number;
 	assignee?: string | null;
 	references?: string | string[];
+	description?: string | null;
 }
 
 export interface TaskStoreEvent {
@@ -334,6 +335,11 @@ export class TaskClient implements TaskStoreClient {
 				referenceIds.add(referenceId);
 				args.push("--references", referenceId);
 			}
+		}
+		if (patch.description === null) {
+			args.push("--description", "");
+		} else if (typeof patch.description === "string" && patch.description.trim()) {
+			args.push("--description", patch.description.trim());
 		}
 		if (args.length === 2) return null;
 		return await this.runJson<unknown>(args);

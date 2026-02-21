@@ -395,6 +395,14 @@ export function updateIssue(state: StoreSnapshot, actor: string, id: string, pat
 		changed = true;
 	}
 
+	if (patch.description === null) {
+		issue.description = null;
+		changed = true;
+	} else if (typeof patch.description === "string") {
+		issue.description = normalizeString(patch.description) ?? null;
+		changed = true;
+	}
+
 	if (changed) issue.updated_at = now;
 	return issue;
 }
