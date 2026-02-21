@@ -23,11 +23,11 @@ OMS is an orchestration layer that coordinates multiple oh-my-pi instances to im
 
 [View v0.0.3 chess output (HTML)](media/chess-benchmark-0.0.3.html)
 
-v0.0.3 took slightly longer wall-clock due to added AI opponent complexity, while cutting token usage nearly in half. Quality improved with Opus as the designer-worker for HTML output.
+v0.0.3 took slightly longer wall-clock due to added AI opponent complexity, while cutting token usage nearly in half. Quality improved with Opus as the designer for HTML output.
 
 Orchestration overhead is approximately 20% for short tasks and 7% for long-running ones.
 
-Default configuration used: Codex (xhigh) for workers, Opus (xhigh) for designer-worker, OMP default for singularity (xhigh), Sonnet (medium) for issuer/finisher/steering, 5 max concurrent workers, 15-minute steering interval.
+Default configuration used: Codex (xhigh) for workers, Opus (xhigh) for designer, OMP default for singularity (xhigh), Sonnet (medium) for issuer/finisher/steering, 5 max concurrent workers, 15-minute steering interval.
 
 ## Problem Solved
 
@@ -44,7 +44,7 @@ Default configuration used: Codex (xhigh) for workers, Opus (xhigh) for designer
 - **In-Process Task Tracker**: Full lifecycle management (create → claim → in_progress → close) via `tasks` tool API
 - **Extension System**: TypeScript files inject custom tools into agent processes
 - **Rich TUI**: 6-pane terminal interface with PTY-backed REPL, agent event viewer, task tree, and system logs
-- **IPC Coordination**: Unix socket communication between agents and OMS for broadcasts, complaints, steering
+- **IPC Coordination**: Unix socket communication between agents and OMS for broadcasts, steering
 - **Low resource usage**: updates are interrupt based and TUI rendering is simple.
 ---
 
@@ -56,7 +56,7 @@ Default configuration used: Codex (xhigh) for workers, Opus (xhigh) for designer
 - **Issuer** — Pre-implementation scout. Explores the codebase and prior art, then decides *start*, *defer*, or *skip* with actionable guidance for the worker.
 - **Worker** — Implements code, tests, docs for a single task. Leaves a knowledge trail via comments. Broadcasts when changes affect parallel workers.
 - **Designer-Worker** — Same as worker but specialized for UI/UX/visual tasks.
-- **Fast-Worker** — Lightweight agent for trivial (`tiny` scope) tasks. Uses a fast model (default: codex-spark) and skips the issuer step. Can escalate to the full lifecycle if the task turns out to be more complex than expected.
+- **Fast-Worker** — Lightweight agent for trivial (`tiny` scope) tasks. Uses a fast model (default: sonnet-4-6) and skips the issuer step. Can escalate to the full lifecycle if the task turns out to be more complex than expected.
 - **Finisher** — Post-implementation cleanup. Reviews worker output, stops leftover agents, closes/updates issues, creates follow-ups. Owns all lifecycle mutations.
 - **Steering** — Periodic supervisor. Evaluates running work and decides *continue*, *redirect*, or *interrupt*. Broadcast-steering variant evaluates multiple workers at once.
 
@@ -71,7 +71,7 @@ Default configuration used: Codex (xhigh) for workers, Opus (xhigh) for designer
        │                                       │
        │                                       ▼
        │                              ┌──────────────────┐
-       │                              │ Fast-Worker      │  Quick fix (codex-spark)
+       │                              │ Fast-Worker      │  Quick fix
        │                              └────────┬─────────┘
        │                                       │
        │                            ┌──(ok)────┴──(too complex)──┐
@@ -142,9 +142,9 @@ Replicas can be toggled on/off in the settings pane. When off, all workers share
 
 ### Fast-Path Workers
 
-Tasks with `scope: tiny` bypass the full issuer→worker pipeline. Instead, OMS spawns a **fast-worker** directly - a lightweight agent using a cheaper, faster model (default: codex-spark).
+Tasks with `scope: tiny` bypass the full issuer→worker pipeline. Instead, OMS spawns a **speedy** directly - a lightweight agent using a cheaper, faster model (default: sonnet-4-6).
 
-If the fast-worker determines the task is too complex for a quick fix, it **escalates**: exits and kicks off the standard issuer→worker lifecycle. This gives trivial changes (constant tweaks, typo fixes, config updates) a sub-minute path while preserving the full pipeline for real work.
+If the speedy determines the task is too complex for a quick fix, it **escalates**: exits and kicks off the standard issuer→worker lifecycle. This gives trivial changes (constant tweaks, typo fixes, config updates) a sub-minute path while preserving the full pipeline for real work.
 
 Scope levels: `tiny` | `small` | `medium` | `large` | `xlarge`. Only `tiny` uses the fast path; all others go through the normal pipeline.
 
@@ -175,7 +175,6 @@ Extensions are TypeScript files in `src/agents/extensions/` that inject custom t
 **Examples:**
 - `tasks-worker.ts` — Worker-scoped tasks API (read + comment)
 - `broadcast-to-workers.ts` — Broadcast messages to relevant workers
-- `complain.ts` — Report file conflicts to OMS
 - `interrupt-agent.ts` — Stop a running task agent and queue an interrupt message
 - `steer-agent.ts` — Send targeted wait/redirect guidance to a running task agent
 
@@ -332,7 +331,7 @@ Configuration precedence (later overrides earlier):
       "thinking": "xhigh",
       "tools": "bash,read,edit,write,grep,find,lsp,python,fetch,web_search,task"
     },
-    "designer-worker": {
+    "designer": {
       "model": "opus",
       "thinking": "xhigh",
       "tools": "bash,read,edit,write,grep,find,lsp,python,fetch,web_search,task"
@@ -616,7 +615,6 @@ Extensions can:
 
 **Conflict detection:**
 - Labels prevent parallel work on same subsystem (e.g., two workers can't both claim `subsystem:auth`)
-- `complain` tool reports file conflicts (OMS spawns resolver agent)
 - `wait_for_agent` blocks until specified agent completes
 
 ---
