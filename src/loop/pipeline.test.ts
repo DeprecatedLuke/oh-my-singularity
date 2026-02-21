@@ -4,17 +4,9 @@ import type { AgentInfo } from "../agents/types";
 import { createEmptyAgentUsage } from "../agents/types";
 import type { TaskStoreClient } from "../tasks/client";
 import type { TaskIssue } from "../tasks/types";
-import { PipelineManager } from "./pipeline";
+import { type IssuerResult, PipelineManager } from "./pipeline";
 
 type ActiveWorkerProvider = () => AgentInfo[];
-
-type IssuerResult = {
-	start: boolean;
-	skip?: boolean;
-	message: string | null;
-	reason: string | null;
-	raw: string | null;
-};
 
 const makeTask = (id: string): TaskIssue => ({
 	id,
@@ -33,7 +25,7 @@ const makeTask = (id: string): TaskIssue => ({
 const makeWorker = (taskId: string, id = `worker:${taskId}`): AgentInfo => ({
 	id,
 	taskId,
-	role: "worker",
+	agentType: "worker",
 	tasksAgentId: `tasks-${id}`,
 	status: "running",
 	usage: createEmptyAgentUsage(),
@@ -47,7 +39,7 @@ const makeWorker = (taskId: string, id = `worker:${taskId}`): AgentInfo => ({
 const makeIssuer = (taskId: string, rpc: OmsRpcClient, id = `issuer:${taskId}`): AgentInfo => ({
 	id,
 	taskId,
-	role: "issuer",
+	agentType: "issuer",
 	tasksAgentId: `tasks-${id}`,
 	status: "working",
 	usage: createEmptyAgentUsage(),
@@ -78,18 +70,18 @@ const createPipeline = (opts: {
 		registry: {} as never,
 		scheduler: {} as never,
 		spawner: {
-			spawnWorker: async (taskId: string) => {
-				calls.spawnWorker += 1;
-				if (opts.spawnWorker) {
-					return opts.spawnWorker(makeTask(taskId), false, undefined);
+			spawnAgent: async (configKey: string, taskId: string) => {
+				if (configKey === "worker" || configKey === "designer" || configKey === "speedy") {
+					calls.spawnWorker += 1;
+					if (opts.spawnWorker) {
+						return opts.spawnWorker(makeTask(taskId), false, undefined);
+					}
+					if (configKey === "designer") {
+						return { ...makeWorker("designer"), agentType: "designer" } as never;
+					}
 				}
 				return makeWorker(taskId);
 			},
-			spawnDesignerWorker: async () =>
-				({
-					...makeWorker("designer"),
-					role: "designer-worker",
-				}) as never,
 		} as never,
 		getMaxWorkers: () => 1,
 		getActiveWorkerAgents: activeWorkers,
@@ -189,7 +181,7 @@ describe("PipelineManager resume pipeline", () => {
 });
 
 describe("PipelineManager issuer lifecycle recovery", () => {
-	test("runIssuerForTask treats wait failure as success when advance_lifecycle already recorded", async () => {
+	test("runIssuerForTask consumes advance_lifecycle record on normal exit (no forceKill)", async () => {
 		const task = makeTask("task-advance");
 		const rpc = new OmsRpcClient();
 		const issuer = makeIssuer(task.id, rpc, "issuer-task-advance");
@@ -197,27 +189,21 @@ describe("PipelineManager issuer lifecycle recovery", () => {
 		const logFinishedCalls: string[] = [];
 		let spawnIssuerCalls = 0;
 		let resumeAgentCalls = 0;
-		let forceKillCalls = 0;
 		let pipeline: PipelineManager;
-
-		(rpc as unknown as { forceKill: () => void }).forceKill = () => {
-			forceKillCalls += 1;
-		};
-
-		(rpc as unknown as { getLastAssistantText: () => Promise<string | null> }).getLastAssistantText = async () =>
-			"advance completed";
-
+		("advance completed");
+		// waitForAgentEnd succeeds normally — agent exits after advance_lifecycle tool returns.
+		// The lifecycle record is stored during the tool call; the normal path consumes it.
 		(rpc as unknown as { waitForAgentEnd: (_timeoutMs?: number) => Promise<void> }).waitForAgentEnd = async () => {
-			pipeline.advanceIssuerLifecycle({
+			pipeline.advanceLifecycle({
+				agentType: "issuer",
 				taskId: task.id,
-				action: "start",
+				action: "advance",
+				target: "worker",
 				message: "ship it",
 				reason: "ready",
 				agentId: issuer.id,
 			});
-			throw new Error("RPC process exited before agent_end");
 		};
-
 		pipeline = new PipelineManager({
 			tasksClient: {
 				updateStatus: async () => {},
@@ -225,6 +211,7 @@ describe("PipelineManager issuer lifecycle recovery", () => {
 			} as unknown as TaskStoreClient,
 			registry: {
 				getActiveByTask: (queryTaskId: string) => (queryTaskId === task.id ? [issuer] : []),
+				get: () => undefined,
 			} as never,
 			scheduler: {} as never,
 			spawner: {
@@ -259,23 +246,107 @@ describe("PipelineManager issuer lifecycle recovery", () => {
 			isRunning: () => true,
 			isPaused: () => false,
 		});
-
 		const result = await pipeline.runIssuerForTask(task);
 		expect(result.start).toBe(true);
 		expect(result.message).toBe("ship it");
 		expect(result.reason).toBe("ready");
 		expect(typeof result.raw).toBe("string");
 		expect(result.raw ? JSON.parse(result.raw) : null).toMatchObject({
-			action: "start",
+			action: "advance",
+			target: "worker",
 			message: "ship it",
 			reason: "ready",
 			agentId: issuer.id,
 		});
 		expect(spawnIssuerCalls).toBe(1);
 		expect(resumeAgentCalls).toBe(0);
-		expect(forceKillCalls).toBe(1);
 		expect(finishCalls).toEqual([{ id: issuer.id, status: "done" }]);
-		expect(logFinishedCalls).toEqual(["advance completed"]);
+		expect(logFinishedCalls.length).toBe(1);
+	});
+
+	test("runIssuerForTask consumes advance_lifecycle record when agent is force-killed", async () => {
+		const task = makeTask("task-force-kill");
+		const rpc = new OmsRpcClient();
+		const issuer = makeIssuer(task.id, rpc, "issuer-task-force-kill");
+		const finishCalls: Array<{ id: string; status: "done" | "stopped" | "dead" }> = [];
+		const logFinishedCalls: string[] = [];
+		let spawnIssuerCalls = 0;
+		let pipeline: PipelineManager;
+
+		// waitForAgentEnd rejects — simulating forceKill() after advance_lifecycle.
+		// The lifecycle record is stored before the kill; the catch path consumes it.
+		(rpc as unknown as { waitForAgentEnd: (_timeoutMs?: number) => Promise<void> }).waitForAgentEnd = async () => {
+			pipeline.advanceLifecycle({
+				agentType: "issuer",
+				taskId: task.id,
+				action: "advance",
+				target: "worker",
+				message: "done",
+				reason: "completed",
+				agentId: issuer.id,
+			});
+			throw new Error("RPC process force-killed");
+		};
+		(rpc as unknown as { getLastAssistantText: () => Promise<string | null> }).getLastAssistantText = async () =>
+			"force-kill final text";
+
+		pipeline = new PipelineManager({
+			tasksClient: {
+				updateStatus: async () => {},
+				comment: async () => {},
+			} as unknown as TaskStoreClient,
+			registry: {
+				getActiveByTask: (queryTaskId: string) => (queryTaskId === task.id ? [issuer] : []),
+				get: () => undefined,
+			} as never,
+			scheduler: {} as never,
+			spawner: {
+				spawnIssuer: async () => {
+					spawnIssuerCalls += 1;
+					return issuer;
+				},
+				resumeAgent: async () => {
+					throw new Error("resumeAgent should not be called");
+				},
+			} as never,
+			getMaxWorkers: () => 1,
+			getActiveWorkerAgents: () => [],
+			loopLog: () => {},
+			onDirty: () => {},
+			wake: () => {},
+			attachRpcHandlers: () => {},
+			finishAgent: async (agent, status) => {
+				finishCalls.push({ id: agent.id, status });
+			},
+			logAgentStart: () => {},
+			logAgentFinished: async (_agent, explicitText) => {
+				logFinishedCalls.push(explicitText ?? "");
+			},
+			hasPendingInterruptKickoff: () => false,
+			takePendingInterruptKickoff: () => null,
+			hasFinisherTakeover: () => false,
+			spawnFinisherAfterStoppingSteering: async () => {
+				throw new Error("Unexpected finisher spawn");
+			},
+			isRunning: () => true,
+			isPaused: () => false,
+		});
+		const result = await pipeline.runIssuerForTask(task);
+		expect(result.start).toBe(true);
+		expect(result.message).toBe("done");
+		expect(result.reason).toBe("completed");
+		expect(typeof result.raw).toBe("string");
+		expect(result.raw ? JSON.parse(result.raw) : null).toMatchObject({
+			action: "advance",
+			target: "worker",
+			message: "done",
+			reason: "completed",
+			agentId: issuer.id,
+		});
+		expect(spawnIssuerCalls).toBe(1);
+		expect(finishCalls).toEqual([{ id: issuer.id, status: "done" }]);
+		expect(logFinishedCalls.length).toBe(1);
+		expect(logFinishedCalls[0]).toBe("force-kill final text");
 	});
 
 	test("runIssuerForTask sends a resume kickoff when recovering with a session id", async () => {
@@ -300,9 +371,11 @@ describe("PipelineManager issuer lifecycle recovery", () => {
 
 		(resumedRpc as unknown as { waitForAgentEnd: (_timeoutMs?: number) => Promise<void> }).waitForAgentEnd =
 			async () => {
-				pipeline.advanceIssuerLifecycle({
+				pipeline.advanceLifecycle({
+					agentType: "issuer",
 					taskId: task.id,
-					action: "start",
+					action: "advance",
+					target: "worker",
 					message: "resume work",
 					reason: "recovered",
 					agentId: resumedIssuer.id,
@@ -323,6 +396,7 @@ describe("PipelineManager issuer lifecycle recovery", () => {
 			} as unknown as TaskStoreClient,
 			registry: {
 				getActiveByTask: () => [resumedIssuer],
+				get: () => undefined,
 			} as never,
 			scheduler: {} as never,
 			spawner: {
@@ -356,7 +430,7 @@ describe("PipelineManager issuer lifecycle recovery", () => {
 		expect(result.message).toBe("resume work");
 		expect(result.reason).toBe("recovered");
 		expect(typeof resumeKickoff).toBe("string");
-		expect(resumeKickoff).toContain("[SYSTEM RESUME]");
+		expect(resumeKickoff).toContain("[SYSTEM RECOVERY]");
 		expect(resumeKickoff).toContain("advance_lifecycle");
 		expect(showCalls).toBe(1);
 	});
@@ -386,6 +460,7 @@ describe("PipelineManager issuer lifecycle recovery", () => {
 			} as unknown as TaskStoreClient,
 			registry: {
 				getActiveByTask: () => [],
+				get: () => undefined,
 			} as never,
 			scheduler: {} as never,
 			spawner: {
@@ -454,6 +529,7 @@ describe("PipelineManager issuer lifecycle recovery", () => {
 			} as unknown as TaskStoreClient,
 			registry: {
 				getActiveByTask: () => [],
+				get: () => undefined,
 			} as never,
 			scheduler: {} as never,
 			spawner: {
@@ -522,6 +598,7 @@ describe("PipelineManager issuer lifecycle recovery", () => {
 			} as unknown as TaskStoreClient,
 			registry: {
 				getActiveByTask: () => [],
+				get: () => undefined,
 			} as never,
 			scheduler: {} as never,
 			spawner: {
@@ -575,6 +652,7 @@ describe("PipelineManager finisher lifecycle tracking", () => {
 			} as unknown as TaskStoreClient,
 			registry: {
 				getActiveByTask: () => [],
+				get: () => undefined,
 			} as never,
 			scheduler: {} as never,
 			spawner: {} as never,
@@ -597,33 +675,43 @@ describe("PipelineManager finisher lifecycle tracking", () => {
 			isPaused: () => false,
 		});
 
-	test("records and retrieves worker/issuer/defer finisher advance decisions", () => {
+	test("records and retrieves worker/issuer/block finisher advance decisions", () => {
 		const pipeline = createLifecyclePipeline();
-		for (const action of ["worker", "issuer", "defer"] as const) {
-			const response = pipeline.advanceFinisherLifecycle({
+		const cases = [
+			{ oldAction: "worker", action: "advance" as const, target: "worker" },
+			{ oldAction: "issuer", action: "advance" as const, target: "issuer" },
+			{ oldAction: "defer", action: "block" as const, target: null },
+		];
+		for (const { action, target } of cases) {
+			const response = pipeline.advanceLifecycle({
+				agentType: "finisher",
 				taskId: "task-finish",
 				action,
+				target: target ?? undefined,
 				message: `message-${action}`,
 				reason: `reason-${action}`,
 				agentId: "finisher-1",
 			});
 			expect(response).toMatchObject({ ok: true, action });
 
-			const decision = pipeline.takeFinisherLifecycleAdvance("task-finish");
+			const decision = pipeline.takeLifecycleRecord("task-finish");
 			expect(decision).toMatchObject({
 				taskId: "task-finish",
+				agentType: "finisher",
 				action,
+				target: target ?? null,
 				message: `message-${action}`,
 				reason: `reason-${action}`,
 				agentId: "finisher-1",
 			});
-			expect(pipeline.takeFinisherLifecycleAdvance("task-finish")).toBeNull();
+			expect(pipeline.takeLifecycleRecord("task-finish")).toBeNull();
 		}
 	});
 
 	test("rejects unsupported finisher advance action", () => {
 		const pipeline = createLifecyclePipeline();
-		const response = pipeline.advanceFinisherLifecycle({
+		const response = pipeline.advanceLifecycle({
+			agentType: "finisher",
 			taskId: "task-finish",
 			action: "start",
 		});
@@ -631,64 +719,64 @@ describe("PipelineManager finisher lifecycle tracking", () => {
 			ok: false,
 			summary: "advance_lifecycle rejected: unsupported action 'start'",
 		});
-		expect(pipeline.takeFinisherLifecycleAdvance("task-finish")).toBeNull();
+		expect(pipeline.takeLifecycleRecord("task-finish")).toBeNull();
 	});
 
-	test("records and retrieves fast-worker close markers and clears fast-worker lifecycle advance", () => {
-		type FastWorkerCloseRecord = {
-			taskId: string;
-			reason: string | null;
-			agentId: string | null;
-			ts: number;
-		};
-		type FastWorkerLifecycleAdvanceRecord = {
-			taskId: string;
-			action: "done" | "escalate";
-			message: string | null;
-			reason: string | null;
-			agentId: string | null;
-			ts: number;
-		};
+	test("records and retrieves speedy close markers via unified lifecycle", () => {
 		const pipeline = createLifecyclePipeline();
-		pipeline.advanceFastWorkerLifecycle({
+		// First record an advance, then overwrite with a close
+		pipeline.advanceLifecycle({
+			agentType: "speedy",
 			taskId: "task-fast",
-			action: "done",
+			action: "advance",
+			target: "finisher",
 			message: "completed",
 			reason: "ready",
 			agentId: "fast-1",
 		});
-		pipeline.recordFastWorkerClose({ taskId: "task-fast", reason: "done", agentId: "fast-1" });
-		const fastWorkerLifecycleApi = pipeline as unknown as {
-			takeFastWorkerCloseRecord: (taskId: string) => FastWorkerCloseRecord | null;
-			takeFastWorkerLifecycleAdvance: (taskId: string) => FastWorkerLifecycleAdvanceRecord | null;
-		};
-
-		const closeRecord = fastWorkerLifecycleApi.takeFastWorkerCloseRecord("task-fast");
-		expect(closeRecord).toMatchObject({
+		pipeline.advanceLifecycle({
+			agentType: "speedy",
 			taskId: "task-fast",
+			action: "close",
 			reason: "done",
 			agentId: "fast-1",
 		});
-		expect(fastWorkerLifecycleApi.takeFastWorkerCloseRecord("task-fast")).toBeNull();
-		expect(fastWorkerLifecycleApi.takeFastWorkerLifecycleAdvance("task-fast")).toBeNull();
+
+		const record = pipeline.takeLifecycleRecord("task-fast");
+		expect(record).toMatchObject({
+			taskId: "task-fast",
+			agentType: "speedy",
+			action: "close",
+			reason: "done",
+			agentId: "fast-1",
+		});
+		expect(pipeline.takeLifecycleRecord("task-fast")).toBeNull();
 	});
 	test("records and retrieves finisher close markers", () => {
 		const pipeline = createLifecyclePipeline();
-		pipeline.recordFinisherClose({ taskId: "task-finish", reason: "done", agentId: "finisher-1" });
-
-		const closeRecord = pipeline.takeFinisherCloseRecord("task-finish");
-		expect(closeRecord).toMatchObject({
+		pipeline.advanceLifecycle({
+			agentType: "finisher",
 			taskId: "task-finish",
+			action: "close",
 			reason: "done",
 			agentId: "finisher-1",
 		});
-		expect(pipeline.takeFinisherCloseRecord("task-finish")).toBeNull();
+
+		const closeRecord = pipeline.takeLifecycleRecord("task-finish");
+		expect(closeRecord).toMatchObject({
+			taskId: "task-finish",
+			agentType: "finisher",
+			action: "close",
+			reason: "done",
+			agentId: "finisher-1",
+		});
+		expect(pipeline.takeLifecycleRecord("task-finish")).toBeNull();
 	});
 });
 
-describe("PipelineManager tiny-scope fast-worker routing", () => {
+describe("PipelineManager tiny-scope speedy routing", () => {
 	const createTinyScopeFixture = (opts: {
-		runFastWorkerForTask: () => Promise<{
+		runSpeedyForTask: () => Promise<{
 			done: boolean;
 			escalate: boolean;
 			closed: boolean;
@@ -700,7 +788,7 @@ describe("PipelineManager tiny-scope fast-worker routing", () => {
 		tryClaim?: boolean;
 	}) => {
 		const calls = {
-			runFastWorkerForTask: 0,
+			runSpeedyForTask: 0,
 			runIssuerForTask: 0,
 			spawnWorker: 0,
 			spawnFinisher: 0,
@@ -717,15 +805,15 @@ describe("PipelineManager tiny-scope fast-worker routing", () => {
 				tryClaim: async () => opts.tryClaim ?? true,
 			} as never,
 			spawner: {
-				spawnWorker: async (taskId: string) => {
-					calls.spawnWorker += 1;
+				spawnAgent: async (configKey: string, taskId: string) => {
+					if (configKey === "worker" || configKey === "designer" || configKey === "speedy") {
+						calls.spawnWorker += 1;
+						if (configKey === "designer") {
+							return { ...makeWorker("designer"), agentType: "designer" } as never;
+						}
+					}
 					return makeWorker(taskId);
 				},
-				spawnDesignerWorker: async () =>
-					({
-						...makeWorker("designer"),
-						role: "designer-worker",
-					}) as never,
 			} as never,
 			getMaxWorkers: () => 1,
 			getActiveWorkerAgents: () => [],
@@ -744,7 +832,7 @@ describe("PipelineManager tiny-scope fast-worker routing", () => {
 				calls.finisherOutputs.push(workerOutput);
 				return {
 					...makeWorker("finisher", `finisher:${Date.now()}`),
-					role: "finisher",
+					agentType: "finisher",
 				} as AgentInfo;
 			},
 			isRunning: () => true,
@@ -753,7 +841,7 @@ describe("PipelineManager tiny-scope fast-worker routing", () => {
 
 		(
 			pipeline as unknown as {
-				runFastWorkerForTask: (task: TaskIssue) => Promise<{
+				runSpeedyForTask: (task: TaskIssue) => Promise<{
 					done: boolean;
 					escalate: boolean;
 					closed: boolean;
@@ -762,9 +850,9 @@ describe("PipelineManager tiny-scope fast-worker routing", () => {
 					raw: string | null;
 				}>;
 			}
-		).runFastWorkerForTask = async () => {
-			calls.runFastWorkerForTask += 1;
-			return await opts.runFastWorkerForTask();
+		).runSpeedyForTask = async () => {
+			calls.runSpeedyForTask += 1;
+			return await opts.runSpeedyForTask();
 		};
 		(
 			pipeline as unknown as {
@@ -780,9 +868,9 @@ describe("PipelineManager tiny-scope fast-worker routing", () => {
 		return { pipeline, calls };
 	};
 
-	test("tiny scope uses fast-worker done path and skips issuer/worker spawn", async () => {
+	test("tiny scope uses speedy done path and skips issuer/worker spawn", async () => {
 		const { pipeline, calls } = createTinyScopeFixture({
-			runFastWorkerForTask: async () => ({
+			runSpeedyForTask: async () => ({
 				done: true,
 				escalate: false,
 				closed: false,
@@ -800,16 +888,16 @@ describe("PipelineManager tiny-scope fast-worker routing", () => {
 			task,
 		);
 
-		expect(calls.runFastWorkerForTask).toBe(1);
+		expect(calls.runSpeedyForTask).toBe(1);
 		expect(calls.runIssuerForTask).toBe(0);
 		expect(calls.spawnWorker).toBe(0);
 		expect(calls.spawnFinisher).toBe(1);
 		expect(calls.finisherOutputs).toEqual(["tiny change complete"]);
 	});
 
-	test("tiny scope fast-worker close path skips issuer/worker/finisher spawn", async () => {
+	test("tiny scope speedy close path skips issuer/worker/finisher spawn", async () => {
 		const { pipeline, calls } = createTinyScopeFixture({
-			runFastWorkerForTask: async () => ({
+			runSpeedyForTask: async () => ({
 				done: true,
 				escalate: false,
 				closed: true,
@@ -827,7 +915,7 @@ describe("PipelineManager tiny-scope fast-worker routing", () => {
 			task,
 		);
 
-		expect(calls.runFastWorkerForTask).toBe(1);
+		expect(calls.runSpeedyForTask).toBe(1);
 		expect(calls.runIssuerForTask).toBe(0);
 		expect(calls.spawnWorker).toBe(0);
 		expect(calls.spawnFinisher).toBe(0);
@@ -836,7 +924,7 @@ describe("PipelineManager tiny-scope fast-worker routing", () => {
 
 	test("tiny scope escalation falls through to issuer and spawns worker", async () => {
 		const { pipeline, calls } = createTinyScopeFixture({
-			runFastWorkerForTask: async () => ({
+			runSpeedyForTask: async () => ({
 				done: false,
 				escalate: true,
 				closed: false,
@@ -857,7 +945,7 @@ describe("PipelineManager tiny-scope fast-worker routing", () => {
 			task,
 		);
 
-		expect(calls.runFastWorkerForTask).toBe(1);
+		expect(calls.runSpeedyForTask).toBe(1);
 		expect(calls.runIssuerForTask).toBe(1);
 		expect(calls.spawnWorker).toBe(1);
 		expect(calls.spawnFinisher).toBe(0);
@@ -867,8 +955,8 @@ describe("PipelineManager tiny-scope fast-worker routing", () => {
 
 	test("non-tiny scope keeps normal issuer path", async () => {
 		const { pipeline, calls } = createTinyScopeFixture({
-			runFastWorkerForTask: async () => {
-				throw new Error("fast-worker should not run");
+			runSpeedyForTask: async () => {
+				throw new Error("speedy should not run");
 			},
 			runIssuerForTask: async () => ({
 				start: true,
@@ -883,9 +971,201 @@ describe("PipelineManager tiny-scope fast-worker routing", () => {
 			task,
 		);
 
-		expect(calls.runFastWorkerForTask).toBe(0);
+		expect(calls.runSpeedyForTask).toBe(0);
 		expect(calls.runIssuerForTask).toBe(1);
 		expect(calls.spawnWorker).toBe(1);
 		expect(calls.spawnFinisher).toBe(0);
+	});
+});
+
+describe("PipelineManager pipelineInFlight ref-counting", () => {
+	test("addPipelineInFlight is ref-counted: two adds require two removes", () => {
+		const { pipeline } = createPipeline({});
+
+		pipeline.addPipelineInFlight("task-1");
+		expect(pipeline.isPipelineInFlight("task-1")).toBe(true);
+
+		// Second add increments refcount
+		pipeline.addPipelineInFlight("task-1");
+		expect(pipeline.isPipelineInFlight("task-1")).toBe(true);
+
+		// First remove decrements but does not clear
+		pipeline.removePipelineInFlight("task-1");
+		expect(pipeline.isPipelineInFlight("task-1")).toBe(true);
+
+		// Second remove clears
+		pipeline.removePipelineInFlight("task-1");
+		expect(pipeline.isPipelineInFlight("task-1")).toBe(false);
+	});
+
+	test("removePipelineInFlight is safe when called more times than add", () => {
+		const { pipeline } = createPipeline({});
+
+		pipeline.addPipelineInFlight("task-1");
+		pipeline.removePipelineInFlight("task-1");
+		expect(pipeline.isPipelineInFlight("task-1")).toBe(false);
+
+		// Extra remove should not throw or go negative
+		pipeline.removePipelineInFlight("task-1");
+		expect(pipeline.isPipelineInFlight("task-1")).toBe(false);
+	});
+
+	test("availableWorkerSlots counts ref-counted taskId as one slot", () => {
+		const { pipeline } = createPipeline({});
+
+		// Max workers = 1, no active workers, no reservations => 1 slot
+		expect(pipeline.availableWorkerSlots()).toBe(1);
+
+		// One add => 1 reserved => 0 slots
+		pipeline.addPipelineInFlight("task-1");
+		expect(pipeline.availableWorkerSlots()).toBe(0);
+
+		// Second add for same taskId => still 1 reserved (Map has 1 key) => 0 slots
+		pipeline.addPipelineInFlight("task-1");
+		expect(pipeline.availableWorkerSlots()).toBe(0);
+
+		// First remove => still in-flight => 0 slots
+		pipeline.removePipelineInFlight("task-1");
+		expect(pipeline.availableWorkerSlots()).toBe(0);
+
+		// Second remove => cleared => 1 slot
+		pipeline.removePipelineInFlight("task-1");
+		expect(pipeline.availableWorkerSlots()).toBe(1);
+	});
+
+	test("independent taskIds are tracked separately", () => {
+		const { pipeline } = createPipeline({});
+
+		pipeline.addPipelineInFlight("task-a");
+		pipeline.addPipelineInFlight("task-b");
+
+		pipeline.removePipelineInFlight("task-a");
+		expect(pipeline.isPipelineInFlight("task-a")).toBe(false);
+		expect(pipeline.isPipelineInFlight("task-b")).toBe(true);
+
+		pipeline.removePipelineInFlight("task-b");
+		expect(pipeline.isPipelineInFlight("task-b")).toBe(false);
+	});
+
+	test("runNewTaskPipeline does not block when worker already active (replace_agent race)", async () => {
+		const task = makeTask("task-race-new");
+		const activeWorker = makeWorker(task.id, "worker:task-race-new:replacement");
+		const statusCalls: Array<{ taskId: string; status: string }> = [];
+		const pipeline = new PipelineManager({
+			tasksClient: {
+				updateStatus: async (taskId: string, status: string) => {
+					statusCalls.push({ taskId, status });
+				},
+				comment: async () => {},
+			} as unknown as TaskStoreClient,
+			registry: {
+				getActiveByTask: (queryTaskId: string) => (queryTaskId === task.id ? [activeWorker] : []),
+			} as never,
+			scheduler: {
+				tryClaim: async () => true,
+			} as never,
+			spawner: {
+				spawnAgent: async () => {
+					throw new Error("spawnAgent should not be called");
+				},
+			} as never,
+			getMaxWorkers: () => 1,
+			getActiveWorkerAgents: () => [activeWorker],
+			loopLog: () => {},
+			onDirty: () => {},
+			wake: () => {},
+			attachRpcHandlers: () => {},
+			finishAgent: async () => {},
+			logAgentStart: () => {},
+			logAgentFinished: async () => {},
+			hasPendingInterruptKickoff: () => false,
+			takePendingInterruptKickoff: () => null,
+			hasFinisherTakeover: () => false,
+			spawnFinisherAfterStoppingSteering: async () => {
+				throw new Error("Unexpected finisher spawn");
+			},
+			isRunning: () => true,
+			isPaused: () => false,
+		});
+		// Mock runIssuerForTask to return start=false (simulating issuer abort)
+		(
+			pipeline as unknown as {
+				runIssuerForTask: (t: TaskIssue) => Promise<IssuerResult>;
+			}
+		).runIssuerForTask = async () => ({
+			start: false,
+			skip: false,
+			message: null,
+			reason: "issuer stopped externally \u2014 pipeline replaced by singularity",
+			raw: null,
+		});
+		await (
+			pipeline as unknown as {
+				runNewTaskPipeline: (task: TaskIssue) => Promise<void>;
+			}
+		).runNewTaskPipeline(task);
+		// Task should NOT be blocked because worker is already active
+		const blockedCalls = statusCalls.filter(c => c.status === "blocked");
+		expect(blockedCalls).toEqual([]);
+	});
+
+	test("runResumePipeline does not block when worker already active (replace_agent race)", async () => {
+		const task = makeTask("task-race-resume");
+		const activeWorker = makeWorker(task.id, "worker:task-race-resume:replacement");
+		const statusCalls: Array<{ taskId: string; status: string }> = [];
+		const pipeline = new PipelineManager({
+			tasksClient: {
+				updateStatus: async (taskId: string, status: string) => {
+					statusCalls.push({ taskId, status });
+				},
+				comment: async () => {},
+			} as unknown as TaskStoreClient,
+			registry: {
+				getActiveByTask: (queryTaskId: string) => (queryTaskId === task.id ? [activeWorker] : []),
+			} as never,
+			scheduler: {} as never,
+			spawner: {
+				spawnAgent: async () => {
+					throw new Error("spawnAgent should not be called");
+				},
+			} as never,
+			getMaxWorkers: () => 1,
+			getActiveWorkerAgents: () => [activeWorker],
+			loopLog: () => {},
+			onDirty: () => {},
+			wake: () => {},
+			attachRpcHandlers: () => {},
+			finishAgent: async () => {},
+			logAgentStart: () => {},
+			logAgentFinished: async () => {},
+			hasPendingInterruptKickoff: () => false,
+			takePendingInterruptKickoff: () => null,
+			hasFinisherTakeover: () => false,
+			spawnFinisherAfterStoppingSteering: async () => {
+				throw new Error("Unexpected finisher spawn");
+			},
+			isRunning: () => true,
+			isPaused: () => false,
+		});
+		// Mock runIssuerForTask to return action=block (simulating issuer abort)
+		(
+			pipeline as unknown as {
+				runIssuerForTask: (t: TaskIssue) => Promise<IssuerResult>;
+			}
+		).runIssuerForTask = async () => ({
+			start: false,
+			skip: false,
+			message: null,
+			reason: "issuer stopped externally \u2014 pipeline replaced by singularity",
+			raw: null,
+		});
+		await (
+			pipeline as unknown as {
+				runResumePipeline: (task: TaskIssue) => Promise<void>;
+			}
+		).runResumePipeline(task);
+		// Task should NOT be blocked because worker is already active
+		const blockedCalls = statusCalls.filter(c => c.status === "blocked");
+		expect(blockedCalls).toEqual([]);
 	});
 });

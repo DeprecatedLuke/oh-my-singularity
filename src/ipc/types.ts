@@ -1,6 +1,12 @@
-import { LIMIT_MESSAGE_HISTORY_DEFAULT, TIMEOUT_AGENT_WAIT_MS, TIMEOUT_MIN_MS } from "../config/constants";
-export type ReplaceAgentRole = "finisher" | "issuer" | "worker";
-export type ReplaceAgentRoleField = ReplaceAgentRole | "";
+import {
+	getAgentLifecycleConfig,
+	getReplaceableAgents,
+	LIMIT_MESSAGE_HISTORY_DEFAULT,
+	type LifecycleAction,
+	TIMEOUT_AGENT_WAIT_MS,
+	TIMEOUT_MIN_MS,
+} from "../config/constants";
+export type ReplaceAgentTypeField = string;
 
 interface IPCMessageBase {
 	type: string;
@@ -23,43 +29,13 @@ export interface TasksRequestMessage extends IPCMessageBase {
 	defaultTaskId?: string;
 }
 
-export interface IssuerAdvanceLifecycleMessage extends IPCMessageBase {
-	type: "issuer_advance_lifecycle";
+export interface AdvanceLifecycleMessage extends IPCMessageBase {
+	type: "advance_lifecycle";
+	agentType: string;
 	taskId: string;
 	action: string;
+	target: string;
 	message: string;
-	reason: string;
-	agentId: string;
-}
-
-export interface FastWorkerAdvanceLifecycleMessage extends IPCMessageBase {
-	type: "fast_worker_advance_lifecycle";
-	taskId: string;
-	action: string;
-	message: string;
-	reason: string;
-	agentId: string;
-}
-
-export interface FastWorkerCloseTaskMessage extends IPCMessageBase {
-	type: "fast_worker_close_task";
-	taskId: string;
-	reason: string;
-	agentId: string;
-}
-
-export interface FinisherAdvanceLifecycleMessage extends IPCMessageBase {
-	type: "finisher_advance_lifecycle";
-	taskId: string;
-	action: string;
-	message: string;
-	reason: string;
-	agentId: string;
-}
-
-export interface FinisherCloseTaskMessage extends IPCMessageBase {
-	type: "finisher_close_task";
-	taskId: string;
 	reason: string;
 	agentId: string;
 }
@@ -97,7 +73,7 @@ export interface SteerAgentMessage extends IPCMessageBase {
 
 export interface ReplaceAgentMessage extends IPCMessageBase {
 	type: "replace_agent";
-	role: ReplaceAgentRoleField;
+	agent: ReplaceAgentTypeField;
 	taskId: string;
 	context: string;
 }
@@ -107,21 +83,6 @@ export interface StopAgentsForTaskMessage extends IPCMessageBase {
 	taskId: string;
 	includeFinisher: boolean;
 	waitForCompletion: boolean;
-}
-
-export interface ComplainMessage extends IPCMessageBase {
-	type: "complain";
-	files: string[];
-	reason: string;
-	complainantAgentId?: string;
-	complainantTaskId?: string;
-}
-
-export interface RevokeComplaintMessage extends IPCMessageBase {
-	type: "revoke_complaint";
-	files?: string[];
-	complainantAgentId?: string;
-	complainantTaskId?: string;
 }
 
 export interface WaitForAgentMessage extends IPCMessageBase {
@@ -151,11 +112,7 @@ export interface IPCMessageMap {
 	start_tasks: StartTasksMessage;
 
 	tasks_request: TasksRequestMessage;
-	issuer_advance_lifecycle: IssuerAdvanceLifecycleMessage;
-	fast_worker_advance_lifecycle: FastWorkerAdvanceLifecycleMessage;
-	fast_worker_close_task: FastWorkerCloseTaskMessage;
-	finisher_advance_lifecycle: FinisherAdvanceLifecycleMessage;
-	finisher_close_task: FinisherCloseTaskMessage;
+	advance_lifecycle: AdvanceLifecycleMessage;
 	merger_complete: MergerCompleteMessage;
 	merger_conflict: MergerConflictMessage;
 	broadcast: BroadcastMessage;
@@ -163,8 +120,6 @@ export interface IPCMessageMap {
 	steer_agent: SteerAgentMessage;
 	replace_agent: ReplaceAgentMessage;
 	stop_agents_for_task: StopAgentsForTaskMessage;
-	complain: ComplainMessage;
-	revoke_complaint: RevokeComplaintMessage;
 	wait_for_agent: WaitForAgentMessage;
 	list_active_agents: ListActiveAgentsMessage;
 	list_task_agents: ListTaskAgentsMessage;
@@ -187,11 +142,7 @@ const CORE_IPC_MESSAGE_TYPES = [
 	"start_tasks",
 
 	"tasks_request",
-	"issuer_advance_lifecycle",
-	"fast_worker_advance_lifecycle",
-	"fast_worker_close_task",
-	"finisher_advance_lifecycle",
-	"finisher_close_task",
+	"advance_lifecycle",
 	"merger_complete",
 	"merger_conflict",
 	"broadcast",
@@ -199,17 +150,14 @@ const CORE_IPC_MESSAGE_TYPES = [
 	"steer_agent",
 	"replace_agent",
 	"stop_agents_for_task",
-	"complain",
-	"revoke_complaint",
 	"wait_for_agent",
 	"list_active_agents",
 	"list_task_agents",
 	"read_message_history",
 ] as const;
 
-const REPLACE_AGENT_ROLES = new Set<ReplaceAgentRole>(["finisher", "issuer", "worker"]);
-const FAST_WORKER_LIFECYCLE_ACTIONS = new Set(["done", "escalate"]);
-const FINISHER_LIFECYCLE_ACTIONS = new Set(["worker", "issuer", "defer"]);
+const REPLACEABLE_AGENTS = getReplaceableAgents();
+const LIFECYCLE_ACTIONS = new Set<LifecycleAction>(["close", "block", "advance"]);
 const WAIT_FOR_AGENT_DEFAULT_TIMEOUT_MS = TIMEOUT_AGENT_WAIT_MS;
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -306,36 +254,6 @@ function readNumberField(
 	return { ok: true, value: normalized };
 }
 
-function readFilesField(
-	rec: Record<string, unknown>,
-	messageType: string,
-	field: string,
-	optional: false,
-): FieldParseResult<string[]>;
-function readFilesField(
-	rec: Record<string, unknown>,
-	messageType: string,
-	field: string,
-	optional: true,
-): FieldParseResult<string[] | undefined>;
-function readFilesField(
-	rec: Record<string, unknown>,
-	messageType: string,
-	field: string,
-	optional: boolean,
-): FieldParseResult<string[] | undefined> {
-	const value = rec[field];
-	if (value === undefined) return { ok: true, value: optional ? undefined : [] };
-	if (!Array.isArray(value)) {
-		return invalidField(messageType, field, "an array of strings", value);
-	}
-	const files = value
-		.filter((file: unknown): file is string => typeof file === "string")
-		.map((file: string) => file.trim())
-		.filter((file: string) => file.length > 0);
-	return { ok: true, value: files };
-}
-
 export function parseIPCMessage(payload: unknown): ParseIPCMessageResult {
 	const rec = asRecord(payload);
 	if (!rec) return { ok: true, message: { type: "wake" } };
@@ -372,40 +290,35 @@ export function parseIPCMessage(payload: unknown): ParseIPCMessageResult {
 				},
 			};
 		}
-		case "issuer_advance_lifecycle": {
-			const taskId = readStringField(rec, rawType, "taskId");
-			if (!taskId.ok) return taskId;
-			const action = readStringField(rec, rawType, "action");
-			if (!action.ok) return action;
-			const message = readStringField(rec, rawType, "message");
-			if (!message.ok) return message;
-			const reason = readStringField(rec, rawType, "reason");
-			if (!reason.ok) return reason;
-			const agentId = readStringField(rec, rawType, "agentId");
-			if (!agentId.ok) return agentId;
-			return {
-				ok: true,
-				message: {
-					...rec,
-					type: rawType,
-					taskId: taskId.value,
-					action: action.value,
-					message: message.value,
-					reason: reason.value,
-					agentId: agentId.value,
-				},
-			};
-		}
-		case "fast_worker_advance_lifecycle": {
+		case "advance_lifecycle": {
+			const agentType = readStringField(rec, rawType, "agentType", { trim: true });
+			if (!agentType.ok) return agentType;
 			const taskId = readStringField(rec, rawType, "taskId");
 			if (!taskId.ok) return taskId;
 			const action = readStringField(rec, rawType, "action", { trim: true });
 			if (!action.ok) return action;
-			if (!FAST_WORKER_LIFECYCLE_ACTIONS.has(action.value)) {
+			if (!LIFECYCLE_ACTIONS.has(action.value as LifecycleAction)) {
 				return {
 					ok: false,
-					error: `Invalid IPC payload for "${rawType}": "action" must be one of done, escalate (received "${action.value || "(empty)"}").`,
+					error: `Invalid IPC payload for "${rawType}": "action" must be one of close, block, advance (received "${action.value || "(empty)"}").`,
 				};
+			}
+			const target = readStringField(rec, rawType, "target");
+			if (!target.ok) return target;
+			if (action.value === "advance") {
+				if (!target.value.trim()) {
+					return {
+						ok: false,
+						error: `Invalid IPC payload for "${rawType}": "target" is required when action is "advance".`,
+					};
+				}
+				const lifecycleCfg = getAgentLifecycleConfig(agentType.value);
+				if (lifecycleCfg && !lifecycleCfg.allowedAdvanceTargets.includes(target.value.trim())) {
+					return {
+						ok: false,
+						error: `Invalid IPC payload for "${rawType}": target "${target.value}" is not a valid advance target for agent type "${agentType.value}". Valid targets: ${lifecycleCfg.allowedAdvanceTargets.join(", ")}.`,
+					};
+				}
 			}
 			const message = readStringField(rec, rawType, "message");
 			if (!message.ok) return message;
@@ -418,77 +331,11 @@ export function parseIPCMessage(payload: unknown): ParseIPCMessageResult {
 				message: {
 					...rec,
 					type: rawType,
+					agentType: agentType.value,
 					taskId: taskId.value,
 					action: action.value,
+					target: target.value,
 					message: message.value,
-					reason: reason.value,
-					agentId: agentId.value,
-				},
-			};
-		}
-
-		case "fast_worker_close_task": {
-			const taskId = readStringField(rec, rawType, "taskId");
-			if (!taskId.ok) return taskId;
-			const reason = readStringField(rec, rawType, "reason");
-			if (!reason.ok) return reason;
-			const agentId = readStringField(rec, rawType, "agentId");
-			if (!agentId.ok) return agentId;
-			return {
-				ok: true,
-				message: {
-					...rec,
-					type: rawType,
-					taskId: taskId.value,
-					reason: reason.value,
-					agentId: agentId.value,
-				},
-			};
-		}
-
-		case "finisher_advance_lifecycle": {
-			const taskId = readStringField(rec, rawType, "taskId");
-			if (!taskId.ok) return taskId;
-			const action = readStringField(rec, rawType, "action", { trim: true });
-			if (!action.ok) return action;
-			if (!FINISHER_LIFECYCLE_ACTIONS.has(action.value)) {
-				return {
-					ok: false,
-					error: `Invalid IPC payload for "${rawType}": "action" must be one of worker, issuer, defer (received "${action.value || "(empty)"}").`,
-				};
-			}
-			const message = readStringField(rec, rawType, "message");
-			if (!message.ok) return message;
-			const reason = readStringField(rec, rawType, "reason");
-			if (!reason.ok) return reason;
-			const agentId = readStringField(rec, rawType, "agentId");
-			if (!agentId.ok) return agentId;
-			return {
-				ok: true,
-				message: {
-					...rec,
-					type: rawType,
-					taskId: taskId.value,
-					action: action.value,
-					message: message.value,
-					reason: reason.value,
-					agentId: agentId.value,
-				},
-			};
-		}
-		case "finisher_close_task": {
-			const taskId = readStringField(rec, rawType, "taskId");
-			if (!taskId.ok) return taskId;
-			const reason = readStringField(rec, rawType, "reason");
-			if (!reason.ok) return reason;
-			const agentId = readStringField(rec, rawType, "agentId");
-			if (!agentId.ok) return agentId;
-			return {
-				ok: true,
-				message: {
-					...rec,
-					type: rawType,
-					taskId: taskId.value,
 					reason: reason.value,
 					agentId: agentId.value,
 				},
@@ -574,28 +421,28 @@ export function parseIPCMessage(payload: unknown): ParseIPCMessageResult {
 			};
 		}
 		case "replace_agent": {
-			const role = readStringField(rec, rawType, "role");
-			if (!role.ok) return role;
+			const agent = readStringField(rec, rawType, "agent");
+			if (!agent.ok) return agent;
 			const taskId = readStringField(rec, rawType, "taskId");
 			if (!taskId.ok) return taskId;
 			const context = readStringField(rec, rawType, "context");
 			if (!context.ok) return context;
 
-			const normalizedRole = role.value.trim();
-			if (normalizedRole && !REPLACE_AGENT_ROLES.has(normalizedRole as ReplaceAgentRole)) {
+			const normalizedAgent = agent.value.trim();
+			if (normalizedAgent && !REPLACEABLE_AGENTS.has(normalizedAgent)) {
 				return {
 					ok: false,
-					error: `Invalid IPC payload for "${rawType}": "role" must be one of finisher, issuer, worker (received "${normalizedRole}").`,
+					error: `Invalid IPC payload for "${rawType}": "agent" must be one of ${[...REPLACEABLE_AGENTS].join(", ")} (received "${normalizedAgent}").`,
 				};
 			}
-			const typedRole: ReplaceAgentRoleField = normalizedRole ? (normalizedRole as ReplaceAgentRole) : "";
+			const typedAgent: ReplaceAgentTypeField = normalizedAgent || "";
 
 			return {
 				ok: true,
 				message: {
 					...rec,
 					type: rawType,
-					role: typedRole,
+					agent: typedAgent,
 					taskId: taskId.value,
 					context: context.value,
 				},
@@ -616,45 +463,6 @@ export function parseIPCMessage(payload: unknown): ParseIPCMessageResult {
 					taskId: taskId.value,
 					includeFinisher: includeFinisher.value,
 					waitForCompletion: waitForCompletion.value,
-				},
-			};
-		}
-		case "complain": {
-			const files = readFilesField(rec, rawType, "files", false);
-			if (!files.ok) return files;
-			const reason = readStringField(rec, rawType, "reason");
-			if (!reason.ok) return reason;
-			const complainantAgentId = readOptionalStringField(rec, rawType, "complainantAgentId");
-			if (!complainantAgentId.ok) return complainantAgentId;
-			const complainantTaskId = readOptionalStringField(rec, rawType, "complainantTaskId");
-			if (!complainantTaskId.ok) return complainantTaskId;
-			return {
-				ok: true,
-				message: {
-					...rec,
-					type: rawType,
-					files: files.value,
-					reason: reason.value,
-					complainantAgentId: complainantAgentId.value,
-					complainantTaskId: complainantTaskId.value,
-				},
-			};
-		}
-		case "revoke_complaint": {
-			const files = readFilesField(rec, rawType, "files", true);
-			if (!files.ok) return files;
-			const complainantAgentId = readOptionalStringField(rec, rawType, "complainantAgentId");
-			if (!complainantAgentId.ok) return complainantAgentId;
-			const complainantTaskId = readOptionalStringField(rec, rawType, "complainantTaskId");
-			if (!complainantTaskId.ok) return complainantTaskId;
-			return {
-				ok: true,
-				message: {
-					...rec,
-					type: rawType,
-					files: files.value,
-					complainantAgentId: complainantAgentId.value,
-					complainantTaskId: complainantTaskId.value,
 				},
 			};
 		}

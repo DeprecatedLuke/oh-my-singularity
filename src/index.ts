@@ -75,7 +75,7 @@ async function main(opts: OmsLaunchOptions): Promise<void> {
 	const systemAgentId = "oms:system";
 	registry.register({
 		id: systemAgentId,
-		role: "finisher",
+		agentType: "finisher",
 		taskId: null,
 		tasksAgentId: "",
 		status: "running",

@@ -28,7 +28,7 @@ import type { TaskIssue } from "../tasks/types";
 import { asRecord, logger } from "../utils";
 
 const PIPE_SINGULARITY_FALLBACK_TOOLS =
-	"tasks,start_tasks,broadcast_to_workers,replace_agent,delete_task_issue,read,edit,grep,find,lsp,bash,python,calc,fetch,web_search";
+	"tasks,start_tasks,replace_agent,delete_task_issue,read,edit,grep,find,lsp,bash,python,calc,fetch,web_search";
 
 function normalizePipeSingularityTools(tools: string | undefined): string | undefined {
 	const base = typeof tools === "string" && tools.trim() ? tools : PIPE_SINGULARITY_FALLBACK_TOOLS;
@@ -552,7 +552,7 @@ export async function runPipeMode(opts: {
 				cwd: opts.targetProjectPath,
 				env: buildEnv({
 					TASKS_ACTOR: "oms-singularity",
-					OMS_ROLE: "singularity",
+					OMS_AGENT_TYPE: "singularity",
 					OMS_PIPE_MODE: "1",
 					OMS_SINGULARITY_SOCK: opts.singularitySockPath,
 				}),
@@ -663,7 +663,7 @@ export async function runPipeMode(opts: {
 				const status = typeof agent.status === "string" ? agent.status.trim().toLowerCase() : "";
 				return status === "failed" || status === "dead" || status === "aborted";
 			})
-			.map(agent => `agent ${agent.id} (${agent.role}) on ${agent.taskId} ended with status ${agent.status}`);
+			.map(agent => `agent ${agent.id} (${agent.agentType}) on ${agent.taskId} ended with status ${agent.status}`);
 
 		const summary = buildPipeResultSummary({
 			request: userRequest,

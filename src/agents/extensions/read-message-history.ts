@@ -3,7 +3,7 @@ import { createToolRenderers } from "./tool-renderers";
 import type { ExtensionAPI } from "./types";
 
 /**
- * OMS extension for resolver agents.
+ * OMS extension for reading agent message history.
  *
  * Provides read-only access to active agents and recent message history:
  * - list_active_agents()
@@ -31,7 +31,7 @@ export default async function readMessageHistoryExtension(api: ExtensionAPI): Pr
 	api.registerTool({
 		name: "list_active_agents",
 		label: "List Active Agents",
-		description: "List active OMS agents with role/task metadata.",
+		description: "List active OMS agents with agent/task metadata.",
 		parameters: Type.Object({}, { additionalProperties: false }),
 		renderCall: listRenderCall,
 		execute: async () => {

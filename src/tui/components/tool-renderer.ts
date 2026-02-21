@@ -542,18 +542,14 @@ function formatStartTasksResultPreview(value: unknown, isError: boolean): string
 /** Set of OMS custom IPC tool names that use the standard { content: [...], details?: {...} } format. */
 const OMS_IPC_TOOLS = new Set([
 	"delete_task_issue",
-	"broadcast_to_workers",
 	"replace_agent",
 	"interrupt_agent",
 	"steer_agent",
 	"resume_agent",
 	"advance_lifecycle",
-	"close_task",
 	"list_active_agents",
 	"read_message_history",
 	"list_task_agents",
-	"complain",
-	"revoke_complaint",
 	"wait_for_agent",
 ]);
 
@@ -667,26 +663,22 @@ export function formatToolArgs(toolName: string, args: unknown): string {
 		// OMS custom IPC tools
 		case "delete_task_issue":
 			return typeof rec.id === "string" ? rec.id : previewValue(args, 80);
-		case "broadcast_to_workers":
-			return typeof rec.message === "string" ? clipText(squashWhitespace(rec.message), 80) : previewValue(args, 80);
 		case "replace_agent": {
-			const role = typeof rec.role === "string" ? rec.role : "";
+			const agent = typeof rec.agent === "string" ? rec.agent : "";
 			const tid = typeof rec.taskId === "string" ? rec.taskId : "";
-			return role && tid ? `${role} ${tid}` : role || tid || previewValue(args, 80);
+			return agent && tid ? `${agent} ${tid}` : agent || tid || previewValue(args, 80);
 		}
 		case "interrupt_agent":
 		case "steer_agent":
 		case "resume_agent":
 		case "list_task_agents":
 			return typeof rec.taskId === "string" ? rec.taskId : previewValue(args, 80);
-		case "close_task":
-			return typeof rec.reason === "string" ? clipText(squashWhitespace(rec.reason), 80) : previewValue(args, 80);
 		case "advance_lifecycle":
-			return typeof rec.action === "string" ? rec.action : previewValue(args, 80);
-		case "complain":
-			return typeof rec.reason === "string" ? clipText(squashWhitespace(rec.reason), 80) : previewValue(args, 80);
-		case "revoke_complaint":
-			return Array.isArray(rec.files) ? rec.files.slice(0, 3).join(", ") : previewValue(args, 80);
+			return typeof rec.action === "string"
+				? rec.target
+					? `${rec.action} → ${rec.target}`
+					: rec.action
+				: previewValue(args, 80);
 		case "wait_for_agent":
 			return typeof rec.agentId === "string" ? rec.agentId : previewValue(args, 80);
 		case "read_message_history":
@@ -717,7 +709,19 @@ function isTaskCommentsResult(block: ToolBlock): boolean {
 	return action === "comments";
 }
 
-
+/** Check if a completed tool block has no meaningful output to display. */
+function hasNoMeaningfulOutput(block: ToolBlock): boolean {
+	if (block.resultContent?.trim()) return false;
+	const data = block.resultData;
+	if (data === undefined || data === null) {
+		const base = getToolBaseName(block.toolName);
+		if (base === "start_tasks" || base === "wake" || base === "wakeup") return false;
+		if (OMS_IPC_TOOLS.has(base)) return false;
+		return true;
+	}
+	const { payload } = extractToolPayload(data);
+	return payload === null || payload === undefined;
+}
 
 export function renderToolBlockLines(block: ToolBlock, width: number): string[] {
 	if (width < 8) return [];
@@ -787,6 +791,22 @@ export function renderToolBlockLines(block: ToolBlock, width: number): string[] 
 		return contentTextLines;
 	}
 
+	// ---- Collapse no-output success blocks to single line ----
+	if (block.state === "success" && hasNoMeaningfulOutput(block)) {
+		const bgAnsi = BG.toolSuccess;
+		const argsClipped = block.argsPreview ? clipText(block.argsPreview, Math.max(0, width - 25)) : "";
+		const argsStr = argsClipped ? ` ${FG.dim}${ICON.dot}${RESET_FG} ${FG.dim}${argsClipped}${RESET_FG}` : "";
+		const labelContent = `${ICON.success} ${BOLD}${block.toolName}${UNBOLD}${argsStr}`;
+		const labelPadded = ` ${labelContent} `;
+		const labelVW = visibleWidth(labelPadded);
+		const fillCount = Math.max(0, width - labelVW);
+		const line = `${labelPadded}${FG.dim}${BOX.h.repeat(fillCount)}${RESET_FG}`;
+		const clipped = clipAnsi(line, width);
+		const vw = visibleWidth(clipped);
+		const pad = " ".repeat(Math.max(0, width - vw));
+		return [`${bgAnsi}${clipped}${pad}${RESET}`];
+	}
+
 	// State-based colors
 	const borderFg = block.state === "error" ? FG.error : block.state === "pending" ? FG.accent : FG.dim;
 	const icon = block.state === "error" ? ICON.error : block.state === "pending" ? ICON.pending : ICON.success;
@@ -823,4 +843,3 @@ export function renderToolBlockLines(block: ToolBlock, width: number): string[] 
 		return `${bgAnsi}${clipped}${pad}${RESET}`;
 	});
 }
-

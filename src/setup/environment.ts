@@ -82,21 +82,21 @@ export function loadOmsConfigOverride(configPath: string): OmsConfigOverride | n
 }
 
 function mergeOmsConfigOverrides(base: OmsConfigOverride, patch: OmsConfigOverride): OmsConfigOverride {
-	const { layout, roles, ...topLevelPatch } = patch;
+	const { layout, agents, ...topLevelPatch } = patch;
 	const merged: OmsConfigOverride = { ...base, ...topLevelPatch };
 
 	if (layout && Object.keys(layout).length > 0) {
 		merged.layout = { ...(merged.layout ?? {}), ...layout };
 	}
 
-	if (roles && Object.keys(roles).length > 0) {
-		const mergedRoles = { ...(merged.roles ?? {}) } as NonNullable<OmsConfigOverride["roles"]>;
-		for (const roleKey of Object.keys(roles) as Array<keyof typeof roles>) {
-			const rolePatch = roles[roleKey];
-			if (!rolePatch) continue;
-			mergedRoles[roleKey] = { ...(mergedRoles[roleKey] ?? {}), ...rolePatch };
+	if (agents && Object.keys(agents).length > 0) {
+		const mergedAgents = { ...(merged.agents ?? {}) } as NonNullable<OmsConfigOverride["agents"]>;
+		for (const agentKey of Object.keys(agents) as Array<keyof typeof agents>) {
+			const agentPatch = agents[agentKey];
+			if (!agentPatch) continue;
+			mergedAgents[agentKey] = { ...(mergedAgents[agentKey] ?? {}), ...agentPatch };
 		}
-		merged.roles = mergedRoles;
+		merged.agents = mergedAgents;
 	}
 
 	return merged;

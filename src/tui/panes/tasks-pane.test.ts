@@ -89,7 +89,7 @@ describe("TasksPane agent line formatting", () => {
 
 		registry.register({
 			id: "worker-1",
-			role: "worker",
+			agentType: "worker",
 			taskId: issue.id,
 			tasksAgentId: "agent-1",
 			status: "done",

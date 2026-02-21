@@ -33,7 +33,7 @@ export default async function readTaskMessageHistoryExtension(api: ExtensionAPI)
 		name: "list_task_agents",
 		label: "List Task Agents",
 		description:
-			"List OMS agents assigned to the current task. Task-scoped: only shows agents on YOUR current task, cannot inspect unrelated tasks. Returns id, role, state, and lastActivity.",
+			"List OMS agents assigned to the current task. Task-scoped: only shows agents on YOUR current task, cannot inspect unrelated tasks. Returns id, agentType, state, and lastActivity.",
 		parameters: Type.Object({}, { additionalProperties: false }),
 		renderCall: listRenderCall,
 		execute: async () => {

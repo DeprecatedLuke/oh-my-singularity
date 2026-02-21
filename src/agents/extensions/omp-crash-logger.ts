@@ -102,9 +102,9 @@ export default async function ompCrashLoggerExtension(_api: ExtensionAPI): Promi
 
 			const ts = Date.now();
 			const isoTs = new Date(ts).toISOString();
-			const role = sanitizeToken(process.env.OMS_ROLE, "unknown-role");
+			const agentType = sanitizeToken(process.env.OMS_AGENT_TYPE, "unknown-agent");
 			const agentId = sanitizeToken(process.env.OMS_AGENT_ID, "unknown-agent");
-			const fileName = `omp-crash-${formatTimestampForFilename(ts)}-${agentId}-${role}.log`;
+			const fileName = `omp-crash-${formatTimestampForFilename(ts)}-${agentId}-${agentType}.log`;
 			const filePath = path.join(crashesDir, fileName);
 
 			const normalizedError = normalizeError(error);
@@ -128,7 +128,7 @@ export default async function ompCrashLoggerExtension(_api: ExtensionAPI): Promi
 			lines.push("");
 			lines.push(
 				formatSection("agent", {
-					role: process.env.OMS_ROLE ?? null,
+					agentType: process.env.OMS_AGENT_TYPE ?? null,
 					taskId: process.env.OMS_TASK_ID ?? null,
 					agentId: process.env.OMS_AGENT_ID ?? null,
 					tasksActor: process.env.TASKS_ACTOR ?? null,

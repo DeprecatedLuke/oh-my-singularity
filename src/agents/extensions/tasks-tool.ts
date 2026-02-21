@@ -2,7 +2,7 @@
  * Tasks tool extension for omp.
  *
  * Registers a single tool `tasks` with a constrained set of allowed actions.
- * The outer harness can load different extension modules per agent role to
+ * The outer harness can load different extension modules per agent type to
  * enforce task permissions via tool availability.
  */
 
@@ -23,12 +23,12 @@ import { createToolRenderers } from "./tool-renderers";
 import type { ExtensionAPI, ToolRenderResultOptions, ToolResultWithError, ToolTheme, UnknownRecord } from "./types";
 
 type TasksExtensionOptions = {
-	role?: string;
+	agentType?: string;
 	allowedActions?: string[];
 };
 
 export function makeTasksExtension(opts: TasksExtensionOptions) {
-	const role = opts?.role ?? "agent";
+	const agentType = opts?.agentType ?? "agent";
 	const allowed = new Set(Array.isArray(opts?.allowedActions) ? opts.allowedActions : []);
 
 	return async function tasksExtension(api: ExtensionAPI): Promise<void> {
@@ -145,7 +145,9 @@ export function makeTasksExtension(opts: TasksExtensionOptions) {
 					priority: Type.Optional(Type.Number({ description: "Priority (0-4)" })),
 					assignee: Type.Optional(Type.String({ description: "Assignee" })),
 					scope: Type.Optional(
-						Type.String({ description: "Expected work size (tiny|small|medium|large|xlarge)" }),
+						Type.String({
+							description: "Expected work size (tiny|small|medium|large|xlarge); required when action is create",
+						}),
 					),
 					depends_on: Type.Optional(
 						Type.Union([Type.String(), Type.Array(Type.String())], {
@@ -203,21 +205,22 @@ export function makeTasksExtension(opts: TasksExtensionOptions) {
 
 				if (!allowed.has(action)) {
 					const workerLifecycleAction =
-						(role === "worker" || role === "designer-worker") && (action === "close" || action === "update");
-					const singularityLifecycleAction = role === "singularity" && (action === "close" || action === "update");
+						(agentType === "worker" || agentType === "designer") && (action === "close" || action === "update");
+					const singularityLifecycleAction =
+						agentType === "singularity" && (action === "close" || action === "update");
 					const message = workerLifecycleAction
-						? `tasks: action not permitted: ${action} (role=${role}). ` +
+						? `tasks: action not permitted: ${action} (agentType=${agentType}). ` +
 							"Workers must exit with a concise summary; finisher handles update/close."
 						: singularityLifecycleAction
-							? `tasks: action not permitted: ${action} (role=${role}). ` +
-								"Singularity must not mutate issue lifecycle directly. Use broadcast_to_workers to coordinate, then let steering/finisher handle close/update."
-							: `tasks: action not permitted: ${action} (role=${role})`;
+							? `tasks: action not permitted: ${action} (agentType=${agentType}). ` +
+								"Singularity must not mutate issue lifecycle directly. Let steering/finisher handle close/update."
+							: `tasks: action not permitted: ${action} (agentType=${agentType})`;
 					throw new Error(message);
 				}
 
 				const sockPath = requireSockPath();
 
-				const actor = process.env.TASKS_ACTOR ?? `oms-${role}`;
+				const actor = process.env.TASKS_ACTOR ?? `oms-${agentType}`;
 				const defaultTaskId =
 					typeof process.env.OMS_TASK_ID === "string" && process.env.OMS_TASK_ID.trim()
 						? process.env.OMS_TASK_ID.trim()

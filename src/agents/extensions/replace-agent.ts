@@ -14,27 +14,29 @@ import type { ExtensionAPI } from "./types";
 export default async function replaceAgentExtension(api: ExtensionAPI): Promise<void> {
 	const { Type } = api.typebox;
 	const { renderCall, renderResult } = createToolRenderers("Replace Agent", args => {
-		const role = typeof args?.role === "string" ? args.role.trim() : "";
+		const agent = typeof args?.agent === "string" ? args.agent.trim() : "";
 		const taskId = typeof args?.taskId === "string" ? args.taskId.trim() : "";
 		const context = typeof args?.context === "string" ? args.context.trim() : "";
-		return [role ? `role=${role}` : "", taskId ? `taskId=${taskId}` : "", context ? `context=${context}` : ""].filter(
-			Boolean,
-		);
+		return [
+			agent ? `agent=${agent}` : "",
+			taskId ? `taskId=${taskId}` : "",
+			context ? `context=${context}` : "",
+		].filter(Boolean);
 	});
 
 	api.registerTool({
 		name: "replace_agent",
 		label: "Replace Agent",
 		description:
-			"Replace or start a lifecycle agent for a specific task. If an agent of that role is already running, this kills it and spawns a fresh replacement; if none exists, this starts one. " +
+			"Replace or start a lifecycle agent for a specific task. If an agent of that type is already running, this kills it and spawns a fresh replacement; if none exists, this starts one. " +
 			"Use when an agent is stuck, dead, or on the wrong approach and needs a clean restart. " +
 			"For blocked tasks needing unblock/close, replace with a finisher. " +
 			"For tasks needing fresh analysis, replace with an issuer (runs full issuer→worker pipeline). " +
 			"For tasks where you already know the implementation guidance, replace with a worker directly.",
 		parameters: Type.Object(
 			{
-				role: Type.Union([Type.Literal("finisher"), Type.Literal("issuer"), Type.Literal("worker")], {
-					description: "Agent role to replace",
+				agent: Type.Union([Type.Literal("finisher"), Type.Literal("issuer"), Type.Literal("worker")], {
+					description: "Agent type to replace",
 				}),
 				taskId: Type.String({
 					description: "Tasks issue ID to replace the agent for",
@@ -56,12 +58,12 @@ export default async function replaceAgentExtension(api: ExtensionAPI): Promise<
 		execute: async (_toolCallId, params) => {
 			const sockPath = requireSockPath();
 
-			const role = typeof params?.role === "string" ? params.role.trim() : "";
+			const agent = typeof params?.agent === "string" ? params.agent.trim() : "";
 			const taskId = typeof params?.taskId === "string" ? params.taskId.trim() : "";
 			const context = typeof params?.context === "string" ? params.context.trim() : "";
 
-			if (!role || !["finisher", "issuer", "worker"].includes(role)) {
-				throw new Error("replace_agent: role must be one of: finisher, issuer, worker");
+			if (!agent || !["finisher", "issuer", "worker"].includes(agent)) {
+				throw new Error("replace_agent: agent must be one of: finisher, issuer, worker");
 			}
 
 			if (!taskId) {
@@ -70,7 +72,7 @@ export default async function replaceAgentExtension(api: ExtensionAPI): Promise<
 
 			const payload = {
 				type: "replace_agent",
-				role,
+				agent,
 				taskId,
 				context: context || undefined,
 				ts: Date.now(),
@@ -84,7 +86,7 @@ export default async function replaceAgentExtension(api: ExtensionAPI): Promise<
 					content: [
 						{
 							type: "text",
-							text: `OK (replace_agent queued: ${role} for task ${taskId})`,
+							text: `OK (replace_agent queued: ${agent} for task ${taskId})`,
 						},
 					],
 				};

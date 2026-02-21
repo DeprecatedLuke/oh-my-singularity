@@ -295,8 +295,8 @@ export class TasksPane {
 					? FG.warning
 					: terminal
 						? DIM
-						: line.agentRole
-							? agentFg(line.agentRole)
+						: line.agentType
+							? agentFg(line.agentType)
 							: agentStatusColor(line.agentStatus);
 				const rendered =
 					heartbeatActive && !line.orphaned && !terminal ? flashActivityIndicator(padded, color) : padded;
@@ -375,7 +375,7 @@ export class TasksPane {
 
 			for (const agent of visible) {
 				const indent = "   ".repeat(issueLine.depth + 1);
-				const roleLabel = agent.role === "designer-worker" ? "designer" : agent.role;
+				const typeLabel = agent.agentType;
 				const isTerminal = isTerminalAgentStatus(agent.status);
 				const isError = agent.status === "failed" || agent.status === "aborted" || agent.status === "dead";
 				const icon = isTerminal ? (isError ? "✘" : "◦") : "⦿";
@@ -402,13 +402,13 @@ export class TasksPane {
 					usageSuffix += ` C:${compactions}`;
 				}
 				const statusDisplay = agent.status === "working" ? "active" : String(agent.status);
-				const text = `${indent}${icon} ${roleLabel.padEnd(10)} |${centerPad(statusDisplay, 8)}|${usageSuffix}`;
+				const text = `${indent}${icon} ${typeLabel.padEnd(10)} |${centerPad(statusDisplay, 8)}|${usageSuffix}`;
 
 				newLines.push({
 					issue: issueLine.issue,
 					agentId: agent.id,
 					agentStatus: agent.status,
-					agentRole: agent.role,
+					agentType: agent.agentType,
 					depth: issueLine.depth + 1,
 					text,
 				});
@@ -439,13 +439,13 @@ export class TasksPane {
 			});
 			for (const entry of orphaned) {
 				const { agent, reason, taskIssue, agentIssue } = entry;
-				const roleLabel = agent.role === "designer-worker" ? "designer" : agent.role;
-				const text = `   ⚠ ${roleLabel} |${agent.status}| (${reason})`;
+				const typeLabel = agent.agentType;
+				const text = `   ⚠ ${typeLabel} |${agent.status}| (${reason})`;
 				newLines.push({
 					issue: agentIssue ?? taskIssue ?? ORPHAN_SECTION_ISSUE,
 					agentId: agent.id,
 					agentStatus: agent.status,
-					agentRole: agent.role,
+					agentType: agent.agentType,
 					depth: 1,
 					text,
 					orphaned: true,

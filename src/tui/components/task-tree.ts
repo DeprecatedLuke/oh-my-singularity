@@ -11,8 +11,8 @@ export type TaskTreeLine = {
 	agentId?: string;
 	/** AgentStatus string, used for color tinting agent lines. */
 	agentStatus?: string;
-	/** AgentRole string, used for role-based color tinting. */
-	agentRole?: string;
+	/** AgentType string, used for type-based color tinting. */
+	agentType?: string;
 	/** Render hint for de-emphasized synthetic lines (e.g., collapsed orphaned agents). */
 	dim?: boolean;
 	/** True when this line is an orphaned active agent (no/open task association). */

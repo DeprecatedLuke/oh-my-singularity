@@ -169,7 +169,7 @@ describe("TasksDetailsPane", () => {
 		const agents = [
 			{
 				id: "worker-1",
-				role: "worker",
+				agentType: "worker",
 				taskId: selectedIssue.id,
 				tasksAgentId: "agent-1",
 				status: "done",

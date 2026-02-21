@@ -1,3 +1,5 @@
+import { getAgentSpawnConfig } from "../config/constants";
+
 /**
  * Shared TUI color constants matching oh-my-pi dark theme (truecolor ANSI).
  */
@@ -48,19 +50,9 @@ export const ICON = {
 	dot: "·",
 } as const;
 
-// Agent role foreground colors (truecolor, dark-background friendly)
-export const AGENT_FG: Record<string, string> = {
-	singularity: "\x1b[38;2;0;206;209m", // #00CED1  dark cyan
-	worker: "\x1b[38;2;100;149;237m", // #6495ED  cornflower blue
-	"designer-worker": "\x1b[38;2;218;112;214m", // #DA70D6  orchid
-	steering: "\x1b[38;2;255;215;0m", // #FFD700  gold
-	finisher: "\x1b[38;2;255;99;71m", // #FF6347  tomato
-	issuer: "\x1b[38;2;124;252;0m", // #7CFC00  lawn green
-};
-
-/** Foreground ANSI color for an agent role (falls back to dim). */
-export function agentFg(role: string): string {
-	return AGENT_FG[role] ?? FG.dim;
+/** Foreground ANSI color for an agent type (falls back to dim). */
+export function agentFg(agentType: string): string {
+	return getAgentSpawnConfig(agentType)?.fg ?? FG.dim;
 }
 
 // Lifecycle state foreground colors (for status events in logs)

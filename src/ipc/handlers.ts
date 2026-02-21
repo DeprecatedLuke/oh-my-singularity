@@ -1,6 +1,8 @@
 import type { AgentRegistry } from "../agents/registry";
-import type { AgentRole, AgentStatus } from "../agents/types";
+import { OmsRpcClient } from "../agents/rpc-wrapper";
+import type { AgentStatus, AgentType } from "../agents/types";
 import {
+	getReplaceableAgents,
 	INTERVAL_WAIT_SLEEP_MS,
 	LIMIT_MESSAGE_HISTORY_DEFAULT,
 	LIMIT_TASK_LIST_DEFAULT,
@@ -120,15 +122,13 @@ function getIssueTaskBinding(issue: TaskIssue): string | null {
 	return asString(slotBindings.hook);
 }
 
-function inferAgentRoleFromIssue(issue: TaskIssue): AgentRole {
+function inferAgentTypeFromIssue(issue: TaskIssue): AgentType {
 	const title = typeof issue.title === "string" ? issue.title.trim().toLowerCase() : "";
-	if (title.startsWith("designer-worker-")) return "designer-worker";
+	if (title.startsWith("designer-")) return "designer";
 	if (title.startsWith("worker-")) return "worker";
 	if (title.startsWith("issuer-")) return "issuer";
 	if (title.startsWith("finisher-")) return "finisher";
-	if (title.startsWith("steering-") || title.startsWith("resolver-") || title.startsWith("broadcast-steering-")) {
-		return "steering";
-	}
+	if (title.startsWith("steering-")) return "steering";
 	if (title.startsWith("singularity-")) return "singularity";
 	return "worker";
 }
@@ -168,7 +168,7 @@ async function listPersistedTaskAgents(
 	Array<{
 		id: string;
 		tasksAgentId: string;
-		role: AgentRole;
+		agentType: AgentType;
 		state: AgentStatus;
 		lastActivity: number;
 		source: string;
@@ -194,7 +194,7 @@ async function listPersistedTaskAgents(
 			return {
 				id: issue.id,
 				tasksAgentId: issue.id,
-				role: inferAgentRoleFromIssue(issue),
+				agentType: inferAgentTypeFromIssue(issue),
 				state,
 				lastActivity,
 				source: "persisted",
@@ -407,6 +407,7 @@ async function executeTasksToolAction(
 				const referencesString = asString(params.references);
 				const references = referencesArray.length > 0 ? referencesArray : (referencesString ?? undefined);
 				const scope = asString(params.scope);
+				if (!scope) return { ok: false, error: "scope is required for create" };
 				const createInput: TaskCreateInput = {
 					type: asString(params.type) ?? "task",
 					labels: asStringArray(params.labels),
@@ -443,6 +444,9 @@ async function executeTasksToolAction(
 				if (Object.hasOwn(params, "scope")) {
 					const scope = asString(params.scope);
 					if (scope) patch.scope = scope as TaskIssueScope;
+				}
+				if (Object.hasOwn(params, "description")) {
+					patch.description = params.description === null ? null : asString(params.description);
 				}
 				await tasksClient.update(issueId, patch);
 				const dependsOnArray = asStringArray(params.depends_on);
@@ -553,9 +557,11 @@ export async function handleIpcMessage(opts: {
 		return response;
 	}
 
-	if (t === "issuer_advance_lifecycle") {
+	if (t === "advance_lifecycle") {
+		const agentType = typeof (rec as any)?.agentType === "string" ? (rec as any).agentType : "";
 		const taskId = typeof (rec as any)?.taskId === "string" ? (rec as any).taskId : "";
 		const action = typeof (rec as any)?.action === "string" ? (rec as any).action : "";
+		const target = typeof (rec as any)?.target === "string" ? (rec as any).target : "";
 		const msg = typeof rec?.message === "string" ? rec.message : "";
 		const reason = typeof rec?.reason === "string" ? rec.reason : "";
 		const agentId = typeof (rec as any)?.agentId === "string" ? (rec as any).agentId : "";
@@ -563,123 +569,32 @@ export async function handleIpcMessage(opts: {
 			type: "log",
 			ts: Date.now(),
 			level: "info",
-			message: `IPC: issuer_advance_lifecycle taskId=${taskId} action=${action}`,
+			message: `IPC: advance_lifecycle agentType=${agentType} taskId=${taskId} action=${action}${target ? ` target=${target}` : ""}`,
 			data: opts.payload,
 		});
 		if (!opts.loop) {
 			refresh();
 			return { ok: false, summary: "Agent loop unavailable" };
 		}
-		const result = opts.loop.advanceIssuerLifecycle({
+		const result = await opts.loop.advanceLifecycle({
+			agentType,
 			taskId,
 			action,
+			target,
 			message: msg,
 			reason,
 			agentId: agentId || undefined,
 		});
-		refresh();
-		return result;
-	}
-
-	if (t === "fast_worker_advance_lifecycle") {
-		const taskId = typeof (rec as any)?.taskId === "string" ? (rec as any).taskId : "";
-		const action = typeof (rec as any)?.action === "string" ? (rec as any).action : "";
-		const msg = typeof rec?.message === "string" ? rec.message : "";
-		const reason = typeof rec?.reason === "string" ? rec.reason : "";
-		const agentId = typeof (rec as any)?.agentId === "string" ? (rec as any).agentId : "";
-		opts.registry.pushEvent(opts.systemAgentId, {
-			type: "log",
-			ts: Date.now(),
-			level: "info",
-			message: `IPC: fast_worker_advance_lifecycle taskId=${taskId} action=${action}`,
-			data: opts.payload,
-		});
-		if (!opts.loop) {
-			refresh();
-			return { ok: false, summary: "Agent loop unavailable" };
+		if ((result as any).ok && agentId) {
+			try {
+				const agent = resolveRegistryAgent(opts.registry, agentId);
+				if (agent?.rpc instanceof OmsRpcClient) {
+					agent.rpc.forceKill();
+				}
+			} catch (err) {
+				logger.debug("ipc/handlers.ts: best-effort failure after agent.rpc.forceKill();", { err });
+			}
 		}
-		const result = opts.loop.advanceFastWorkerLifecycle({
-			taskId,
-			action,
-			message: msg,
-			reason,
-			agentId: agentId || undefined,
-		});
-		refresh();
-		return result;
-	}
-
-	if (t === "fast_worker_close_task") {
-		const taskId = typeof (rec as any)?.taskId === "string" ? (rec as any).taskId : "";
-		const reason = typeof rec?.reason === "string" ? rec.reason : "";
-		const agentId = typeof (rec as any)?.agentId === "string" ? (rec as any).agentId : "";
-		opts.registry.pushEvent(opts.systemAgentId, {
-			type: "log",
-			ts: Date.now(),
-			level: "info",
-			message: `IPC: fast_worker_close_task taskId=${taskId}`,
-			data: opts.payload,
-		});
-		if (!opts.loop) {
-			refresh();
-			return { ok: false, summary: "Agent loop unavailable" };
-		}
-		const result = opts.loop.handleFastWorkerCloseTask({
-			taskId,
-			reason,
-			agentId: agentId || undefined,
-		});
-		refresh();
-		return result;
-	}
-	if (t === "finisher_advance_lifecycle") {
-		const taskId = typeof (rec as any)?.taskId === "string" ? (rec as any).taskId : "";
-		const action = typeof (rec as any)?.action === "string" ? (rec as any).action : "";
-		const msg = typeof rec?.message === "string" ? rec.message : "";
-		const reason = typeof rec?.reason === "string" ? rec.reason : "";
-		const agentId = typeof (rec as any)?.agentId === "string" ? (rec as any).agentId : "";
-		opts.registry.pushEvent(opts.systemAgentId, {
-			type: "log",
-			ts: Date.now(),
-			level: "info",
-			message: `IPC: finisher_advance_lifecycle taskId=${taskId} action=${action}`,
-			data: opts.payload,
-		});
-		if (!opts.loop) {
-			refresh();
-			return { ok: false, summary: "Agent loop unavailable" };
-		}
-		const result = opts.loop.advanceFinisherLifecycle({
-			taskId,
-			action,
-			message: msg,
-			reason,
-			agentId: agentId || undefined,
-		});
-		refresh();
-		return result;
-	}
-
-	if (t === "finisher_close_task") {
-		const taskId = typeof (rec as any)?.taskId === "string" ? (rec as any).taskId : "";
-		const reason = typeof rec?.reason === "string" ? rec.reason : "";
-		const agentId = typeof (rec as any)?.agentId === "string" ? (rec as any).agentId : "";
-		opts.registry.pushEvent(opts.systemAgentId, {
-			type: "log",
-			ts: Date.now(),
-			level: "info",
-			message: `IPC: finisher_close_task taskId=${taskId}`,
-			data: opts.payload,
-		});
-		if (!opts.loop) {
-			refresh();
-			return { ok: false, summary: "Agent loop unavailable" };
-		}
-		const result = opts.loop.handleFinisherCloseTask({
-			taskId,
-			reason,
-			agentId: agentId || undefined,
-		});
 		refresh();
 		return result;
 	}
@@ -730,25 +645,6 @@ export async function handleIpcMessage(opts: {
 		});
 		refresh();
 		return result;
-	}
-
-	if (t === "broadcast") {
-		const msg = typeof rec?.message === "string" ? rec.message : "";
-		opts.registry.pushEvent(opts.systemAgentId, {
-			type: "log",
-			ts: Date.now(),
-			level: "info",
-			message: "IPC: broadcast_to_workers",
-			data: opts.payload,
-		});
-
-		if (!msg.trim()) {
-			refresh();
-			return { ok: false, error: "broadcast_to_workers: message is required" };
-		}
-		void opts.loop?.broadcastToWorkers(msg, opts.payload);
-		refresh();
-		return { ok: true };
 	}
 
 	if (t === "interrupt_agent") {
@@ -826,12 +722,12 @@ export async function handleIpcMessage(opts: {
 				error: `steer_agent: no active agent for task ${normalizedTaskId} (current active agents: none)`,
 			};
 		}
-		const nonFinisherAgents = activeAgents.filter(agent => agent.role !== "finisher");
+		const nonFinisherAgents = activeAgents.filter(agent => agent.agentType !== "finisher");
 		if (nonFinisherAgents.length === 0) {
 			refresh();
 			return {
 				ok: false,
-				error: `steer_agent: cannot steer finisher agent on task ${normalizedTaskId} (current active roles: finisher)`,
+				error: `steer_agent: cannot steer finisher agent on task ${normalizedTaskId} (current active agents: finisher)`,
 			};
 		}
 		const steered = await opts.loop.steerAgent(normalizedTaskId, normalizedMessage);
@@ -839,28 +735,29 @@ export async function handleIpcMessage(opts: {
 		if (!steered) {
 			return {
 				ok: false,
-				error: `steer_agent: steer request was not applied for task ${normalizedTaskId} (current active roles: ${activeAgents.map(agent => agent.role).join(", ")})`,
+				error: `steer_agent: steer request was not applied for task ${normalizedTaskId} (current active agents: ${activeAgents.map(agent => agent.agentType).join(", ")})`,
 			};
 		}
 		return { ok: true };
 	}
 	if (t === "replace_agent") {
-		const role = typeof (rec as any)?.role === "string" ? (rec as any).role : "";
+		const agent = typeof (rec as any)?.agent === "string" ? (rec as any).agent : "";
 		const taskId = typeof (rec as any)?.taskId === "string" ? (rec as any).taskId : "";
 		const context = typeof (rec as any)?.context === "string" ? (rec as any).context : "";
 		opts.registry.pushEvent(opts.systemAgentId, {
 			type: "log",
 			ts: Date.now(),
 			level: "info",
-			message: `IPC: replace_agent role=${role} taskId=${taskId}`,
+			message: `IPC: replace_agent agent=${agent} taskId=${taskId}`,
 			data: opts.payload,
 		});
-		const normalizedRole = role.trim();
+		const normalizedAgent = agent.trim();
 		const normalizedTaskId = taskId.trim();
 		const normalizedContext = context.trim();
-		if (!normalizedRole || !["finisher", "issuer", "worker"].includes(normalizedRole)) {
+		const replaceableAgents = getReplaceableAgents();
+		if (!normalizedAgent || !replaceableAgents.has(normalizedAgent)) {
 			refresh();
-			return { ok: false, error: "replace_agent: role must be one of finisher, issuer, worker" };
+			return { ok: false, error: `replace_agent: agent must be one of ${[...replaceableAgents].join(", ")}` };
 		}
 		if (!normalizedTaskId) {
 			refresh();
@@ -902,31 +799,31 @@ export async function handleIpcMessage(opts: {
 				error: `replace_agent: no active agent for task ${normalizedTaskId} (current active agents: none)`,
 			};
 		}
-		const nonFinisherAgents = activeAgents.filter(agent => agent.role !== "finisher");
+		const nonFinisherAgents = activeAgents.filter(agent => agent.agentType !== "finisher");
 		if (nonFinisherAgents.length === 0 && !taskIsBlocked) {
 			refresh();
 			return {
 				ok: false,
-				error: `replace_agent: cannot replace finisher agent on task ${normalizedTaskId} (finisher manages its own lifecycle; current active roles: finisher)`,
+				error: `replace_agent: cannot replace finisher agent on task ${normalizedTaskId} (finisher manages its own lifecycle; current active agents: finisher)`,
 			};
 		}
-		try {
-			await opts.loop.spawnAgentBySingularity({
-				role: normalizedRole as "finisher" | "issuer" | "worker",
+		void opts.loop
+			.spawnAgentBySingularity({
+				agent: normalizedAgent as "finisher" | "issuer" | "worker",
 				taskId: normalizedTaskId,
 				context: normalizedContext || undefined,
+			})
+			.catch((err: unknown) => {
+				logger.error("replace_agent: background spawn failed", {
+					taskId: normalizedTaskId,
+					agent: normalizedAgent,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			})
+			.finally(() => {
+				refresh();
 			});
-			refresh();
-			return { ok: true };
-		} catch (err) {
-			refresh();
-			return {
-				ok: false,
-				error: `replace_agent: failed to spawn replacement for task ${normalizedTaskId}: ${
-					err instanceof Error ? err.message : String(err)
-				}`,
-			};
-		}
+		return { ok: true };
 	}
 
 	if (t === "stop_agents_for_task") {
@@ -950,70 +847,6 @@ export async function handleIpcMessage(opts: {
 		}
 		refresh();
 		return;
-	}
-
-	if (t === "complain") {
-		const files = Array.isArray((rec as any)?.files)
-			? (rec as any).files
-					.filter((file: unknown): file is string => typeof file === "string")
-					.map((file: string) => file.trim())
-					.filter((file: string) => file.length > 0)
-			: [];
-		const reason = typeof rec?.reason === "string" ? rec.reason : "";
-		const complainantAgentId =
-			typeof (rec as any)?.complainantAgentId === "string" ? (rec as any).complainantAgentId : undefined;
-		const complainantTaskId =
-			typeof (rec as any)?.complainantTaskId === "string" ? (rec as any).complainantTaskId : undefined;
-		opts.registry.pushEvent(opts.systemAgentId, {
-			type: "log",
-			ts: Date.now(),
-			level: "info",
-			message: `IPC: complain files=${files.length}`,
-			data: opts.payload,
-		});
-		if (!opts.loop) {
-			refresh();
-			return { ok: false, summary: "Agent loop unavailable" };
-		}
-		const result = await opts.loop.complain({
-			complainantAgentId,
-			complainantTaskId,
-			files,
-			reason,
-		});
-		refresh();
-		return result;
-	}
-
-	if (t === "revoke_complaint") {
-		const files = Array.isArray((rec as any)?.files)
-			? (rec as any).files
-					.filter((file: unknown): file is string => typeof file === "string")
-					.map((file: string) => file.trim())
-					.filter((file: string) => file.length > 0)
-			: undefined;
-		const complainantAgentId =
-			typeof (rec as any)?.complainantAgentId === "string" ? (rec as any).complainantAgentId : undefined;
-		const complainantTaskId =
-			typeof (rec as any)?.complainantTaskId === "string" ? (rec as any).complainantTaskId : undefined;
-		opts.registry.pushEvent(opts.systemAgentId, {
-			type: "log",
-			ts: Date.now(),
-			level: "info",
-			message: `IPC: revoke_complaint files=${files?.length ?? 0}`,
-			data: opts.payload,
-		});
-		if (!opts.loop) {
-			refresh();
-			return { ok: false, summary: "Agent loop unavailable" };
-		}
-		const result = await opts.loop.revokeComplaint({
-			complainantAgentId,
-			complainantTaskId,
-			files,
-		});
-		refresh();
-		return result;
 	}
 
 	if (t === "wait_for_agent") {
@@ -1053,7 +886,7 @@ export async function handleIpcMessage(opts: {
 		const agents = opts.registry.getByTask(taskId).map(agent => ({
 			id: agent.id,
 			tasksAgentId: agent.tasksAgentId,
-			role: agent.role,
+			agentType: agent.agentType,
 			state: agent.status,
 			lastActivity: agent.lastActivity,
 			source: "live",

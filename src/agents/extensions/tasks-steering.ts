@@ -1,6 +1,6 @@
 import { makeTasksExtension } from "./tasks-tool";
 
 export default makeTasksExtension({
-	role: "steering",
+	agentType: "steering",
 	allowedActions: ["show", "list", "search", "ready", "comments", "query", "dep_tree", "types"],
 });

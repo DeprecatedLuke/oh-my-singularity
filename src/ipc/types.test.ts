@@ -78,123 +78,147 @@ describe("parseIPCMessage", () => {
 		});
 	});
 
-	describe("issuer_advance_lifecycle", () => {
-		test("parses required lifecycle fields", () => {
+	describe("advance_lifecycle", () => {
+		test("parses valid advance_lifecycle with all fields", () => {
 			const message = expectParseOk({
-				type: "issuer_advance_lifecycle",
+				type: "advance_lifecycle",
+				agentType: "worker",
 				taskId: "task-1",
-				action: "promote",
-				message: "ready",
-				reason: "approved",
+				action: "advance",
+				target: "finisher",
+				message: "implementation done",
+				reason: "all tests pass",
 				agentId: "agent-1",
 			});
 			expect(message).toEqual({
-				type: "issuer_advance_lifecycle",
+				type: "advance_lifecycle",
+				agentType: "worker",
 				taskId: "task-1",
-				action: "promote",
-				message: "ready",
-				reason: "approved",
+				action: "advance",
+				target: "finisher",
+				message: "implementation done",
+				reason: "all tests pass",
 				agentId: "agent-1",
 			});
 		});
 
-		test("rejects wrong field types", () => {
-			expectParseError({ type: "issuer_advance_lifecycle", reason: 1 }, /"reason" must be a string/);
-		});
-	});
-
-	describe("fast_worker_advance_lifecycle", () => {
-		test("parses required lifecycle fields and validates action values", () => {
+		test("parses close action (no target required)", () => {
 			const message = expectParseOk({
-				type: "fast_worker_advance_lifecycle",
-				taskId: "task-1",
-				action: "done",
-				message: "implemented tiny fix",
+				type: "advance_lifecycle",
+				agentType: "speedy",
+				taskId: "task-2",
+				action: "close",
+				message: "tiny fix done",
 				reason: "completed",
 				agentId: "fast-1",
 			});
 			expect(message).toEqual({
-				type: "fast_worker_advance_lifecycle",
-				taskId: "task-1",
-				action: "done",
-				message: "implemented tiny fix",
+				type: "advance_lifecycle",
+				agentType: "speedy",
+				taskId: "task-2",
+				action: "close",
+				target: "",
+				message: "tiny fix done",
 				reason: "completed",
 				agentId: "fast-1",
 			});
 		});
 
-		test("rejects unsupported action", () => {
+		test("parses block action", () => {
+			const message = expectParseOk({
+				type: "advance_lifecycle",
+				agentType: "issuer",
+				taskId: "task-3",
+				action: "block",
+				message: "needs clarification",
+				reason: "unclear requirements",
+				agentId: "issuer-1",
+			});
+			expect(message).toEqual({
+				type: "advance_lifecycle",
+				agentType: "issuer",
+				taskId: "task-3",
+				action: "block",
+				target: "",
+				message: "needs clarification",
+				reason: "unclear requirements",
+				agentId: "issuer-1",
+			});
+		});
+
+		test("rejects invalid action", () => {
 			expectParseError(
 				{
-					type: "fast_worker_advance_lifecycle",
+					type: "advance_lifecycle",
+					agentType: "worker",
 					taskId: "task-1",
-					action: "start",
+					action: "promote",
 					message: "go",
 					reason: "nope",
-					agentId: "fast-1",
+					agentId: "agent-1",
 				},
-				/"action" must be one of done, escalate/,
+				/"action" must be one of close, block, advance/,
 			);
 		});
-	});
 
-	describe("finisher_advance_lifecycle", () => {
-		test("parses required lifecycle fields and validates action values", () => {
-			const message = expectParseOk({
-				type: "finisher_advance_lifecycle",
-				taskId: "task-1",
-				action: "worker",
-				message: "resume implementation",
-				reason: "needs code changes",
-				agentId: "fin-1",
-			});
-			expect(message).toEqual({
-				type: "finisher_advance_lifecycle",
-				taskId: "task-1",
-				action: "worker",
-				message: "resume implementation",
-				reason: "needs code changes",
-				agentId: "fin-1",
-			});
-		});
-
-		test("rejects unsupported action", () => {
+		test("requires target when action is advance", () => {
 			expectParseError(
 				{
-					type: "finisher_advance_lifecycle",
+					type: "advance_lifecycle",
+					agentType: "worker",
 					taskId: "task-1",
-					action: "start",
-					message: "go",
-					reason: "nope",
+					action: "advance",
+					target: "",
+					message: "done",
+					reason: "finished",
+					agentId: "agent-1",
+				},
+				/"target" is required when action is "advance"/,
+			);
+		});
+
+		test("validates target against agent type's allowed targets", () => {
+			// worker can advance to finisher, not issuer
+			expectParseError(
+				{
+					type: "advance_lifecycle",
+					agentType: "worker",
+					taskId: "task-1",
+					action: "advance",
+					target: "issuer",
+					message: "done",
+					reason: "finished",
+					agentId: "agent-1",
+				},
+				/target "issuer" is not a valid advance target for agent type "worker"/,
+			);
+			// finisher can advance to worker or issuer, not finisher
+			expectParseError(
+				{
+					type: "advance_lifecycle",
+					agentType: "finisher",
+					taskId: "task-1",
+					action: "advance",
+					target: "finisher",
+					message: "retry",
+					reason: "loop",
 					agentId: "fin-1",
 				},
-				/"action" must be one of worker, issuer, defer/,
+				/target "finisher" is not a valid advance target for agent type "finisher"/,
 			);
 		});
-	});
 
-	test("parses fast_worker_close_task and rejects non-string reason", () => {
-		expect(
-			expectParseOk({ type: "fast_worker_close_task", taskId: "task-1", reason: "done", agentId: "fast-1" }),
-		).toEqual({
-			type: "fast_worker_close_task",
-			taskId: "task-1",
-			reason: "done",
-			agentId: "fast-1",
+		test("rejects non-string fields", () => {
+			expectParseError({ type: "advance_lifecycle", agentType: 1 }, /"agentType" must be a string/);
+			expectParseError(
+				{ type: "advance_lifecycle", agentType: "worker", taskId: "t-1", action: "block", reason: 1 },
+				/"reason" must be a string/,
+			);
+			expectParseError(
+				{ type: "advance_lifecycle", agentType: "worker", taskId: "t-1", action: "block", agentId: false },
+				/"agentId" must be a string/,
+			);
 		});
-		expectParseError({ type: "fast_worker_close_task", reason: false }, /"reason" must be a string/);
-	});
-
-	test("parses finisher_close_task and rejects non-string reason", () => {
-		expect(
-			expectParseOk({ type: "finisher_close_task", taskId: "task-1", reason: "done", agentId: "fin-1" }),
-		).toEqual({
-			type: "finisher_close_task",
-			taskId: "task-1",
-			reason: "done",
-			agentId: "fin-1",
-		});
-		expectParseError({ type: "finisher_close_task", reason: false }, /"reason" must be a string/);
 	});
 
 	test("parses broadcast, interrupt_agent, steer_agent", () => {
@@ -216,29 +240,29 @@ describe("parseIPCMessage", () => {
 	});
 
 	describe("replace_agent", () => {
-		test("trims role and accepts empty role", () => {
-			expect(expectParseOk({ type: "replace_agent", role: " worker ", taskId: "task-1", context: "ctx" })).toEqual({
+		test("trims agent and accepts empty agent", () => {
+			expect(expectParseOk({ type: "replace_agent", agent: " worker ", taskId: "task-1", context: "ctx" })).toEqual({
 				type: "replace_agent",
-				role: "worker",
+				agent: "worker",
 				taskId: "task-1",
 				context: "ctx",
 			});
-			expect(expectParseOk({ type: "replace_agent", role: "  ", taskId: "task-1", context: "ctx" })).toEqual({
+			expect(expectParseOk({ type: "replace_agent", agent: "  ", taskId: "task-1", context: "ctx" })).toEqual({
 				type: "replace_agent",
-				role: "",
+				agent: "",
 				taskId: "task-1",
 				context: "ctx",
 			});
 		});
 
-		test("rejects invalid role values and types", () => {
+		test("rejects invalid agent values and types", () => {
 			expectParseError(
-				{ type: "replace_agent", role: "manager", taskId: "task-1", context: "ctx" },
-				/"role" must be one of finisher, issuer, worker/,
+				{ type: "replace_agent", agent: "manager", taskId: "task-1", context: "ctx" },
+				/"agent" must be one of/,
 			);
 			expectParseError(
-				{ type: "replace_agent", role: 3, taskId: "task-1", context: "ctx" },
-				/"role" must be a string/,
+				{ type: "replace_agent", agent: 3, taskId: "task-1", context: "ctx" },
+				/"agent" must be a string/,
 			);
 		});
 	});
@@ -258,39 +282,6 @@ describe("parseIPCMessage", () => {
 				{ type: "stop_agents_for_task", taskId: "task-1", includeFinisher: "yes" },
 				/"includeFinisher" must be a boolean/,
 			);
-		});
-	});
-
-	describe("complain + revoke_complaint", () => {
-		test("normalizes files and optional fields", () => {
-			expect(
-				expectParseOk({
-					type: "complain",
-					files: [" a.ts ", "", 1, "b.ts"],
-					reason: "blocked",
-					complainantAgentId: "agent-1",
-					complainantTaskId: "task-1",
-				}),
-			).toEqual({
-				type: "complain",
-				files: ["a.ts", "b.ts"],
-				reason: "blocked",
-				complainantAgentId: "agent-1",
-				complainantTaskId: "task-1",
-			});
-
-			expect(expectParseOk({ type: "revoke_complaint" })).toEqual({
-				type: "revoke_complaint",
-				files: undefined,
-				complainantAgentId: undefined,
-				complainantTaskId: undefined,
-			});
-		});
-
-		test("rejects invalid files and reason types", () => {
-			expectParseError({ type: "complain", files: "x", reason: "r" }, /"files" must be an array of strings/);
-			expectParseError({ type: "complain", files: [], reason: 1 }, /"reason" must be a string/);
-			expectParseError({ type: "revoke_complaint", files: {} }, /"files" must be an array of strings/);
 		});
 	});
 

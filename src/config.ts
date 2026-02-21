@@ -1,29 +1,26 @@
 // lifecycle-interrupt-advance-test
-// Defines OMS configuration types, defaults, and environment-variable loading/merge behavior for agent roles and runtime settings.
+// OMS configuration
+// Defines OMS configuration types, defaults, and environment-variable loading/merge behavior for agents and runtime settings.
+import type { SpawnableAgent, ThinkingLevel } from "./config/constants";
 import {
 	DEFAULT_LAYOUT_AGENTS_WIDTH_RATIO,
 	DEFAULT_LAYOUT_SYSTEM_HEIGHT_RATIO,
 	DEFAULT_LAYOUT_TASKS_HEIGHT_RATIO,
 	DEFAULT_MAX_WORKERS,
+	getAgentSpawnConfig,
 	LIMIT_AGENT_EVENT_BUFFER,
+	SPAWNABLE_AGENTS,
 	TIMEOUT_DEFAULT_POLL_MS,
 	TIMEOUT_STEERING_INTERVAL_MS,
 } from "./config/constants";
-export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
-export type AgentRole =
-	| "singularity"
-	| "issuer"
-	| "worker"
-	| "fast-worker"
-	| "designer-worker"
-	| "finisher"
-	| "merger"
-	| "steering";
+export type { AgentType, SpawnableAgent, ThinkingLevel } from "./config/constants";
 
-type RoleKey = AgentRole | "orchestrator";
+import { logger } from "./utils";
 
-export interface RoleConfig {
+type AgentKey = SpawnableAgent | "orchestrator";
+
+export interface AgentModelConfig {
 	/** Fuzzy model name or provider/id string passed to `omp --model`. */
 	model: string;
 	thinking: ThinkingLevel;
@@ -49,21 +46,22 @@ export interface OmsConfig {
 		systemHeightRatio: number;
 	};
 
-	roles: Record<Exclude<AgentRole, "singularity">, RoleConfig>;
+	agents: Record<SpawnableAgent, AgentModelConfig>;
 }
 
-// Default tool allowlists per role (can be overridden via config `roles.<role>.tools` or OMS_TOOLS_<ROLE>).
-
-export const WORKER_TOOLS =
-	"bash,read,edit,write,grep,find,lsp,python,notebook,browser,fetch,web_search,todo_write,task";
-
-export const FINISHER_TOOLS = "bash,read,grep,find,lsp,python,notebook,browser,fetch,web_search,todo_write,task";
-
-export const MERGER_TOOLS = "bash,read,grep,find";
-
-export const STEERING_TOOLS = "bash,read,grep,find,lsp,python,notebook,browser,fetch,web_search,todo_write,task";
-
-export const ISSUER_TOOLS = "bash,read,grep,find,lsp,python,notebook,browser,fetch,web_search,todo_write,task";
+function buildDefaultAgents(): Record<SpawnableAgent, AgentModelConfig> {
+	const agents = {} as Record<SpawnableAgent, AgentModelConfig>;
+	for (const agentType of SPAWNABLE_AGENTS) {
+		const cfg = getAgentSpawnConfig(agentType);
+		if (!cfg) continue;
+		agents[agentType] = {
+			model: cfg.model ?? "sonnet",
+			thinking: cfg.thinking ?? "low",
+			tools: cfg.defaultTools,
+		};
+	}
+	return agents;
+}
 
 export const DEFAULT_CONFIG: OmsConfig = {
 	ompCli: "omp",
@@ -79,63 +77,17 @@ export const DEFAULT_CONFIG: OmsConfig = {
 		systemHeightRatio: DEFAULT_LAYOUT_SYSTEM_HEIGHT_RATIO,
 	},
 
-	roles: {
-		issuer: {
-			model: "sonnet",
-			thinking: "medium",
-			tools: ISSUER_TOOLS,
-		},
-		worker: {
-			model: "codex",
-			thinking: "xhigh",
-			tools: WORKER_TOOLS,
-		},
-		"fast-worker": {
-			model: "codex-spark",
-			thinking: "medium",
-			tools: WORKER_TOOLS,
-		},
-		"designer-worker": {
-			model: "opus",
-			thinking: "xhigh",
-			tools: WORKER_TOOLS,
-		},
-		finisher: {
-			model: "codex-spark",
-			thinking: "medium",
-			tools: FINISHER_TOOLS,
-		},
-		merger: {
-			model: "codex-spark",
-			thinking: "medium",
-			tools: MERGER_TOOLS,
-		},
-		steering: {
-			model: "codex-spark",
-			thinking: "medium",
-		},
-	},
+	agents: buildDefaultAgents(),
 };
 
-export type OmsConfigOverride = Partial<Omit<OmsConfig, "layout" | "roles">> & {
+export type OmsConfigOverride = Partial<Omit<OmsConfig, "layout" | "agents">> & {
 	layout?: Partial<OmsConfig["layout"]>;
-	roles?: Partial<Record<RoleKey, Partial<RoleConfig>>>;
+	agents?: Partial<Record<AgentKey, Partial<AgentModelConfig>>>;
 };
 
-function normalizeRoleKey(role: string): Exclude<AgentRole, "singularity"> | null {
-	if (role === "orchestrator") return "finisher";
-	if (
-		role === "issuer" ||
-		role === "worker" ||
-		role === "fast-worker" ||
-		role === "designer-worker" ||
-		role === "finisher" ||
-		role === "merger" ||
-		role === "steering"
-	) {
-		return role;
-	}
-
+function normalizeAgentKey(agentType: string): SpawnableAgent | null {
+	if (agentType === "orchestrator") return "finisher";
+	if ((SPAWNABLE_AGENTS as ReadonlySet<string>).has(agentType)) return agentType as SpawnableAgent;
 	return null;
 }
 
@@ -174,16 +126,6 @@ function readBooleanEnv(name: string): boolean | undefined {
 	return undefined;
 }
 
-const ROLE_ENV_SUFFIX: Record<Exclude<AgentRole, "singularity">, string> = {
-	issuer: "ISSUER",
-	worker: "WORKER",
-	"fast-worker": "FAST_WORKER",
-	"designer-worker": "DESIGNER_WORKER",
-	finisher: "FINISHER",
-	merger: "MERGER",
-	steering: "STEERING",
-};
-
 export function loadConfigFromEnvironment(): OmsConfigOverride {
 	const override: OmsConfigOverride = {};
 
@@ -203,57 +145,57 @@ export function loadConfigFromEnvironment(): OmsConfigOverride {
 	if (typeof agentEventLimit === "number") override.agentEventLimit = agentEventLimit;
 
 	const enableReplicas = readBooleanEnv("OMS_ENABLE_REPLICAS");
-	if (typeof enableReplicas === "boolean") override.enableReplicas = enableReplicas;
+	if (typeof enableReplicas === "boolean") {
+		if (enableReplicas && process.platform !== "linux") {
+			logger.warn("OMS_ENABLE_REPLICAS=true ignored: OverlayFS replicas are only supported on Linux");
+			override.enableReplicas = false;
+		} else {
+			override.enableReplicas = enableReplicas;
+		}
+	}
 
-	const roleOverrides: Partial<Record<RoleKey, Partial<RoleConfig>>> = {};
-	for (const role of [
-		"issuer",
-		"worker",
-		"fast-worker",
-		"designer-worker",
-		"finisher",
-		"merger",
-		"steering",
-	] as const) {
-		const suffix = ROLE_ENV_SUFFIX[role];
+	const agentOverrides: Partial<Record<AgentKey, Partial<AgentModelConfig>>> = {};
+	for (const agentType of SPAWNABLE_AGENTS) {
+		const suffix = getAgentSpawnConfig(agentType)?.envSuffix;
+		if (!suffix) continue;
 		const model = readNonEmptyEnv(`OMS_MODEL_${suffix}`);
 		const thinking = readNonEmptyEnv(`OMS_THINKING_${suffix}`);
 		const tools = readNonEmptyEnv(`OMS_TOOLS_${suffix}`);
 
-		const roleOverride: Partial<RoleConfig> = {};
-		if (model) roleOverride.model = model;
-		if (thinking && isThinkingLevel(thinking)) roleOverride.thinking = thinking;
-		if (tools) roleOverride.tools = tools;
+		const agentOverride: Partial<AgentModelConfig> = {};
+		if (model) agentOverride.model = model;
+		if (thinking && isThinkingLevel(thinking)) agentOverride.thinking = thinking;
+		if (tools) agentOverride.tools = tools;
 
-		if (Object.keys(roleOverride).length > 0) {
-			roleOverrides[role] = roleOverride;
+		if (Object.keys(agentOverride).length > 0) {
+			agentOverrides[agentType] = agentOverride;
 		}
 	}
 
-	if (Object.keys(roleOverrides).length > 0) {
-		override.roles = roleOverrides;
+	if (Object.keys(agentOverrides).length > 0) {
+		override.agents = agentOverrides;
 	}
 
 	return override;
 }
 
 export function mergeOmsConfig(base: OmsConfig, override: OmsConfigOverride): OmsConfig {
-	const mergedRoles: Record<Exclude<AgentRole, "singularity">, RoleConfig> = { ...base.roles };
+	const mergedAgents: Record<SpawnableAgent, AgentModelConfig> = { ...base.agents };
 
 	const mergedLayout = {
 		...base.layout,
 		...(override.layout ?? {}),
 	};
 
-	if (override.roles) {
-		for (const [role, roleOverride] of Object.entries(override.roles)) {
-			if (!roleOverride) continue;
-			const normalized = normalizeRoleKey(role);
+	if (override.agents) {
+		for (const [agentType, agentOverride] of Object.entries(override.agents)) {
+			if (!agentOverride) continue;
+			const normalized = normalizeAgentKey(agentType);
 			if (!normalized) continue;
 
-			mergedRoles[normalized] = {
-				...mergedRoles[normalized],
-				...roleOverride,
+			mergedAgents[normalized] = {
+				...mergedAgents[normalized],
+				...agentOverride,
 			};
 		}
 	}
@@ -262,6 +204,6 @@ export function mergeOmsConfig(base: OmsConfig, override: OmsConfigOverride): Om
 		...base,
 		...override,
 		layout: mergedLayout,
-		roles: mergedRoles,
+		agents: mergedAgents,
 	};
 }

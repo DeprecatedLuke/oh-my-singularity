@@ -279,7 +279,6 @@ export class SteeringManager {
 	private readonly steeringInFlightByWorker = new Map<string, Promise<void>>();
 	private readonly lastSteeringAtByWorker = new Map<string, number>();
 	private readonly finisherSpawningTasks = new Set<string>();
-	private broadcastInFlight: Promise<void> | null = null;
 	private readonly pendingInterruptKickoffByTask = new Map<string, string[]>();
 	private readonly registry: AgentRegistry;
 	private readonly spawner: AgentSpawner;
@@ -319,12 +318,12 @@ export class SteeringManager {
 	getActiveWorkerAgents(): AgentInfo[] {
 		return this.registry
 			.getActive()
-			.filter(a => (a.role === "worker" || a.role === "designer-worker") && !isTerminalStatus(a.status));
+			.filter(a => (a.agentType === "worker" || a.agentType === "designer") && !isTerminalStatus(a.status));
 	}
 
 	hasFinisherTakeover(taskId: string): boolean {
 		if (this.finisherSpawningTasks.has(taskId)) return true;
-		return this.registry.getActiveByTask(taskId).some(agent => agent.role === "finisher");
+		return this.registry.getActiveByTask(taskId).some(agent => agent.agentType === "finisher");
 	}
 
 	onAgentStopped(agentId: string): void {
@@ -351,7 +350,7 @@ export class SteeringManager {
 		const activeForTask = this.registry.getActiveByTask(taskId);
 		const taskAgents = this.registry.getByTask(taskId);
 		const workerIds = taskAgents
-			.filter(agent => agent.role === "worker" || agent.role === "designer-worker")
+			.filter(agent => agent.agentType === "worker" || agent.agentType === "designer")
 			.map(agent => agent.id);
 		const inFlight = workerIds
 			.map(workerId => this.steeringInFlightByWorker.get(workerId))
@@ -360,8 +359,8 @@ export class SteeringManager {
 			this.steeringInFlightByWorker.delete(workerId);
 			this.lastSteeringAtByWorker.delete(workerId);
 		}
-		const steeringAgentIds = activeForTask.filter(agent => agent.role === "steering").map(agent => agent.id);
-		const isTaskSteering = (agent: AgentInfo) => agent.taskId === taskId && agent.role === "steering";
+		const steeringAgentIds = activeForTask.filter(agent => agent.agentType === "steering").map(agent => agent.id);
+		const isTaskSteering = (agent: AgentInfo) => agent.taskId === taskId && agent.agentType === "steering";
 		await this.stopAgentsMatching(isTaskSteering);
 
 		if (inFlight.length > 0) {
@@ -389,7 +388,10 @@ export class SteeringManager {
 		try {
 			await this.stopSteeringForFinisher(taskId);
 			if (normalizedResumeSessionId) {
-				return await this.spawner.spawnFinisherWithResume(taskId, normalizedResumeSessionId, workerOutput);
+				return await this.spawner.spawnAgent("finisher", taskId, {
+					resumeSessionId: normalizedResumeSessionId,
+					kickoffMessage: workerOutput,
+				});
 			}
 			return await this.spawner.spawnFinisher(taskId, workerOutput);
 		} finally {
@@ -405,7 +407,7 @@ export class SteeringManager {
 		const steerSummary = `${normalizeSummary(trimmed)}\n`;
 		const targets = this.registry
 			.getActive()
-			.filter(agent => agent.taskId === normalizedTaskId && agent.role !== "finisher");
+			.filter(agent => agent.taskId === normalizedTaskId && agent.agentType !== "finisher");
 		if (targets.length === 0) {
 			this.loopLog(`Steer: no active agents for task ${normalizedTaskId}`, "warn", {
 				taskId: normalizedTaskId,
@@ -555,143 +557,6 @@ export class SteeringManager {
 		});
 		this.onDirty?.();
 		return true;
-	}
-
-	async broadcastToWorkers(message: string, meta?: unknown): Promise<void> {
-		const trimmed = message.trim();
-		if (!trimmed) return;
-
-		if (this.broadcastInFlight) return;
-
-		const p = this.runBroadcastToWorkers(trimmed, meta).finally(() => {
-			this.broadcastInFlight = null;
-		});
-
-		this.broadcastInFlight = p;
-		await p;
-	}
-
-	private async runBroadcastToWorkers(message: string, meta?: unknown): Promise<void> {
-		const workers = this.getActiveWorkerAgents().filter(w => !!w.taskId);
-		if (workers.length === 0) return;
-
-		const urgency = (() => {
-			const rec = asRecord(meta);
-			const u = rec && typeof rec.urgency === "string" ? rec.urgency : null;
-			return u === "critical" || u === "normal" ? u : undefined;
-		})();
-
-		const summary = workers.map(w => ({
-			id: w.id,
-			taskId: w.taskId,
-			status: w.status,
-			lastActivity: w.lastActivity,
-		}));
-
-		let steering: AgentInfo;
-		try {
-			steering = await this.spawner.spawnBroadcastSteering({
-				message,
-				urgency,
-				workers: summary,
-			});
-			this.attachRpcHandlers(steering);
-			this.logAgentStart("OMS/system", steering, message);
-		} catch {
-			return;
-		}
-
-		const steeringRpc = steering.rpc;
-		if (!steeringRpc || !(steeringRpc instanceof OmsRpcClient)) {
-			await this.finishAgent(steering, "dead");
-			return;
-		}
-
-		try {
-			await steeringRpc.waitForAgentEnd(300_000);
-		} catch {
-			await this.finishAgent(steering, "dead");
-			return;
-		}
-
-		let text: string | null = null;
-		try {
-			text = await steeringRpc.getLastAssistantText();
-		} catch {
-			text = null;
-		}
-
-		if (!text) {
-			await this.finishAgent(steering, "done");
-			await this.logAgentFinished(steering, "");
-			return;
-		}
-
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(text);
-		} catch {
-			await this.finishAgent(steering, "done");
-			await this.logAgentFinished(steering, text);
-			return;
-		}
-
-		const rec = asRecord(parsed);
-		const decisions = rec && Array.isArray(rec.decisions) ? rec.decisions : [];
-
-		for (const d of decisions) {
-			const dr = asRecord(d);
-			if (!dr) continue;
-
-			const taskId = typeof dr.taskId === "string" ? dr.taskId : null;
-			const action = typeof dr.action === "string" ? dr.action : null;
-			const msg = typeof dr.message === "string" ? dr.message : null;
-			const reason = typeof dr.reason === "string" ? dr.reason : null;
-
-			if (!taskId || !action) continue;
-
-			const worker = workers.find(w => w.taskId === taskId);
-			if (!worker) continue;
-			if (this.hasFinisherTakeover(taskId)) continue;
-
-			const workerRpc = worker.rpc;
-			if (!workerRpc || !(workerRpc instanceof OmsRpcClient)) continue;
-
-			if (action === "steer") {
-				const finalMsg = msg?.trim() ? msg.trim() : message;
-				try {
-					await workerRpc.steer(finalMsg);
-				} catch (err) {
-					logger.debug("loop/steering.ts: best-effort failure after await workerRpc.steer(finalMsg);", { err });
-				}
-
-				this.registry.pushEvent(worker.id, {
-					type: "log",
-					ts: Date.now(),
-					level: "info",
-					message: `Broadcast steer${reason ? `: ${reason}` : ""}`,
-					data: { taskId, reason },
-				});
-			} else if (action === "interrupt") {
-				try {
-					await workerRpc.abort();
-				} catch (err) {
-					logger.debug("loop/steering.ts: best-effort failure after await workerRpc.abort();", { err });
-				}
-
-				this.registry.pushEvent(worker.id, {
-					type: "log",
-					ts: Date.now(),
-					level: "warn",
-					message: `Broadcast interrupt${reason ? `: ${reason}` : ""}`,
-					data: { taskId, reason },
-				});
-			}
-		}
-
-		await this.finishAgent(steering, "done");
-		await this.logAgentFinished(steering, text);
-		this.onDirty?.();
 	}
 
 	async maybeSteerWorkers(paused: boolean): Promise<void> {

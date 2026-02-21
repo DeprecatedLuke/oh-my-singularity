@@ -1,12 +1,5 @@
-export type AgentRole =
-	| "singularity"
-	| "issuer"
-	| "worker"
-	| "fast-worker"
-	| "designer-worker"
-	| "finisher"
-	| "merger"
-	| "steering";
+import type { AgentType, SpawnableAgent } from "../config/constants";
+export type { AgentType, SpawnableAgent };
 
 export type AgentStatus =
 	| "spawning"
@@ -70,7 +63,7 @@ export interface AgentInfo {
 	/** Local registry id (stable within this process). */
 	id: string;
 
-	role: AgentRole;
+	agentType: AgentType;
 	taskId: string | null;
 	/** Replica working directory used by editable agents (worker/finisher). */
 	replicaDir?: string;

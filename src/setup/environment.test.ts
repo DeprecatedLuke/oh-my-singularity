@@ -29,7 +29,7 @@ describe("saveOmsConfigOverride", () => {
 					agentsWidthRatio: 0.2,
 					systemHeightRatio: 0.2,
 				},
-				roles: {
+				agents: {
 					worker: {
 						model: "codex",
 						thinking: "medium",
@@ -48,7 +48,7 @@ describe("saveOmsConfigOverride", () => {
 				layout: {
 					tasksHeightRatio: 0.9,
 				},
-				roles: {
+				agents: {
 					worker: {
 						thinking: "xhigh",
 					},
@@ -64,7 +64,7 @@ describe("saveOmsConfigOverride", () => {
 					agentsWidthRatio: 0.2,
 					systemHeightRatio: 0.2,
 				},
-				roles: {
+				agents: {
 					worker: {
 						model: "codex",
 						thinking: "xhigh",

@@ -1,4 +1,4 @@
-import type { AgentRole, OmsConfig, OmsConfigOverride, RoleConfig, ThinkingLevel } from "../../config";
+import type { AgentModelConfig, OmsConfig, OmsConfigOverride, SpawnableAgent, ThinkingLevel } from "../../config";
 import { BG, clipAnsi, FG, RESET, RESET_FG, visibleWidth } from "../colors";
 
 type TerminalLike = {
@@ -23,14 +23,14 @@ type SettingRow = {
 
 const MODEL_OPTIONS = ["codex", "codex-spark", "haiku", "sonnet", "sonnet-4-6", "opus"] as const;
 const THINKING_OPTIONS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
-const ROLE_ORDER: readonly Exclude<AgentRole, "singularity">[] = [
+const AGENT_ORDER: readonly SpawnableAgent[] = [
 	"worker",
 	"issuer",
 	"finisher",
 	"merger",
 	"steering",
-	"designer-worker",
-	"fast-worker",
+	"designer",
+	"speedy",
 ];
 
 function clampInt(value: number, min: number, max: number): number {
@@ -72,31 +72,10 @@ function cycleOption<T extends string>(current: string, options: readonly T[], d
 	return options[nextIndex]!;
 }
 
-function roleLabel(role: AgentRole): string {
-	switch (role) {
-		case "worker":
-			return "worker";
-		case "issuer":
-			return "issuer";
-		case "finisher":
-			return "finisher";
-		case "steering":
-			return "steering";
-		case "designer-worker":
-			return "designer-worker";
-		case "fast-worker":
-			return "fast-worker";
-		case "singularity":
-			return "singularity";
-		default:
-			return role;
-	}
-}
-
-function buildRoleOverride(role: Exclude<AgentRole, "singularity">, patch: Partial<RoleConfig>): OmsConfigOverride {
-	const roles: NonNullable<OmsConfigOverride["roles"]> = {};
-	roles[role] = patch;
-	return { roles };
+function buildAgentOverride(agent: SpawnableAgent, patch: Partial<AgentModelConfig>): OmsConfigOverride {
+	const agents: NonNullable<OmsConfigOverride["agents"]> = {};
+	agents[agent] = patch;
+	return { agents };
 }
 
 export class SettingsPane {
@@ -266,30 +245,30 @@ export class SettingsPane {
 
 	#buildRows(): SettingRow[] {
 		const rows: SettingRow[] = [];
-		for (const role of ROLE_ORDER) {
-			const roleCfg = this.#config.roles[role];
+		for (const agent of AGENT_ORDER) {
+			const agentCfg = this.#config.agents[agent];
 			rows.push({
-				label: `${roleLabel(role)}:`,
+				label: `${agent}:`,
 				getValue: () => "",
 				readOnly: true,
 				isHeader: true,
 			});
 			rows.push({
 				label: "  model",
-				getValue: () => roleCfg.model,
+				getValue: () => agentCfg.model,
 				change: delta => {
-					const nextModel = cycleOption(roleCfg.model, MODEL_OPTIONS, delta);
-					roleCfg.model = nextModel;
-					this.#persistConfigOverride(buildRoleOverride(role, { model: nextModel }));
+					const nextModel = cycleOption(agentCfg.model, MODEL_OPTIONS, delta);
+					agentCfg.model = nextModel;
+					this.#persistConfigOverride(buildAgentOverride(agent, { model: nextModel }));
 				},
 			});
 			rows.push({
 				label: "  thinking",
-				getValue: () => roleCfg.thinking,
+				getValue: () => agentCfg.thinking,
 				change: delta => {
-					const nextThinking = cycleOption(roleCfg.thinking, THINKING_OPTIONS, delta);
-					roleCfg.thinking = nextThinking;
-					this.#persistConfigOverride(buildRoleOverride(role, { thinking: nextThinking }));
+					const nextThinking = cycleOption(agentCfg.thinking, THINKING_OPTIONS, delta);
+					agentCfg.thinking = nextThinking;
+					this.#persistConfigOverride(buildAgentOverride(agent, { thinking: nextThinking }));
 				},
 			});
 		}

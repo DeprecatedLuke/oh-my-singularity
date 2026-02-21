@@ -35,7 +35,7 @@ function createRegistry(tasksClient: TaskStoreClient): AgentRegistry {
 	const registry = new AgentRegistry({ tasksClient });
 	registry.register({
 		id: "system",
-		role: "singularity",
+		agentType: "singularity",
 		taskId: null,
 		tasksAgentId: "system-agent",
 		status: "running",
@@ -49,19 +49,11 @@ function createRegistry(tasksClient: TaskStoreClient): AgentRegistry {
 
 function createLoopStub(overrides: Record<string, unknown> = {}) {
 	return {
-		advanceIssuerLifecycle: (opts: unknown) => ({ ok: true, opts }),
-		advanceFastWorkerLifecycle: (opts: unknown) => ({ ok: true, opts }),
-		advanceFinisherLifecycle: (opts: unknown) => ({ ok: true, opts }),
-		handleFinisherCloseTask: async (opts: unknown) => ({ ok: true, opts }),
-		handleFastWorkerCloseTask: async (opts: unknown) => ({ ok: true, opts }),
-		handleExternalTaskClose: async (_taskId: string) => {},
-		broadcastToWorkers: async (_message: string, _meta?: unknown) => {},
+		advanceLifecycle: async (opts: unknown) => ({ ok: true, opts }),
 		interruptAgent: async (_taskId: string, _message: string) => true,
 		steerAgent: async (_taskId: string, _message: string) => true,
 		spawnAgentBySingularity: async (_opts: unknown) => {},
 		stopAgentsForTask: async (_taskId: string, _opts?: unknown) => {},
-		complain: async (_opts: unknown) => ({ ok: true }),
-		revokeComplaint: async (_opts: unknown) => ({ ok: true }),
 		isRunning: () => true,
 		isPaused: () => false,
 		resume: () => {},
@@ -302,7 +294,7 @@ describe("handleIpcMessage", () => {
 			const openAgent = await tasksClient.create("Open terminal agent", null, 0, { type: "agent" });
 
 			const createResponse = (await handleIpcMessage({
-				payload: { type: "tasks_request", action: "create", params: { title: "Fresh open task" } },
+				payload: { type: "tasks_request", action: "create", params: { title: "Fresh open task", scope: "medium" } },
 				loop: null,
 				registry,
 				tasksClient,
@@ -1008,6 +1000,14 @@ describe("handleIpcMessage", () => {
 			systemAgentId: "system",
 		});
 		expect(createError).toEqual({ ok: false, error: "title is required for create" });
+		const createScopeError = await handleIpcMessage({
+			payload: { type: "tasks_request", action: "create", params: { title: "Missing scope" } },
+			loop: null,
+			registry,
+			tasksClient,
+			systemAgentId: "system",
+		});
+		expect(createScopeError).toEqual({ ok: false, error: "scope is required for create" });
 	});
 
 	test("tasks_request create forwards depends_on and references values", async () => {
@@ -1029,7 +1029,7 @@ describe("handleIpcMessage", () => {
 			payload: {
 				type: "tasks_request",
 				action: "create",
-				params: { title: "Single dependency", depends_on: "task-100", references: "task-50" },
+				params: { title: "Single dependency", scope: "small", depends_on: "task-100", references: "task-50" },
 			},
 			loop: null,
 			registry,
@@ -1050,6 +1050,7 @@ describe("handleIpcMessage", () => {
 					title: "Multiple dependencies",
 					depends_on: ["task-100", "task-101"],
 					references: ["task-50", "task-51"],
+					scope: "large",
 				},
 			},
 			loop: null,
@@ -1138,6 +1139,120 @@ describe("handleIpcMessage", () => {
 		expect(showCalls).toEqual(["task-1", "task-1", "task-1"]);
 	});
 
+	test("tasks_request update forwards description to patch", async () => {
+		const updateCalls: Array<{ id: string; patch: unknown }> = [];
+		const showCalls: string[] = [];
+		const tasksClient = {
+			update: async (id: string, patch: unknown) => {
+				updateCalls.push({ id, patch });
+				return null;
+			},
+			show: async (id: string) => {
+				showCalls.push(id);
+				return makeIssue(id);
+			},
+		} as unknown as TaskStoreClient;
+		const registry = createRegistry(tasksClient);
+
+		const setResponse = await handleIpcMessage({
+			payload: {
+				type: "tasks_request",
+				action: "update",
+				params: { id: "task-1", description: "new desc" },
+			},
+			loop: null,
+			registry,
+			tasksClient,
+			systemAgentId: "system",
+		});
+		expect(setResponse).toEqual(expect.objectContaining({ ok: true }));
+
+		const clearResponse = await handleIpcMessage({
+			payload: {
+				type: "tasks_request",
+				action: "update",
+				params: { id: "task-1", description: null },
+			},
+			loop: null,
+			registry,
+			tasksClient,
+			systemAgentId: "system",
+		});
+		expect(clearResponse).toEqual(expect.objectContaining({ ok: true }));
+
+		const firstPatch = updateCalls[0]?.patch as { description?: string | null } | undefined;
+		const secondPatch = updateCalls[1]?.patch as { description?: string | null } | undefined;
+		expect(firstPatch?.description).toBe("new desc");
+		expect(secondPatch?.description).toBeNull();
+		expect(showCalls).toEqual(["task-1", "task-1"]);
+	});
+
+	test("tasks_request update description round-trip with real store", async () => {
+		const sessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "oms-desc-roundtrip-test-"));
+		try {
+			const tasksClient = new JsonTaskStore({
+				cwd: process.cwd(),
+				sessionDir,
+				actor: "oms-main",
+			});
+			const registry = createRegistry(tasksClient);
+
+			const createResponse = (await handleIpcMessage({
+				payload: {
+					type: "tasks_request",
+					action: "create",
+					params: { title: "Desc test task", description: "original", scope: "small" },
+				},
+				loop: null,
+				registry,
+				tasksClient,
+				systemAgentId: "system",
+			})) as { ok: boolean; data?: TaskIssue };
+			expect(createResponse.ok).toBe(true);
+			const taskId = createResponse.data?.id ?? "";
+			expect(taskId).toBeTruthy();
+
+			const updateResponse = await handleIpcMessage({
+				payload: { type: "tasks_request", action: "update", params: { id: taskId, description: "updated desc" } },
+				loop: null,
+				registry,
+				tasksClient,
+				systemAgentId: "system",
+			});
+			expect(updateResponse).toEqual(expect.objectContaining({ ok: true }));
+
+			const showResponse = (await handleIpcMessage({
+				payload: { type: "tasks_request", action: "show", params: { id: taskId } },
+				loop: null,
+				registry,
+				tasksClient,
+				systemAgentId: "system",
+			})) as { ok: boolean; data?: TaskIssue };
+			expect(showResponse.ok).toBe(true);
+			expect(showResponse.data?.description).toBe("updated desc");
+
+			// Clear description
+			await handleIpcMessage({
+				payload: { type: "tasks_request", action: "update", params: { id: taskId, description: null } },
+				loop: null,
+				registry,
+				tasksClient,
+				systemAgentId: "system",
+			});
+			const showAfterClear = (await handleIpcMessage({
+				payload: { type: "tasks_request", action: "show", params: { id: taskId } },
+				loop: null,
+				registry,
+				tasksClient,
+				systemAgentId: "system",
+			})) as { ok: boolean; data?: TaskIssue };
+			expect(showAfterClear.ok).toBe(true);
+			expect(showAfterClear.data?.description).toBeNull();
+		} finally {
+			await fs.rm(sessionDir, { recursive: true, force: true });
+		}
+	});
+
 	test("tasks_request supports defaultTaskId fallback", async () => {
 		const commentCalls: Array<{ id: string; text: string; actor?: string }> = [];
 		const tasksClient = {
@@ -1218,7 +1333,7 @@ describe("handleIpcMessage", () => {
 				};
 				return registry.register({
 					id: "worker-comment-actor",
-					role: "worker",
+					agentType: "worker",
 					taskId: spawnTask.id,
 					tasksAgentId: "worker-comment-actor",
 					status: "running",
@@ -1230,8 +1345,8 @@ describe("handleIpcMessage", () => {
 				});
 			};
 
-			await loop.spawnAgentBySingularity({ role: "worker", taskId: task.id });
-			expect(registry.getActiveByTask(task.id).some(agent => agent.role === "worker")).toBe(true);
+			await loop.spawnAgentBySingularity({ agent: "worker", taskId: task.id });
+			expect(registry.getActiveByTask(task.id).some(agent => agent.agentType === "worker")).toBe(true);
 
 			poller = new TaskPoller({
 				client: tasksClient,
@@ -1278,7 +1393,7 @@ describe("handleIpcMessage", () => {
 			]);
 
 			expect(interruptPrompts).toEqual(["[URGENT MESSAGE]\n\nurgent guidance"]);
-			const worker = registry.getActiveByTask(task.id).find(agent => agent.role === "worker");
+			const worker = registry.getActiveByTask(task.id).find(agent => agent.agentType === "worker");
 			const sawInterruptLog = worker?.events.some(event => {
 				if (event.type !== "log") return false;
 				const message = typeof event.message === "string" ? event.message : "";
@@ -1291,86 +1406,43 @@ describe("handleIpcMessage", () => {
 		}
 	});
 
-	test("issuer/fast-worker/finisher lifecycle IPC and fast_worker_close_task return unavailable when loop is missing", async () => {
+	test("advance_lifecycle returns unavailable when loop is missing", async () => {
 		const tasksClient = {} as unknown as TaskStoreClient;
 		const registry = createRegistry(tasksClient);
-		const issuerResponse = await handleIpcMessage({
-			payload: { type: "issuer_advance_lifecycle", taskId: "task-1", action: "next" },
+		const response = await handleIpcMessage({
+			payload: {
+				type: "advance_lifecycle",
+				agentType: "issuer",
+				taskId: "task-1",
+				action: "advance",
+				target: "worker",
+			},
 			loop: null,
 			registry,
 			tasksClient,
 			systemAgentId: "system",
 		});
-		const fastWorkerResponse = await handleIpcMessage({
-			payload: { type: "fast_worker_advance_lifecycle", taskId: "task-1", action: "done" },
-			loop: null,
-			registry,
-			tasksClient,
-			systemAgentId: "system",
-		});
-		const fastWorkerCloseResponse = await handleIpcMessage({
-			payload: { type: "fast_worker_close_task", taskId: "task-1", reason: "done", agentId: "fast-1" },
-			loop: null,
-			registry,
-			tasksClient,
-			systemAgentId: "system",
-		});
-		const finisherResponse = await handleIpcMessage({
-			payload: { type: "finisher_advance_lifecycle", taskId: "task-1", action: "worker" },
-			loop: null,
-			registry,
-			tasksClient,
-			systemAgentId: "system",
-		});
-		expect(issuerResponse).toEqual({ ok: false, summary: "Agent loop unavailable" });
-		expect(fastWorkerResponse).toEqual({ ok: false, summary: "Agent loop unavailable" });
-		expect(fastWorkerCloseResponse).toEqual({ ok: false, summary: "Agent loop unavailable" });
-		expect(finisherResponse).toEqual({ ok: false, summary: "Agent loop unavailable" });
+		expect(response).toEqual({ ok: false, summary: "Agent loop unavailable" });
 	});
 
-	test("issuer/fast-worker/finisher lifecycle IPC and close-task IPC delegate to loop", async () => {
-		const calls: {
-			issuer: unknown[];
-			fastWorkerAdvance: unknown[];
-			fastWorkerClose: unknown[];
-			finisherAdvance: unknown[];
-			finisherClose: unknown[];
-		} = {
-			issuer: [],
-			fastWorkerAdvance: [],
-			fastWorkerClose: [],
-			finisherAdvance: [],
-			finisherClose: [],
-		};
+	test("advance_lifecycle delegates to loop.advanceLifecycle with correct args for multiple agents", async () => {
+		const calls: unknown[] = [];
 		const loop = createLoopStub({
-			advanceIssuerLifecycle: (opts: unknown) => {
-				calls.issuer.push(opts);
-				return { ok: true, kind: "issuer" };
-			},
-			advanceFastWorkerLifecycle: (opts: unknown) => {
-				calls.fastWorkerAdvance.push(opts);
-				return { ok: true, kind: "fast-worker-advance" };
-			},
-			handleFastWorkerCloseTask: async (opts: unknown) => {
-				calls.fastWorkerClose.push(opts);
-				return { ok: true, kind: "fast-worker-close" };
-			},
-			advanceFinisherLifecycle: (opts: unknown) => {
-				calls.finisherAdvance.push(opts);
-				return { ok: true, kind: "finisher-advance" };
-			},
-			handleFinisherCloseTask: async (opts: unknown) => {
-				calls.finisherClose.push(opts);
-				return { ok: true, kind: "finisher-close" };
+			advanceLifecycle: async (opts: unknown) => {
+				calls.push(opts);
+				return { ok: true };
 			},
 		});
 		const tasksClient = {} as unknown as TaskStoreClient;
 		const registry = createRegistry(tasksClient);
+		// issuer: advance to worker
 		const issuer = await handleIpcMessage({
 			payload: {
-				type: "issuer_advance_lifecycle",
+				type: "advance_lifecycle",
+				agentType: "issuer",
 				taskId: "task-1",
-				action: "promote",
+				action: "advance",
+				target: "worker",
 				message: "go",
 				reason: "ok",
 				agentId: "agent-1",
@@ -1380,13 +1452,16 @@ describe("handleIpcMessage", () => {
 			tasksClient,
 			systemAgentId: "system",
 		});
-		const fastWorkerAdvance = await handleIpcMessage({
+		expect(issuer).toEqual({ ok: true });
+
+		// speedy: close
+		const speedyClose = await handleIpcMessage({
 			payload: {
-				type: "fast_worker_advance_lifecycle",
+				type: "advance_lifecycle",
+				agentType: "speedy",
 				taskId: "task-1",
-				action: "escalate",
-				message: "needs issuer",
-				reason: "too broad",
+				action: "close",
+				reason: "done",
 				agentId: "fast-1",
 			},
 			loop: loop as never,
@@ -1394,18 +1469,16 @@ describe("handleIpcMessage", () => {
 			tasksClient,
 			systemAgentId: "system",
 		});
-		const fastWorkerClose = await handleIpcMessage({
-			payload: { type: "fast_worker_close_task", taskId: "task-1", reason: "done", agentId: "fast-1" },
-			loop: loop as never,
-			registry,
-			tasksClient,
-			systemAgentId: "system",
-		});
+		expect(speedyClose).toEqual({ ok: true });
+
+		// finisher: advance to issuer
 		const finisherAdvance = await handleIpcMessage({
 			payload: {
-				type: "finisher_advance_lifecycle",
+				type: "advance_lifecycle",
+				agentType: "finisher",
 				taskId: "task-1",
-				action: "worker",
+				action: "advance",
+				target: "issuer",
 				message: "resume",
 				reason: "missing impl",
 				agentId: "fin-1",
@@ -1415,63 +1488,72 @@ describe("handleIpcMessage", () => {
 			tasksClient,
 			systemAgentId: "system",
 		});
-		const finisherClose = await handleIpcMessage({
-			payload: { type: "finisher_close_task", taskId: "task-1", reason: "done", agentId: "fin-1" },
-			loop: loop as never,
-			registry,
-			tasksClient,
-			systemAgentId: "system",
-		});
-		expect(issuer).toEqual({ ok: true, kind: "issuer" });
-		expect(fastWorkerAdvance).toEqual({ ok: true, kind: "fast-worker-advance" });
-		expect(fastWorkerClose).toEqual({ ok: true, kind: "fast-worker-close" });
-		expect(finisherAdvance).toEqual({ ok: true, kind: "finisher-advance" });
-		expect(finisherClose).toEqual({ ok: true, kind: "finisher-close" });
-		expect(calls.issuer).toHaveLength(1);
-		expect(calls.fastWorkerAdvance).toHaveLength(1);
-		expect(calls.fastWorkerClose).toHaveLength(1);
-		expect(calls.finisherAdvance).toHaveLength(1);
-		expect(calls.finisherClose).toHaveLength(1);
-	});
+		expect(finisherAdvance).toEqual({ ok: true });
 
-	test("broadcast validates message and delegates non-empty", async () => {
-		const sent: string[] = [];
-		const loop = createLoopStub({
-			broadcastToWorkers: async (message: string) => {
-				sent.push(message);
+		// worker: advance to finisher
+		const workerDone = await handleIpcMessage({
+			payload: {
+				type: "advance_lifecycle",
+				agentType: "worker",
+				taskId: "task-1",
+				action: "advance",
+				target: "finisher",
+				message: "complete",
+				agentId: "worker-1",
 			},
-		});
-		const tasksClient = {} as unknown as TaskStoreClient;
-		const registry = createRegistry(tasksClient);
-		const empty = await handleIpcMessage({
-			payload: { type: "broadcast", message: "   " },
 			loop: loop as never,
 			registry,
 			tasksClient,
 			systemAgentId: "system",
 		});
-		expect(empty).toEqual({ ok: false, error: "broadcast_to_workers: message is required" });
+		expect(workerDone).toEqual({ ok: true });
 
-		const ok = await handleIpcMessage({
-			payload: { type: "broadcast", message: "ship it" },
-			loop: loop as never,
-			registry,
-			tasksClient,
-			systemAgentId: "system",
+		expect(calls).toHaveLength(4);
+		expect(calls[0]).toEqual({
+			agentType: "issuer",
+			taskId: "task-1",
+			action: "advance",
+			target: "worker",
+			message: "go",
+			reason: "ok",
+			agentId: "agent-1",
 		});
-		expect(ok).toEqual({ ok: true });
-		expect(sent).toEqual(["ship it"]);
+		expect(calls[1]).toEqual({
+			agentType: "speedy",
+			taskId: "task-1",
+			action: "close",
+			target: "",
+			message: "",
+			reason: "done",
+			agentId: "fast-1",
+		});
+		expect(calls[2]).toEqual({
+			agentType: "finisher",
+			taskId: "task-1",
+			action: "advance",
+			target: "issuer",
+			message: "resume",
+			reason: "missing impl",
+			agentId: "fin-1",
+		});
+		expect(calls[3]).toEqual({
+			agentType: "worker",
+			taskId: "task-1",
+			action: "advance",
+			target: "finisher",
+			message: "complete",
+			reason: "",
+			agentId: "worker-1",
+		});
 	});
 
-	test("interrupt, steer, replace, stop, complain, revoke delegate correctly", async () => {
+	test("interrupt, steer, replace, stop delegate correctly", async () => {
 		const calls: {
 			interrupt: unknown[];
 			steer: unknown[];
 			replace: unknown[];
 			stop: unknown[];
-			complain: unknown[];
-			revoke: unknown[];
-		} = { interrupt: [], steer: [], replace: [], stop: [], complain: [], revoke: [] };
+		} = { interrupt: [], steer: [], replace: [], stop: [] };
 		let stopAwaited = false;
 		const loop = createLoopStub({
 			interruptAgent: async (taskId: string, message: string) => {
@@ -1490,14 +1572,6 @@ describe("handleIpcMessage", () => {
 				stopAwaited = true;
 				calls.stop.push({ taskId, opts });
 			},
-			complain: async (opts: unknown) => {
-				calls.complain.push(opts);
-				return { ok: true };
-			},
-			revokeComplaint: async (opts: unknown) => {
-				calls.revoke.push(opts);
-				return { ok: true };
-			},
 		});
 		const tasksClient = {
 			show: async (id: string) => makeIssue(id),
@@ -1505,7 +1579,7 @@ describe("handleIpcMessage", () => {
 		const registry = createRegistry(tasksClient);
 		registry.register({
 			id: "worker-task-1",
-			role: "worker",
+			agentType: "worker",
 			taskId: "task-1",
 			tasksAgentId: "worker-task-1",
 			status: "running",
@@ -1530,7 +1604,7 @@ describe("handleIpcMessage", () => {
 			systemAgentId: "system",
 		});
 		await handleIpcMessage({
-			payload: { type: "replace_agent", role: "worker", taskId: " task-1 ", context: " context " },
+			payload: { type: "replace_agent", agent: "worker", taskId: " task-1 ", context: " context " },
 			loop: loop as never,
 			registry,
 			tasksClient,
@@ -1543,46 +1617,12 @@ describe("handleIpcMessage", () => {
 			tasksClient,
 			systemAgentId: "system",
 		});
-		await handleIpcMessage({
-			payload: {
-				type: "complain",
-				files: [" a.ts ", "", 7],
-				reason: "blocked",
-				complainantAgentId: "agent-1",
-			},
-			loop: loop as never,
-			registry,
-			tasksClient,
-			systemAgentId: "system",
-		});
-		await handleIpcMessage({
-			payload: {
-				type: "revoke_complaint",
-				files: [" a.ts ", "", 7],
-				complainantAgentId: "agent-1",
-			},
-			loop: loop as never,
-			registry,
-			tasksClient,
-			systemAgentId: "system",
-		});
 
 		expect(calls.interrupt).toEqual([{ taskId: "task-1", message: "stop now" }]);
 		expect(calls.steer).toEqual([{ taskId: "task-1", message: "keep going" }]);
-		expect(calls.replace[0]).toEqual({ role: "worker", taskId: "task-1", context: "context" });
+		expect(calls.replace[0]).toEqual({ agent: "worker", taskId: "task-1", context: "context" });
 		expect(calls.stop[0]).toEqual({ taskId: "task-1", opts: { includeFinisher: true } });
 		expect(stopAwaited).toBe(true);
-		expect(calls.complain[0]).toEqual({
-			complainantAgentId: "agent-1",
-			complainantTaskId: undefined,
-			files: ["a.ts"],
-			reason: "blocked",
-		});
-		expect(calls.revoke[0]).toEqual({
-			complainantAgentId: "agent-1",
-			complainantTaskId: undefined,
-			files: ["a.ts"],
-		});
 	});
 
 	test("interrupt_agent returns error for nonexistent task and does not interrupt", async () => {
@@ -1687,7 +1727,7 @@ describe("handleIpcMessage", () => {
 
 		registry.register({
 			id: "finisher-task-steer",
-			role: "finisher",
+			agentType: "finisher",
 			taskId: "task-steer",
 			tasksAgentId: "finisher-task-steer",
 			status: "running",
@@ -1706,13 +1746,13 @@ describe("handleIpcMessage", () => {
 		});
 		expect(finisherOnly).toEqual({
 			ok: false,
-			error: "steer_agent: cannot steer finisher agent on task task-steer (current active roles: finisher)",
+			error: "steer_agent: cannot steer finisher agent on task task-steer (current active agents: finisher)",
 		});
 		expect(steerCalls).toHaveLength(0);
 
 		registry.register({
 			id: "worker-task-steer",
-			role: "worker",
+			agentType: "worker",
 			taskId: "task-steer",
 			tasksAgentId: "worker-task-steer",
 			status: "running",
@@ -1746,7 +1786,7 @@ describe("handleIpcMessage", () => {
 		const registry = createRegistry(tasksClient);
 
 		const noActive = await handleIpcMessage({
-			payload: { type: "replace_agent", role: "worker", taskId: "task-replace", context: "ctx" },
+			payload: { type: "replace_agent", agent: "worker", taskId: "task-replace", context: "ctx" },
 			loop: loop as never,
 			registry,
 			tasksClient,
@@ -1760,7 +1800,7 @@ describe("handleIpcMessage", () => {
 
 		registry.register({
 			id: "finisher-task-replace",
-			role: "finisher",
+			agentType: "finisher",
 			taskId: "task-replace",
 			tasksAgentId: "finisher-task-replace",
 			status: "running",
@@ -1771,7 +1811,7 @@ describe("handleIpcMessage", () => {
 		});
 
 		const finisherOnly = await handleIpcMessage({
-			payload: { type: "replace_agent", role: "worker", taskId: "task-replace", context: "ctx" },
+			payload: { type: "replace_agent", agent: "worker", taskId: "task-replace", context: "ctx" },
 			loop: loop as never,
 			registry,
 			tasksClient,
@@ -1779,13 +1819,13 @@ describe("handleIpcMessage", () => {
 		});
 		expect(finisherOnly).toEqual({
 			ok: false,
-			error: "replace_agent: cannot replace finisher agent on task task-replace (finisher manages its own lifecycle; current active roles: finisher)",
+			error: "replace_agent: cannot replace finisher agent on task task-replace (finisher manages its own lifecycle; current active agents: finisher)",
 		});
 		expect(replaceCalls).toHaveLength(0);
 
 		registry.register({
 			id: "worker-task-replace",
-			role: "worker",
+			agentType: "worker",
 			taskId: "task-replace",
 			tasksAgentId: "worker-task-replace",
 			status: "running",
@@ -1796,14 +1836,14 @@ describe("handleIpcMessage", () => {
 		});
 
 		const ok = await handleIpcMessage({
-			payload: { type: "replace_agent", role: "worker", taskId: " task-replace ", context: " ctx " },
+			payload: { type: "replace_agent", agent: "worker", taskId: " task-replace ", context: " ctx " },
 			loop: loop as never,
 			registry,
 			tasksClient,
 			systemAgentId: "system",
 		});
 		expect(ok).toEqual({ ok: true });
-		expect(replaceCalls).toEqual([{ role: "worker", taskId: "task-replace", context: "ctx" }]);
+		expect(replaceCalls).toEqual([{ agent: "worker", taskId: "task-replace", context: "ctx" }]);
 	});
 
 	test("replace_agent returns error for nonexistent task and does not spawn", async () => {
@@ -1830,7 +1870,7 @@ describe("handleIpcMessage", () => {
 		const registry = createRegistry(tasksClient);
 
 		const missing = await handleIpcMessage({
-			payload: { type: "replace_agent", role: "worker", taskId: "task-missing", context: "ctx" },
+			payload: { type: "replace_agent", agent: "worker", taskId: "task-missing", context: "ctx" },
 			loop: loop as never,
 			registry,
 			tasksClient,
@@ -1855,7 +1895,7 @@ describe("handleIpcMessage", () => {
 		const registry = createRegistry(tasksClient);
 		registry.register({
 			id: "worker-task-closed",
-			role: "worker",
+			agentType: "worker",
 			taskId: "task-closed",
 			tasksAgentId: "worker-task-closed",
 			status: "running",
@@ -1866,7 +1906,7 @@ describe("handleIpcMessage", () => {
 		});
 
 		const closed = await handleIpcMessage({
-			payload: { type: "replace_agent", role: "worker", taskId: "task-closed", context: "ctx" },
+			payload: { type: "replace_agent", agent: "worker", taskId: "task-closed", context: "ctx" },
 			loop: loop as never,
 			registry,
 			tasksClient,
@@ -1894,7 +1934,7 @@ describe("handleIpcMessage", () => {
 		const registry = createRegistry(tasksClient);
 		registry.register({
 			id: "worker-task-paused",
-			role: "worker",
+			agentType: "worker",
 			taskId: "task-paused",
 			tasksAgentId: "worker-task-paused",
 			status: "running",
@@ -1904,7 +1944,7 @@ describe("handleIpcMessage", () => {
 			lastActivity: 2,
 		});
 		const paused = await handleIpcMessage({
-			payload: { type: "replace_agent", role: "worker", taskId: "task-paused", context: "ctx" },
+			payload: { type: "replace_agent", agent: "worker", taskId: "task-paused", context: "ctx" },
 			loop: loop as never,
 			registry,
 			tasksClient,
@@ -1936,7 +1976,7 @@ describe("handleIpcMessage", () => {
 		const registry = createRegistry(tasksClient);
 		registry.register({
 			id: "worker-task-blocked",
-			role: "worker",
+			agentType: "worker",
 			taskId: "task-blocked",
 			tasksAgentId: "worker-task-blocked",
 			status: "running",
@@ -1964,7 +2004,7 @@ describe("handleIpcMessage", () => {
 			replaceCalls.push({ taskId: task.id, kickoff: opts?.kickoffMessage ?? null });
 			return {
 				id: `worker:${task.id}:spawned`,
-				role: "worker",
+				agentType: "worker",
 				taskId: task.id,
 				tasksAgentId: "agent-spawned",
 				status: "working",
@@ -1976,19 +2016,21 @@ describe("handleIpcMessage", () => {
 		};
 
 		const ok = await handleIpcMessage({
-			payload: { type: "replace_agent", role: "worker", taskId: " task-blocked ", context: " ctx " },
+			payload: { type: "replace_agent", agent: "worker", taskId: " task-blocked ", context: " ctx " },
 			loop: loop as never,
 			registry,
 			tasksClient,
 			systemAgentId: "system",
 		});
 		expect(ok).toEqual({ ok: true });
+		// Fire-and-forget: spawn runs async; flush microtasks so side-effects settle
+		await new Promise(r => setTimeout(r, 50));
 		expect(showCalls).toEqual(["task-blocked", "task-blocked", "task-blocked"]);
 		expect(updateStatusCalls).toEqual([{ taskId: "task-blocked", status: "in_progress" }]);
 		expect(replaceCalls).toEqual([{ taskId: "task-blocked", kickoff: "ctx" }]);
 	});
 
-	test("replace_agent returns error when blocked task cannot be unblocked", async () => {
+	test("replace_agent returns ok immediately even when blocked task cannot be unblocked (fire-and-forget)", async () => {
 		const replaceCalls: unknown[] = [];
 		const scheduler = {
 			getInProgressTasksWithoutAgent: async () => [],
@@ -2004,7 +2046,7 @@ describe("handleIpcMessage", () => {
 		const registry = createRegistry(tasksClient);
 		registry.register({
 			id: "worker-task-blocked-fail",
-			role: "worker",
+			agentType: "worker",
 			taskId: "task-blocked-fail",
 			tasksAgentId: "worker-task-blocked-fail",
 			status: "running",
@@ -2032,7 +2074,7 @@ describe("handleIpcMessage", () => {
 			replaceCalls.push(true);
 			return {
 				id: "worker:task-blocked-fail:spawned",
-				role: "worker",
+				agentType: "worker",
 				taskId: "task-blocked-fail",
 				tasksAgentId: "worker-task-blocked-fail-spawned",
 				status: "working",
@@ -2043,39 +2085,15 @@ describe("handleIpcMessage", () => {
 			};
 		};
 
-		const blocked = (await handleIpcMessage({
-			payload: { type: "replace_agent", role: "worker", taskId: "task-blocked-fail", context: "ctx" },
+		const result = await handleIpcMessage({
+			payload: { type: "replace_agent", agent: "worker", taskId: "task-blocked-fail", context: "ctx" },
 			loop: loop as never,
 			registry,
 			tasksClient,
 			systemAgentId: "system",
-		})) as { ok: boolean; error?: string };
-		expect(blocked.ok).toBe(false);
-		expect(blocked.error).toContain("replace_agent: failed to spawn replacement for task task-blocked-fail");
-		expect(replaceCalls).toHaveLength(0);
-	});
-
-	test("complain/revoke return unavailable when loop is null", async () => {
-		const tasksClient = {} as unknown as TaskStoreClient;
-		const registry = createRegistry(tasksClient);
-
-		const complain = await handleIpcMessage({
-			payload: { type: "complain", files: [], reason: "x" },
-			loop: null,
-			registry,
-			tasksClient,
-			systemAgentId: "system",
 		});
-		const revoke = await handleIpcMessage({
-			payload: { type: "revoke_complaint" },
-			loop: null,
-			registry,
-			tasksClient,
-			systemAgentId: "system",
-		});
-
-		expect(complain).toEqual({ ok: false, summary: "Agent loop unavailable" });
-		expect(revoke).toEqual({ ok: false, summary: "Agent loop unavailable" });
+		// Fire-and-forget: handler returns ok immediately; spawn errors are logged, not returned
+		expect(result).toEqual({ ok: true });
 	});
 
 	test("wait_for_agent validates agentId and resolves terminal/not_found statuses", async () => {
@@ -2083,7 +2101,7 @@ describe("handleIpcMessage", () => {
 		const registry = createRegistry(tasksClient);
 		registry.register({
 			id: "agent-done",
-			role: "worker",
+			agentType: "worker",
 			taskId: "task-1",
 			tasksAgentId: "agent-done",
 			status: "done",
@@ -2128,7 +2146,7 @@ describe("handleIpcMessage", () => {
 		const registry = createRegistry(tasksClient);
 		registry.register({
 			id: "worker-active",
-			role: "worker",
+			agentType: "worker",
 			taskId: "task-1",
 			tasksAgentId: "agent-active",
 			status: "running",
@@ -2139,7 +2157,7 @@ describe("handleIpcMessage", () => {
 		});
 		registry.register({
 			id: "worker-done",
-			role: "worker",
+			agentType: "worker",
 			taskId: "task-1",
 			tasksAgentId: "agent-done-2",
 			status: "done",
@@ -2184,7 +2202,7 @@ describe("handleIpcMessage", () => {
 		const registry = createRegistry(tasksClient);
 		registry.register({
 			id: "worker:task-1:live",
-			role: "worker",
+			agentType: "worker",
 			taskId: "task-1",
 			tasksAgentId: "agent-live",
 			status: "running",
@@ -2219,7 +2237,7 @@ describe("handleIpcMessage", () => {
 		const registry = createRegistry(tasksClient);
 		registry.register({
 			id: "worker:task-2:1",
-			role: "worker",
+			agentType: "worker",
 			taskId: "task-2",
 			tasksAgentId: "agent-live",
 			status: "running",
@@ -2255,7 +2273,7 @@ describe("handleIpcMessage", () => {
 		const registry = createRegistry(tasksClient);
 		registry.readMessageHistory = async () => ({
 			agent: null,
-			messages: [{ role: "assistant", content: "hello" }],
+			messages: [{ agentType: "assistant", content: "hello" }],
 			toolCalls: [],
 		});
 

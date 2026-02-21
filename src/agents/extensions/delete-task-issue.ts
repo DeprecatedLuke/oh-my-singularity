@@ -59,6 +59,20 @@ export default async function deleteTaskIssueExtension(api: ExtensionAPI): Promi
 				throw new Error(`delete_task_issue: issue ${id} does not exist`);
 			}
 
+			// Close before stopping agents to eliminate the race window where
+			// the pipeline's #checkTaskAbort sees the task still open between
+			// agent stop and hard delete.
+			const closed = await sendTasksRequest(sockPath, {
+				action: "close",
+				params: { id, reason: TOMBSTONE_REASON },
+				actor,
+			});
+			if (!closed.ok) {
+				throw new Error(
+					`delete_task_issue: failed to close ${id} before stopping agents: ${closed.error ?? "close failed"}`,
+				);
+			}
+
 			try {
 				await sendIpc(
 					sockPath,
@@ -92,36 +106,24 @@ export default async function deleteTaskIssueExtension(api: ExtensionAPI): Promi
 				};
 			}
 
-			const tombstone = await sendTasksRequest(sockPath, {
-				action: "close",
-				params: { id, reason: TOMBSTONE_REASON },
-				actor,
-			});
-			if (tombstone.ok) {
-				return {
-					content: [
-						{
-							type: "text",
-							text:
-								`delete_task_issue: stopped agents for ${id}; hard delete failed, ` +
-								`tombstoned issue ${id} via close`,
-						},
-					],
-					details: {
-						id,
-						stopped: true,
-						mode: "tombstone",
-						deleteError: deleted.error,
-						result: tombstone.data,
+			// Hard delete failed, but task is already closed from the pre-signal step
+			return {
+				content: [
+					{
+						type: "text",
+						text:
+							`delete_task_issue: stopped agents for ${id}; hard delete failed, ` +
+							`tombstoned issue ${id} via close`,
 					},
-				};
-			}
-
-			const deleteError = deleted.error ?? "delete failed";
-			const tombstoneError = tombstone.error ?? "close failed";
-			throw new Error(
-				`delete_task_issue: stopped agents for ${id}, but deletion failed. delete error: ${deleteError}; tombstone fallback error: ${tombstoneError}`,
-			);
+				],
+				details: {
+					id,
+					stopped: true,
+					mode: "tombstone",
+					deleteError: deleted.error,
+					result: closed.data,
+				},
+			};
 		},
 	});
 }

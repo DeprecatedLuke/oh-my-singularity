@@ -1,7 +1,7 @@
 import { makeTasksExtension } from "./tasks-tool";
 
 export default makeTasksExtension({
-	role: "singularity",
+	agentType: "singularity",
 	allowedActions: [
 		"show",
 		"list",

@@ -12,9 +12,9 @@ function detailValue(value: unknown, max = AGENT_SUMMARY_MAX): string {
 	return previewValue(value, max);
 }
 
-export function extractAgentRole(data: Record<string, unknown> | null): string | null {
+export function extractAgentType(data: Record<string, unknown> | null): string | null {
 	if (!data) return null;
-	if (typeof data.role === "string" && data.role) return data.role;
+	if (typeof data.agentType === "string" && data.agentType) return data.agentType;
 	if (typeof data.agentId === "string" && data.agentId) {
 		const seg = data.agentId.split(":")[0];
 		if (seg) return seg;
@@ -33,8 +33,8 @@ export function extractLifecycle(data: Record<string, unknown> | null, message: 
 	if (lower.includes("resumed")) return "resumed";
 	if (lower.includes("stopped") || lower.includes("blocked")) return "stopped";
 	if (lower.includes("interrupt")) return "interrupt";
-	if (lower.includes("deferred")) return "deferred";
-	if (lower.includes("skipped")) return "skipped";
+	if (lower.includes("deferred") || lower.includes("lifecycle block")) return "deferred";
+	if (lower.includes("skipped") || lower.includes("lifecycle close")) return "skipped";
 	if (level === "warn") return "interrupt";
 	return "";
 }
@@ -108,7 +108,7 @@ export function summarySnippets(summary: string, maxLines = 3): string[] {
 }
 
 export function formatAgentLogSummary(
-	role: string,
+	agentType: string,
 	lifecycle: string,
 	level: string,
 	message: string,
@@ -118,9 +118,9 @@ export function formatAgentLogSummary(
 	const taskId = detailValue(data?.taskId) || "(none)";
 	const dataAgentId = detailValue(data?.agentId);
 
-	if (lifecycle === "started" && (role === "issuer" || role === "steering")) {
+	if (lifecycle === "started" && (agentType === "issuer" || agentType === "steering")) {
 		const started = parseStartedLifecycleMessage(safeMessage);
-		const agentId = started?.agentId || dataAgentId || `${role}:?`;
+		const agentId = started?.agentId || dataAgentId || `${agentType}:?`;
 		const context =
 			detailValue(started?.context) ||
 			detailValue(data?.context) ||
@@ -128,20 +128,20 @@ export function formatAgentLogSummary(
 		return `start ${agentId} for ${taskId} — ${context}`;
 	}
 
-	if (lifecycle === "started" && (role === "worker" || role === "designer-worker" || role === "finisher")) {
+	if (lifecycle === "started" && (agentType === "worker" || agentType === "designer" || agentType === "finisher")) {
 		const started = parseStartedLifecycleMessage(safeMessage);
-		const agentId = started?.agentId || dataAgentId || `${role}:?`;
+		const agentId = started?.agentId || dataAgentId || `${agentType}:?`;
 		const context =
 			detailValue(started?.context) ||
 			detailValue(data?.context) ||
 			clipText(squashWhitespace(safeMessage), AGENT_SUMMARY_MAX);
 		return `start ${agentId} for ${taskId} — ${context}`;
 	}
-	if (lifecycle === "finished" && (role === "issuer" || role === "steering")) {
+	if (lifecycle === "finished" && (agentType === "issuer" || agentType === "steering")) {
 		const finished = parseFinishedLifecycleMessage(safeMessage);
 		const summary = finished?.summary || "";
 		const decision = parseSummaryRecord(summary);
-		const agentId = finished?.agentId || dataAgentId || `${role}:?`;
+		const agentId = finished?.agentId || dataAgentId || `${agentType}:?`;
 		const action = detailValue(decision?.action) || "finish";
 		const decisionTask = detailValue(decision?.taskId) || taskId;
 		const reason = detailValue(decision?.reason) || detailValue(data?.reason);
@@ -152,11 +152,11 @@ export function formatAgentLogSummary(
 		return `${action} ${agentId} for ${decisionTask} — ${detailWithRaw}`;
 	}
 
-	if (lifecycle === "finished" && (role === "worker" || role === "designer-worker" || role === "finisher")) {
+	if (lifecycle === "finished" && (agentType === "worker" || agentType === "designer" || agentType === "finisher")) {
 		const finished = parseFinishedLifecycleMessage(safeMessage);
 		const summary = finished?.summary || "";
 		const snippets = summarySnippets(summary, 3);
-		const agentId = finished?.agentId || dataAgentId || `${role}:?`;
+		const agentId = finished?.agentId || dataAgentId || `${agentType}:?`;
 		const changes = snippets.length > 0 ? snippets.join("; ") : "(no assistant output)";
 		return `done ${agentId} for ${taskId} — ${changes}`;
 	}
@@ -176,7 +176,12 @@ export function formatDataBackedLogSummary(
 	if (!taskId) return safeMessage;
 
 	const lower = safeMessage.toLowerCase();
-	if (lower.includes("issuer skipped") || lower.includes("issuer deferred")) {
+	if (
+		lower.includes("issuer skipped") ||
+		lower.includes("issuer deferred") ||
+		lower.includes("issuer lifecycle close") ||
+		lower.includes("issuer lifecycle block")
+	) {
 		const action = "skip";
 		const reason = detailValue(data.reason) || clipText(squashWhitespace(safeMessage), AGENT_SUMMARY_MAX);
 		return `${action} ${taskId} — ${reason}`;
@@ -205,7 +210,7 @@ export type TaggedText = {
 export type TaggedTextInput = {
 	text: string;
 	style: string;
-	role?: string;
+	agentType?: string;
 	lifecycle?: string;
 	level?: string;
 };
@@ -214,7 +219,7 @@ export type TaggedTextBlockInput = {
 	kind: string;
 	text?: string;
 	style?: string;
-	role?: string;
+	agentType?: string;
 	lifecycle?: string;
 	level?: string;
 };
@@ -235,13 +240,13 @@ export function parseInlineTag(text: string): { tag: string; message: string } |
 
 export function deriveTaggedText(block: TaggedTextInput): TaggedText | null {
 	if (block.style === "agentLog") {
-		const role = (block.role ?? "").trim();
-		if (!role) return null;
+		const agentType = (block.agentType ?? "").trim();
+		if (!agentType) return null;
 		const lifecycle = block.lifecycle ?? "";
 		return {
-			tag: role,
+			tag: agentType,
 			message: block.text,
-			tagColor: agentFg(role),
+			tagColor: agentFg(agentType),
 			messageColor: lifecycle ? lifecycleFg(lifecycle) : FG.dim,
 		};
 	}
@@ -300,7 +305,7 @@ export function getMaxTaggedTextWidth(blocks: readonly TaggedTextBlockInput[]): 
 		const tagged = deriveTaggedText({
 			text: block.text,
 			style: block.style,
-			role: block.role,
+			agentType: block.agentType,
 			lifecycle: block.lifecycle,
 			level: block.level,
 		});

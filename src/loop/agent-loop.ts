@@ -4,13 +4,13 @@ import { OmsRpcClient } from "../agents/rpc-wrapper";
 import type { AgentSpawner } from "../agents/spawner";
 import type { AgentInfo } from "../agents/types";
 import { DEFAULT_CONFIG, type OmsConfig } from "../config";
+import { getAgentSpawnConfig } from "../config/constants";
 import { ReplicaManager } from "../replica/manager";
 import type { SessionLogWriter } from "../session-log-writer";
 import type { TaskStoreClient } from "../tasks/client";
 import { logger } from "../utils";
-import { ComplaintManager } from "./complaints";
 import { LifecycleHelpers } from "./lifecycle-helpers";
-import { PipelineManager } from "./pipeline";
+import { PipelineManager, type PipelineServices } from "./pipeline";
 import { RpcHandlerManager } from "./rpc-handlers";
 import type { Scheduler } from "./scheduler";
 import { SteeringManager } from "./steering";
@@ -35,7 +35,6 @@ export class AgentLoop {
 	private pendingWake = false;
 
 	private readonly steeringManager: SteeringManager;
-	private readonly complaintManager: ComplaintManager;
 	private readonly lifecycleHelpers: LifecycleHelpers;
 	private readonly rpcHandlerManager: RpcHandlerManager;
 	private readonly pipelineManager: PipelineManager;
@@ -89,34 +88,54 @@ export class AgentLoop {
 			isRunning: () => this.running,
 			isPaused: () => this.paused,
 			wake: this.wake.bind(this),
-			revokeComplaint: opts => this.complaintManager.revokeComplaint(opts),
+			addLifecycleTransitionInFlight: (taskId: string) => {
+				const n = taskId.trim();
+				if (n) this.lifecycleTransitionInFlight.add(n);
+			},
+			removeLifecycleTransitionInFlight: (taskId: string) => {
+				const n = taskId.trim();
+				if (n) this.lifecycleTransitionInFlight.delete(n);
+			},
 			spawnFinisherAfterStoppingSteering: (taskId, workerOutput, resumeSessionId) =>
-				this.withLifecycleTransition(taskId, () =>
-					this.steeringManager.spawnFinisherAfterStoppingSteering(taskId, workerOutput, resumeSessionId),
-				),
+				this.steeringManager.spawnFinisherAfterStoppingSteering(taskId, workerOutput, resumeSessionId),
 			getLastAssistantText: this.lifecycleHelpers.getLastAssistantText.bind(this.lifecycleHelpers),
 			logAgentStart: this.lifecycleHelpers.logAgentStart.bind(this.lifecycleHelpers),
 			logAgentFinished: this.lifecycleHelpers.logAgentFinished.bind(this.lifecycleHelpers),
 			writeAgentCrashLog: this.lifecycleHelpers.writeAgentCrashLog.bind(this.lifecycleHelpers),
-			takeFinisherLifecycleAdvance: taskId => this.pipelineManager.takeFinisherLifecycleAdvance(taskId),
-			takeFinisherCloseRecord: taskId => this.pipelineManager.takeFinisherCloseRecord(taskId),
-			spawnWorkerFromFinisherAdvance: async (taskId, kickoffMessage) =>
-				this.withLifecycleTransition(taskId, async () => {
-					const task = await this.tasksClient.show(taskId);
-					return await this.pipelineManager.spawnTaskWorker(task, {
+			takeLifecycleRecord: taskId => this.pipelineManager.takeLifecycleRecord(taskId),
+			hasLifecycleRecord: taskId => this.pipelineManager.hasLifecycleRecord(taskId),
+			spawnWorkerFromFinisherAdvance: async (taskId, kickoffMessage) => {
+				const task = await this.tasksClient.show(taskId);
+				return await this.pipelineManager.spawnTaskWorker(task, {
+					claim: false,
+					kickoffMessage: kickoffMessage ?? null,
+				});
+			},
+			kickoffIssuerFromFinisherAdvance: async (taskId, _kickoffMessage) => {
+				const task = await this.tasksClient.show(taskId);
+				if (task.status === "blocked") {
+					this.loopLog(`Skipped issuer kickoff for blocked task ${taskId}`, "info", { taskId });
+					return;
+				}
+				this.pipelineManager.kickoffResumePipeline(task);
+			},
+			spawnWorkerForRetry: async (agent, recoveryContext) => {
+				const taskId = agent.taskId ?? "";
+				const task = await this.tasksClient.show(taskId);
+				const sessionId = agent.sessionId?.trim() || undefined;
+				if (sessionId) {
+					const agentType = agent.agentType;
+					return await this.spawner.spawnAgent(agentType, taskId, {
 						claim: false,
-						kickoffMessage: kickoffMessage ?? null,
+						resumeSessionId: sessionId,
+						kickoffMessage: recoveryContext,
 					});
-				}),
-			kickoffIssuerFromFinisherAdvance: async (taskId, _kickoffMessage) =>
-				this.withLifecycleTransition(taskId, async () => {
-					const task = await this.tasksClient.show(taskId);
-					if (task.status === "blocked") {
-						this.loopLog(`Skipped issuer kickoff for blocked task ${taskId}`, "info", { taskId });
-						return;
-					}
-					this.pipelineManager.kickoffResumePipeline(task);
-				}),
+				}
+				return await this.pipelineManager.spawnTaskWorker(task, {
+					claim: false,
+					kickoffMessage: recoveryContext,
+				});
+			},
 		});
 
 		const attachRpcHandlers = this.rpcHandlerManager.attachRpcHandlers.bind(this.rpcHandlerManager);
@@ -135,18 +154,7 @@ export class AgentLoop {
 			logAgentFinished,
 			stopAgentsMatching: this.stopAgentsMatching.bind(this),
 		});
-		this.complaintManager = new ComplaintManager({
-			registry: this.registry,
-			spawner: this.spawner,
-			loopLog: this.loopLog.bind(this),
-			onDirty: this.onDirty,
-			attachRpcHandlers,
-			finishAgent,
-			logAgentStart,
-			logAgentFinished,
-			steerAgent: this.steerAgent.bind(this),
-		});
-		this.pipelineManager = new PipelineManager({
+		const pipelineServices: PipelineServices = {
 			tasksClient: this.tasksClient,
 			registry: this.registry,
 			scheduler: this.scheduler,
@@ -169,7 +177,8 @@ export class AgentLoop {
 				),
 			isRunning: () => this.running,
 			isPaused: () => this.paused,
-		});
+		};
+		this.pipelineManager = new PipelineManager(pipelineServices);
 	}
 
 	private loopLog(message: string, level: "debug" | "info" | "warn" | "error" = "info", data?: unknown): void {
@@ -377,39 +386,64 @@ export class AgentLoop {
 		return { spawned: spawned.length, taskIds: spawned };
 	}
 
-	async broadcastToWorkers(message: string, meta?: unknown): Promise<void> {
-		if (!this.running) return;
-		await this.steeringManager.broadcastToWorkers(message, meta);
-	}
-
-	advanceIssuerLifecycle(opts: {
+	async advanceLifecycle(opts: {
+		agentType?: string;
 		taskId?: string;
 		action?: string;
+		target?: string;
 		message?: string;
 		reason?: string;
 		agentId?: string;
-	}): Record<string, unknown> {
-		return this.pipelineManager.advanceIssuerLifecycle(opts);
+	}): Promise<Record<string, unknown>> {
+		const recorded = this.pipelineManager.advanceLifecycle(opts);
+		if (!recorded.ok) return recorded;
+
+		const action = typeof opts.action === "string" ? opts.action.trim().toLowerCase() : "";
+		if (action === "close") {
+			const taskId = typeof opts.taskId === "string" ? opts.taskId.trim() : "";
+			const reason = typeof opts.reason === "string" ? opts.reason.trim() : "";
+			const agentType = typeof opts.agentType === "string" ? opts.agentType.trim().toLowerCase() : "";
+			const agentId = typeof opts.agentId === "string" ? opts.agentId.trim() : "";
+
+			if (agentType === "finisher") {
+				return await this.handleFinisherCloseTask({ taskId, reason, agentId });
+			}
+			// speedy or any other agent type with close permission
+			return await this.#handleCloseTask({ taskId, reason, agentId, agentType });
+		}
+
+		return recorded;
 	}
 
-	advanceFastWorkerLifecycle(opts: {
-		taskId?: string;
-		action?: string;
-		message?: string;
-		reason?: string;
-		agentId?: string;
-	}): Record<string, unknown> {
-		return this.pipelineManager.advanceFastWorkerLifecycle(opts);
-	}
+	async #handleCloseTask(opts: {
+		taskId: string;
+		reason: string;
+		agentId: string;
+		agentType: string;
+	}): Promise<Record<string, unknown>> {
+		const { taskId, reason, agentId, agentType } = opts;
+		if (!taskId) {
+			return { ok: false, summary: "close rejected: taskId is required" };
+		}
 
-	advanceFinisherLifecycle(opts: {
-		taskId?: string;
-		action?: string;
-		message?: string;
-		reason?: string;
-		agentId?: string;
-	}): Record<string, unknown> {
-		return this.pipelineManager.advanceFinisherLifecycle(opts);
+		await this.#closeTaskAndUnblockDependents(taskId, reason || `Closed by ${agentType}`);
+		const abortedCount = this.#abortActiveAgentsByType(taskId, agentType as AgentInfo["agentType"]);
+		this.loopLog(`Lifecycle close recorded for ${taskId} (${agentType})`, "info", {
+			taskId,
+			reason: reason || null,
+			agentId: agentId || null,
+			agentType,
+			abortedCount,
+		});
+
+		return {
+			ok: true,
+			summary: `lifecycle close recorded for ${taskId}`,
+			taskId,
+			reason: reason || null,
+			agentId: agentId || null,
+			abortedCount,
+		};
 	}
 
 	async #restoreMergerQueueFromReplicas(): Promise<void> {
@@ -566,15 +600,15 @@ export class AgentLoop {
 		return task.status === "in_progress";
 	}
 
-	#abortActiveAgentsByRole(taskId: string, role: AgentInfo["role"]): number {
-		const agents = this.registry.getActiveByTask(taskId).filter(agent => agent.role === role);
+	#abortActiveAgentsByType(taskId: string, agentType: AgentInfo["agentType"]): number {
+		const agents = this.registry.getActiveByTask(taskId).filter(agent => agent.agentType === agentType);
 		for (const agent of agents) {
 			const rpc = agent.rpc;
 			if (rpc && rpc instanceof OmsRpcClient) {
 				void rpc.abort().catch(err => {
-					this.loopLog(`Failed to abort ${role} RPC during close (non-fatal)`, "debug", {
+					this.loopLog(`Failed to abort ${agentType} RPC during close (non-fatal)`, "debug", {
 						taskId,
-						role,
+						agentType,
 						agentId: agent.id,
 						error: err instanceof Error ? err.message : String(err),
 					});
@@ -591,7 +625,7 @@ export class AgentLoop {
 			if (!this.running || this.paused) return;
 			if (!this.config.enableReplicas || !this.#replicaManager) return;
 			if (this.#mergerQueueProcessing) {
-				const activeMergerExists = this.registry.getActive().some(agent => agent.role === "merger");
+				const activeMergerExists = this.registry.getActive().some(agent => agent.agentType === "merger");
 				if (activeMergerExists) return;
 				this.#mergerQueueProcessing = false;
 				this.loopLog("Merger queue lock reset after merger agent exit without completion signal", "warn");
@@ -674,43 +708,6 @@ export class AgentLoop {
 		}
 	}
 
-	async handleFastWorkerCloseTask(opts: {
-		taskId?: string;
-		reason?: string;
-		agentId?: string;
-	}): Promise<Record<string, unknown>> {
-		const taskId = typeof opts.taskId === "string" ? opts.taskId.trim() : "";
-		if (!taskId) {
-			return { ok: false, summary: "fast_worker_close_task rejected: taskId is required" };
-		}
-
-		const reason = typeof opts.reason === "string" ? opts.reason.trim() : "";
-		const agentId = typeof opts.agentId === "string" ? opts.agentId.trim() : "";
-		this.pipelineManager.recordFastWorkerClose?.({
-			taskId,
-			reason: reason || undefined,
-			agentId: agentId || undefined,
-		});
-
-		await this.#closeTaskAndUnblockDependents(taskId, reason || "Closed by fast-worker");
-		const abortedFastWorkerCount = this.#abortActiveAgentsByRole(taskId, "fast-worker");
-		this.loopLog(`Fast-worker close recorded for ${taskId}`, "info", {
-			taskId,
-			reason: reason || null,
-			agentId: agentId || null,
-			abortedFastWorkerCount,
-		});
-
-		return {
-			ok: true,
-			summary: `fast_worker_close_task recorded for ${taskId}`,
-			taskId,
-			reason: reason || null,
-			agentId: agentId || null,
-			abortedFastWorkerCount,
-		};
-	}
-
 	async handleFinisherCloseTask(opts: {
 		taskId?: string;
 		reason?: string;
@@ -718,18 +715,13 @@ export class AgentLoop {
 	}): Promise<Record<string, unknown>> {
 		const taskId = typeof opts.taskId === "string" ? opts.taskId.trim() : "";
 		if (!taskId) {
-			return { ok: false, summary: "finisher_close_task rejected: taskId is required" };
+			return { ok: false, summary: "lifecycle close rejected: taskId is required" };
 		}
 
 		const reason = typeof opts.reason === "string" ? opts.reason.trim() : "";
 		const agentId = typeof opts.agentId === "string" ? opts.agentId.trim() : "";
-		this.pipelineManager.recordFinisherClose?.({
-			taskId,
-			reason: reason || undefined,
-			agentId: agentId || undefined,
-		});
 
-		const finishers = this.registry.getActiveByTask(taskId).filter(agent => agent.role === "finisher");
+		const finishers = this.registry.getActiveByTask(taskId).filter(agent => agent.agentType === "finisher");
 		const finisherWithReplica =
 			finishers.find(
 				agent => agent.id === agentId && typeof agent.replicaDir === "string" && agent.replicaDir.trim(),
@@ -751,7 +743,7 @@ export class AgentLoop {
 
 			if (replicaExists) {
 				this.#mergerQueue.enqueue(taskId, replicaDir);
-				const abortedFinisherCount = this.#abortActiveAgentsByRole(taskId, "finisher");
+				const abortedFinisherCount = this.#abortActiveAgentsByType(taskId, "finisher");
 				this.loopLog(`Finisher close queued merger for ${taskId}`, "info", {
 					taskId,
 					reason: reason || null,
@@ -763,7 +755,7 @@ export class AgentLoop {
 				void this.#processMergerQueue();
 				return {
 					ok: true,
-					summary: `finisher_close_task queued merger for ${taskId}`,
+					summary: `lifecycle close queued merger for ${taskId}`,
 					taskId,
 					reason: reason || null,
 					agentId: agentId || null,
@@ -775,7 +767,7 @@ export class AgentLoop {
 		}
 
 		await this.#closeTaskAndUnblockDependents(taskId, reason || "Closed by finisher");
-		const abortedFinisherCount = this.#abortActiveAgentsByRole(taskId, "finisher");
+		const abortedFinisherCount = this.#abortActiveAgentsByType(taskId, "finisher");
 		this.loopLog(`Finisher close recorded for ${taskId}`, "info", {
 			taskId,
 			reason: reason || null,
@@ -785,7 +777,7 @@ export class AgentLoop {
 
 		return {
 			ok: true,
-			summary: `finisher_close_task recorded for ${taskId}`,
+			summary: `lifecycle close recorded for ${taskId}`,
 			taskId,
 			reason: reason || null,
 			agentId: agentId || null,
@@ -810,7 +802,7 @@ export class AgentLoop {
 			}
 		}
 
-		const abortedMergerCount = this.#abortActiveAgentsByRole(normalizedTaskId, "merger");
+		const abortedMergerCount = this.#abortActiveAgentsByType(normalizedTaskId, "merger");
 		this.loopLog(`External close removed ${normalizedTaskId} from merger queue`, "info", {
 			taskId: normalizedTaskId,
 			abortedMergerCount,
@@ -851,7 +843,7 @@ export class AgentLoop {
 		}
 
 		await this.#closeTaskAndUnblockDependents(taskId, reason || "Closed by merger");
-		const abortedMergerCount = this.#abortActiveAgentsByRole(taskId, "merger");
+		const abortedMergerCount = this.#abortActiveAgentsByType(taskId, "merger");
 
 		this.#mergerQueueProcessing = false;
 		void this.#processMergerQueue();
@@ -909,7 +901,7 @@ export class AgentLoop {
 			logger.debug("loop/agent-loop.ts: failed to post merger conflict comment (non-fatal)", { err });
 		}
 
-		const abortedMergerCount = this.#abortActiveAgentsByRole(taskId, "merger");
+		const abortedMergerCount = this.#abortActiveAgentsByType(taskId, "merger");
 
 		this.#mergerQueueProcessing = false;
 		void this.#processMergerQueue();
@@ -939,24 +931,6 @@ export class AgentLoop {
 	async interruptAgent(taskId: string, message: string): Promise<boolean> {
 		if (!this.running) return false;
 		return await this.steeringManager.interruptAgent(taskId, message);
-	}
-
-	async complain(opts: {
-		complainantAgentId?: string;
-		complainantTaskId?: string;
-		files: string[];
-		reason: string;
-	}): Promise<Record<string, unknown>> {
-		return await this.complaintManager.complain(opts);
-	}
-
-	async revokeComplaint(opts: {
-		complainantAgentId?: string;
-		complainantTaskId?: string;
-		files?: string[];
-		cause?: string;
-	}): Promise<Record<string, unknown>> {
-		return await this.complaintManager.revokeComplaint(opts);
 	}
 
 	async waitForAgent(
@@ -1007,34 +981,32 @@ export class AgentLoop {
 		}
 	}
 
-	async spawnAgentBySingularity(opts: {
-		role: "finisher" | "issuer" | "worker";
-		taskId: string;
-		context?: string;
-	}): Promise<void> {
+	async spawnAgentBySingularity(opts: { agent: string; taskId: string; context?: string }): Promise<void> {
 		if (!this.running) return;
 		if (this.paused) return;
-		const { role, taskId, context } = opts;
+		const { agent: targetAgent, taskId, context } = opts;
 		const ctx = context?.trim() || "";
-		const key = `${role}:${taskId}`;
+		const key = `${targetAgent}:${taskId}`;
 		if (this.spawnAgentInFlight.has(key)) {
 			this.loopLog(`replace_agent: already in-flight for ${key}, skipping`, "warn");
 			return;
 		}
 		this.spawnAgentInFlight.add(key);
 		this.pipelineManager.addPipelineInFlight(taskId);
-		this.loopLog(`Singularity requested spawn: ${role} for ${taskId}`, "info", {
-			role,
+		this.loopLog(`Singularity requested spawn: ${targetAgent} for ${taskId}`, "info", {
+			agent: targetAgent,
 			taskId,
 			context: ctx || undefined,
 		});
 
 		// Unblock the task if it's blocked — replace_agent is used to recover stuck tasks.
+		let wasBlocked = false;
 		try {
 			const task = await this.tasksClient.show(taskId);
 			if (task.status === "blocked") {
 				await this.tasksClient.updateStatus(taskId, "in_progress");
 				this.loopLog(`replace_agent: unblocked task ${taskId}`, "info", { taskId });
+				wasBlocked = true;
 			}
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
@@ -1042,26 +1014,36 @@ export class AgentLoop {
 			throw new Error(`replace_agent: failed to check/unblock task ${taskId}: ${message}`);
 		}
 
+		// Mark pending worker replacement before stopping existing agents so that
+		// any in-flight pipeline's #checkTaskAbort sees the flag immediately.
+		const isWorkerCategory = getAgentSpawnConfig(targetAgent)?.spawnGuard === "worker";
+		if (isWorkerCategory) {
+			this.pipelineManager.markWorkerReplacementPending(taskId);
+		}
 		// Duplicate detection: if any active agent exists for this task,
 		// stop all of them first, then spawn a fresh replacement.
 		const existingForTask = this.registry.getActiveByTask(taskId);
 
 		if (existingForTask.length > 0) {
 			await this.stopAgentsMatching(agent => agent.taskId === taskId);
-			this.loopLog(`replace_agent: stopped existing agent(s) for ${taskId} before spawning fresh ${role}`, "info", {
-				role,
-				taskId,
-				replacedAgentIds: existingForTask.map(agent => agent.id),
-			});
+			this.loopLog(
+				`replace_agent: stopped existing agent(s) for ${taskId} before spawning fresh ${targetAgent}`,
+				"info",
+				{
+					agent: targetAgent,
+					taskId,
+					replacedAgentIds: existingForTask.map(agent => agent.id),
+				},
+			);
 		}
 
 		try {
-			if (role === "finisher") {
+			if (targetAgent === "finisher") {
 				const workerOutput = ctx || "[Spawned by singularity for lifecycle recovery]";
 				const finisher = await this.steeringManager.spawnFinisherAfterStoppingSteering(taskId, workerOutput);
 				this.rpcHandlerManager.attachRpcHandlers(finisher);
 				this.lifecycleHelpers.logAgentStart("singularity", finisher, ctx);
-			} else if (role === "issuer") {
+			} else if (targetAgent === "issuer") {
 				const task = await this.tasksClient.show(taskId);
 				const result = await this.pipelineManager.runIssuerForTask(task, { kickoffMessage: ctx || undefined });
 				if (result.skip) {
@@ -1118,29 +1100,34 @@ export class AgentLoop {
 					const kickoff = result.message ?? null;
 					const task2 = await this.tasksClient.show(taskId);
 					const worker = await this.pipelineManager.spawnTaskWorker(task2, {
-						claim: true,
+						claim: !wasBlocked,
 						kickoffMessage: kickoff,
+						target: result.target,
 					});
 					this.lifecycleHelpers.logAgentStart("singularity", worker, kickoff ?? task2.title);
 				}
-			} else if (role === "worker") {
+			} else {
 				const task = await this.tasksClient.show(taskId);
 				const worker = await this.pipelineManager.spawnTaskWorker(task, {
-					claim: true,
+					claim: !wasBlocked && existingForTask.length === 0,
 					kickoffMessage: ctx || undefined,
+					target: targetAgent === "worker" ? undefined : targetAgent,
 				});
 				this.lifecycleHelpers.logAgentStart("singularity", worker, ctx);
 			}
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
-			this.loopLog(`replace_agent failed: ${role} for ${taskId}: ${message}`, "warn", {
+			this.loopLog(`replace_agent failed: ${targetAgent} for ${taskId}: ${message}`, "warn", {
 				taskId,
-				role,
+				agent: targetAgent,
 				error: message,
 			});
 			throw err;
 		} finally {
 			this.spawnAgentInFlight.delete(key);
+			if (isWorkerCategory) {
+				this.pipelineManager.clearWorkerReplacementPending(taskId);
+			}
 			this.pipelineManager.removePipelineInFlight(taskId);
 		}
 		this.onDirty?.();
@@ -1160,7 +1147,7 @@ export class AgentLoop {
 	async stopAgentsForTask(taskId: string, opts?: { includeFinisher?: boolean }): Promise<void> {
 		const includeFinisher = opts?.includeFinisher === true;
 		const stopped = await this.stopAgentsMatching(
-			agent => agent.taskId === taskId && (includeFinisher || agent.role !== "finisher"),
+			agent => agent.taskId === taskId && (includeFinisher || agent.agentType !== "finisher"),
 		);
 		if (stopped.size > 0) {
 			const reason = "Blocked by user via Stop. Ask Singularity for guidance, then unblock when ready.";

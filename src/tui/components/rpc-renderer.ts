@@ -2,7 +2,7 @@ import { asRecord } from "../../utils";
 import { BOX, FG, ICON, lifecycleFg, RESET } from "../colors";
 import {
 	deriveTaggedText,
-	extractAgentRole,
+	extractAgentType,
 	extractLifecycle,
 	formatAgentLogSummary,
 	formatDataBackedLogSummary,
@@ -37,8 +37,8 @@ type TextBlock = {
 	style: TextStyle;
 	/** Optional ANSI fg override — replaces the style's default color when set. */
 	color?: string;
-	/** Agent role for agentLog style. */
-	role?: string;
+	/** Agent type for agentLog style. */
+	agentType?: string;
 	/** Lifecycle keyword for agentLog style. */
 	lifecycle?: string;
 	/** Original log level when event.type === "log". */
@@ -606,12 +606,12 @@ function buildRenderBlocks(events: readonly unknown[]): RenderBlock[] {
 			const level = typeof rec.level === "string" ? rec.level : "log";
 			const message = typeof rec.message === "string" ? rec.message : "";
 			const data = asRecord(rec.data);
-			const role = extractAgentRole(data);
+			const agentType = extractAgentType(data);
 			const text = message || level;
-			if (role) {
+			if (agentType) {
 				const lifecycle = extractLifecycle(data, text, level);
-				const summary = formatAgentLogSummary(role, lifecycle, level, text, data);
-				pushBlock(blocks, { kind: "text", text: summary, style: "agentLog", role, lifecycle, level });
+				const summary = formatAgentLogSummary(agentType, lifecycle, level, text, data);
+				pushBlock(blocks, { kind: "text", text: summary, style: "agentLog", agentType, lifecycle, level });
 			} else {
 				const style: TextStyle = level === "error" ? "error" : level === "warn" ? "warn" : "dim";
 				const summary = formatDataBackedLogSummary(text, level, data);

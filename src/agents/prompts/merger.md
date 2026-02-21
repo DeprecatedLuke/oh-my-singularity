@@ -10,7 +10,8 @@ You merge task changes from a replica workspace back into the project root.
 </critical>
 
 <environment>
-- `OMS_REPLICA_DIR` points to the replica directory containing worker/finisher changes.
+- `OMS_REPLICA_DIR` points to the OverlayFS merged mount (`<base>/merged/`) containing the full workspace view.
+- The OverlayFS upper directory is at `$OMS_REPLICA_DIR/../upper` — only files the worker actually created or modified exist here. Use this to efficiently discover exactly what changed without diffing the entire tree.
 - Current working directory is the project root (merge target).
 </environment>
 
@@ -19,8 +20,10 @@ You merge task changes from a replica workspace back into the project root.
    - `OMS_REPLICA_DIR` exists and is a directory.
    - Project root and replica are different paths.
 2. Discover changed files:
-   - Prefer deterministic file comparisons (`diff -rq`, `diff -qr`, `find`, `grep`) between replica and root.
+   - Compute the upper dir: `UPPER_DIR="$OMS_REPLICA_DIR/../upper"`.
+   - List files in `$UPPER_DIR` to find exactly what the worker changed (OverlayFS only writes modified files to the upper layer).
    - Exclude merge-irrelevant directories (`.git`, `node_modules`, `.oms/replica`).
+   - For deleted files, OverlayFS creates whiteout entries (character devices with 0/0 major/minor) in the upper dir — detect these with `find $UPPER_DIR -type c` and remove the corresponding files from root.
 3. For each changed file, detect conflict risk before applying:
    - If root and replica differ, check whether root appears independently changed after replica creation (e.g. mtime/window heuristic, git status/context).
    - If conflict risk is high or ambiguous, do not overwrite blindly.

@@ -402,7 +402,7 @@ describe("rpc renderer tool and wake rendering", () => {
 					toolName: "tasks",
 					isError: true,
 					result: {
-						content: [{ type: "text", text: "tasks: action not permitted: close (role=worker)" }],
+						content: [{ type: "text", text: "tasks: action not permitted: close (agentType=worker)" }],
 						details: { action: "close" },
 					},
 				},
@@ -411,7 +411,7 @@ describe("rpc renderer tool and wake rendering", () => {
 
 		expect(output).toContain("comment_add");
 		expect(output).toContain("tasks comment_add: ok (no output)");
-		expect(output).toContain("tasks: action not permitted: close (role=worker)");
+		expect(output).toContain("tasks: action not permitted: close (agentType=worker)");
 	});
 
 	test("renders tasks comment_add as a concise count summary", () => {
@@ -550,10 +550,13 @@ describe("rpc renderer tool and wake rendering", () => {
 		]);
 
 		expect(output).toContain("task: task-9");
-		expect(output).toContain("tasks comment_add: ok (no output)");
+		expect(output).toContain("tasks");
+		expect(output).toContain("comment_add");
+		expect(output).not.toContain("tasks comment_add: ok (no output)");
 		expect(output).toContain("Started task spawning");
 		expect(output).toContain("spawned=2");
-		expect(output).toContain("(no output)");
+		expect(output).toContain("custom_tool");
+		expect(output).not.toContain("(no output)");
 	});
 
 	test("renders initial prompt events as task prompt blocks", () => {
@@ -703,60 +706,8 @@ describe("OMS custom tool rendering", () => {
 		expect(output).toContain("stopped agents");
 	});
 
-	test("renders broadcast_to_workers with message arg", () => {
+	test("renders advance_lifecycle results", () => {
 		const output = render([
-			{
-				type: "rpc",
-				data: {
-					type: "tool_execution_start",
-					toolCallId: "call-bc-1",
-					toolName: "broadcast_to_workers",
-					args: { message: "Module changed" },
-				},
-			},
-			{
-				type: "rpc",
-				data: {
-					type: "tool_execution_end",
-					toolCallId: "call-bc-1",
-					toolName: "broadcast_to_workers",
-					isError: false,
-					result: {
-						content: [{ type: "text", text: "OK (broadcast queued)" }],
-					},
-				},
-			},
-		]);
-
-		expect(output).toContain("broadcast_to_workers");
-		expect(output).toContain("Module changed");
-		expect(output).toContain("OK (broadcast queued)");
-	});
-
-	test("renders close_task and advance_lifecycle results", () => {
-		const output = render([
-			{
-				type: "rpc",
-				data: {
-					type: "tool_execution_start",
-					toolCallId: "call-ct-1",
-					toolName: "close_task",
-					args: { reason: "Worker completed successfully" },
-				},
-			},
-			{
-				type: "rpc",
-				data: {
-					type: "tool_execution_end",
-					toolCallId: "call-ct-1",
-					toolName: "close_task",
-					isError: false,
-					result: {
-						content: [{ type: "text", text: "close_task completed for task-456" }],
-						details: { ok: true },
-					},
-				},
-			},
 			{
 				type: "rpc",
 				data: {
@@ -781,15 +732,12 @@ describe("OMS custom tool rendering", () => {
 			},
 		]);
 
-		expect(output).toContain("close_task");
-		expect(output).toContain("Worker completed successfully");
-		expect(output).toContain("close_task completed for task-456");
 		expect(output).toContain("advance_lifecycle");
 		expect(output).toContain("worker");
 		expect(output).toContain("advance_lifecycle recorded");
 	});
 
-	test("renders replace_agent with role and taskId args", () => {
+	test("renders replace_agent with agent and taskId args", () => {
 		const output = render([
 			{
 				type: "rpc",
@@ -797,7 +745,7 @@ describe("OMS custom tool rendering", () => {
 					type: "tool_execution_start",
 					toolCallId: "call-ra-1",
 					toolName: "replace_agent",
-					args: { role: "finisher", taskId: "task-789" },
+					args: { agent: "finisher", taskId: "task-789" },
 				},
 			},
 			{
@@ -817,60 +765,6 @@ describe("OMS custom tool rendering", () => {
 		expect(output).toContain("replace_agent");
 		expect(output).toContain("finisher task-789");
 		expect(output).toContain("replace_agent queued");
-	});
-
-	test("renders complain and revoke_complaint", () => {
-		const output = render([
-			{
-				type: "rpc",
-				data: {
-					type: "tool_execution_start",
-					toolCallId: "call-cp-1",
-					toolName: "complain",
-					args: { reason: "Editing src/foo.ts", files: ["src/foo.ts"] },
-				},
-			},
-			{
-				type: "rpc",
-				data: {
-					type: "tool_execution_end",
-					toolCallId: "call-cp-1",
-					toolName: "complain",
-					isError: false,
-					result: {
-						content: [{ type: "text", text: "Complaint registered for src/foo.ts" }],
-					},
-				},
-			},
-			{
-				type: "rpc",
-				data: {
-					type: "tool_execution_start",
-					toolCallId: "call-rv-1",
-					toolName: "revoke_complaint",
-					args: { files: ["src/foo.ts", "src/bar.ts"] },
-				},
-			},
-			{
-				type: "rpc",
-				data: {
-					type: "tool_execution_end",
-					toolCallId: "call-rv-1",
-					toolName: "revoke_complaint",
-					isError: false,
-					result: {
-						content: [{ type: "text", text: "Complaints revoked" }],
-					},
-				},
-			},
-		]);
-
-		expect(output).toContain("complain");
-		expect(output).toContain("Editing src/foo.ts");
-		expect(output).toContain("Complaint registered");
-		expect(output).toContain("revoke_complaint");
-		expect(output).toContain("src/foo.ts, src/bar.ts");
-		expect(output).toContain("Complaints revoked");
 	});
 
 	test("renders OMS tools with empty content as ok", () => {

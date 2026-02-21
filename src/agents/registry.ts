@@ -7,7 +7,7 @@ import {
 import type { TaskStoreClient } from "../tasks/client";
 import { asRecord, logger } from "../utils";
 import { OmsRpcClient } from "./rpc-wrapper";
-import type { AgentEvent, AgentInfo, AgentRole, AgentStatus } from "./types";
+import type { AgentEvent, AgentInfo, AgentStatus, AgentType } from "./types";
 
 function isActiveStatus(status: AgentStatus): boolean {
 	// Keep conservative: only treat clearly-terminal states as inactive.
@@ -214,10 +214,10 @@ export class AgentRegistry {
 		return out;
 	}
 
-	getByRole(role: AgentRole): AgentInfo[] {
+	getByAgentType(agentType: AgentType): AgentInfo[] {
 		const out: AgentInfo[] = [];
 		for (const agent of this.agents.values()) {
-			if (agent.role === role) out.push(agent);
+			if (agent.agentType === agentType) out.push(agent);
 		}
 		return out;
 	}
@@ -236,14 +236,14 @@ export class AgentRegistry {
 
 	listActiveSummaries(): Array<{
 		id: string;
-		role: AgentRole;
+		agentType: AgentType;
 		taskId: string | null;
 		status: AgentStatus;
 		lastActivity: number;
 	}> {
 		return this.getActive().map(agent => ({
 			id: agent.id,
-			role: agent.role,
+			agentType: agent.agentType,
 			taskId: agent.taskId,
 			status: agent.status,
 			lastActivity: agent.lastActivity,
@@ -256,7 +256,7 @@ export class AgentRegistry {
 	): Promise<{
 		agent: {
 			id: string;
-			role: AgentRole;
+			agentType: AgentType;
 			taskId: string | null;
 			status: AgentStatus;
 		} | null;
@@ -316,7 +316,7 @@ export class AgentRegistry {
 			agent: agent
 				? {
 						id: agent.id,
-						role: agent.role,
+						agentType: agent.agentType,
 						taskId: agent.taskId,
 						status: agent.status,
 					}

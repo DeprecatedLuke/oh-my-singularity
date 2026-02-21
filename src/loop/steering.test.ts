@@ -30,7 +30,7 @@ function makeRpc(overrides: Record<string, unknown> = {}): OmsRpcClient {
 function makeAgent(id: string, overrides: Partial<AgentInfo> = {}): AgentInfo {
 	return {
 		id,
-		role: "worker",
+		agentType: "worker",
 		taskId: "task-1",
 		tasksAgentId: id,
 		status: "running",
@@ -50,9 +50,8 @@ function createManager(opts?: {
 	const tasksClient = {} as unknown as TaskStoreClient;
 	const registry = opts?.registry ?? new AgentRegistry({ tasksClient });
 	const spawner = (opts?.spawner ?? {
-		spawnFinisher: async (taskId: string) => makeAgent(`finisher:${taskId}`, { role: "finisher", taskId }),
-		spawnSteering: async (taskId: string) => makeAgent(`steering:${taskId}`, { role: "steering", taskId }),
-		spawnBroadcastSteering: async () => makeAgent("steering:broadcast", { role: "steering", taskId: null }),
+		spawnFinisher: async (taskId: string) => makeAgent(`finisher:${taskId}`, { agentType: "finisher", taskId }),
+		spawnSteering: async (taskId: string) => makeAgent(`steering:${taskId}`, { agentType: "steering", taskId }),
 	}) as never;
 
 	const attachCalls: string[] = [];
@@ -91,12 +90,12 @@ function createManager(opts?: {
 }
 
 describe("SteeringManager", () => {
-	test("getActiveWorkerAgents filters by role and terminal status", () => {
+	test("getActiveWorkerAgents filters by agent type and terminal status", () => {
 		const { manager, registry } = createManager();
-		registry.register(makeAgent("worker-1", { role: "worker", status: "running" }));
-		registry.register(makeAgent("designer-1", { role: "designer-worker", status: "working" }));
-		registry.register(makeAgent("worker-done", { role: "worker", status: "done" }));
-		registry.register(makeAgent("finisher-1", { role: "finisher", status: "running" }));
+		registry.register(makeAgent("worker-1", { agentType: "worker", status: "running" }));
+		registry.register(makeAgent("designer-1", { agentType: "designer", status: "working" }));
+		registry.register(makeAgent("worker-done", { agentType: "worker", status: "done" }));
+		registry.register(makeAgent("finisher-1", { agentType: "finisher", status: "running" }));
 
 		const active = manager
 			.getActiveWorkerAgents()
@@ -107,7 +106,7 @@ describe("SteeringManager", () => {
 
 	test("hasFinisherTakeover reflects active finisher", () => {
 		const { manager, registry } = createManager();
-		registry.register(makeAgent("finisher-1", { role: "finisher", taskId: "task-1" }));
+		registry.register(makeAgent("finisher-1", { agentType: "finisher", taskId: "task-1" }));
 		expect(manager.hasFinisherTakeover("task-1")).toBe(true);
 		expect(manager.hasFinisherTakeover("task-2")).toBe(false);
 	});
@@ -117,14 +116,14 @@ describe("SteeringManager", () => {
 		const { manager, registry } = createManager();
 		registry.register(
 			makeAgent("worker-1", {
-				role: "worker",
+				agentType: "worker",
 				taskId: "task-1",
 				rpc: makeRpc({ steer: async (msg: string) => steerCalls.push(msg) }),
 			}),
 		);
 		registry.register(
 			makeAgent("finisher-1", {
-				role: "finisher",
+				agentType: "finisher",
 				taskId: "task-1",
 				rpc: makeRpc({ steer: async (msg: string) => steerCalls.push(`finisher:${msg}`) }),
 			}),
@@ -141,7 +140,7 @@ describe("SteeringManager", () => {
 		const { manager, registry, finishCalls } = createManager();
 		registry.register(
 			makeAgent("worker-1", {
-				role: "worker",
+				agentType: "worker",
 				taskId: "task-1",
 				rpc: makeRpc({
 					abortAndPrompt: async (msg: string) => {
@@ -152,7 +151,7 @@ describe("SteeringManager", () => {
 		);
 		registry.register(
 			makeAgent("issuer-1", {
-				role: "issuer",
+				agentType: "issuer",
 				taskId: "task-1",
 				rpc: makeRpc({
 					abortAndPrompt: async (msg: string) => {
@@ -163,7 +162,7 @@ describe("SteeringManager", () => {
 		);
 		registry.register(
 			makeAgent("finisher-1", {
-				role: "finisher",
+				agentType: "finisher",
 				taskId: "task-1",
 				rpc: makeRpc({
 					abortAndPrompt: async (msg: string) => {
@@ -174,7 +173,7 @@ describe("SteeringManager", () => {
 		);
 		registry.register(
 			makeAgent("steering-1", {
-				role: "steering",
+				agentType: "steering",
 				taskId: "task-1",
 				rpc: makeRpc({
 					abortAndPrompt: async (msg: string) => {
@@ -185,7 +184,7 @@ describe("SteeringManager", () => {
 		);
 		registry.register(
 			makeAgent("worker-other", {
-				role: "worker",
+				agentType: "worker",
 				taskId: "task-2",
 				rpc: makeRpc({
 					abortAndPrompt: async (msg: string) => abortCalls.push({ id: "worker-other", message: msg }),
@@ -212,7 +211,7 @@ describe("SteeringManager", () => {
 		const { manager, registry, finishCalls } = createManager();
 		registry.register(
 			makeAgent("worker-1", {
-				role: "worker",
+				agentType: "worker",
 				taskId: "task-1",
 				rpc: makeRpc({
 					abortAndPrompt: async () => {
@@ -232,7 +231,7 @@ describe("SteeringManager", () => {
 		const { manager, registry, finishCalls } = createManager();
 		registry.register(
 			makeAgent("issuer-1", {
-				role: "issuer",
+				agentType: "issuer",
 				taskId: "task-1",
 			}),
 		);
@@ -241,60 +240,6 @@ describe("SteeringManager", () => {
 		expect(finishCalls).toContainEqual({ id: "issuer-1", status: "stopped" });
 		expect(manager.hasPendingInterruptKickoff("task-1")).toBe(true);
 		expect(manager.takePendingInterruptKickoff("task-1")).toBe("[URGENT MESSAGE]\n\nstop and reset");
-	});
-
-	test("broadcastToWorkers routes steering decisions to workers", async () => {
-		const workerSteers: string[] = [];
-		const worker = makeAgent("worker-1", {
-			role: "worker",
-			taskId: "task-1",
-			rpc: makeRpc({ steer: async (msg: string) => workerSteers.push(msg) }),
-		});
-		const steeringRpc = makeRpc({
-			waitForAgentEnd: async () => {},
-			getLastAssistantText: async () =>
-				JSON.stringify({
-					decisions: [{ taskId: "task-1", action: "steer", message: "keep focus", reason: "drift" }],
-				}),
-		});
-		const { manager, registry, attachCalls, finishCalls, finishedLogs } = createManager({
-			spawner: {
-				spawnBroadcastSteering: async () =>
-					makeAgent("steering-broadcast", { role: "steering", taskId: null, rpc: steeringRpc }),
-				spawnFinisher: async (taskId: string, workerOutput: string) =>
-					makeAgent(`finisher:${taskId}`, {
-						role: "finisher",
-						taskId,
-						events: [{ type: "log", ts: Date.now(), message: workerOutput }],
-					}),
-				spawnSteering: async (taskId: string) => makeAgent(`steering:${taskId}`, { role: "steering", taskId }),
-			},
-		});
-		registry.register(worker);
-
-		await manager.broadcastToWorkers("global guidance", { urgency: "critical" });
-		expect(workerSteers).toEqual(["keep focus"]);
-		expect(attachCalls).toContain("steering-broadcast");
-		expect(finishCalls).toContainEqual({ id: "steering-broadcast", status: "done" });
-		expect(finishedLogs.find(entry => entry.id === "steering-broadcast")).toBeDefined();
-	});
-
-	test("broadcastToWorkers ignores empty messages", async () => {
-		let spawned = 0;
-		const { manager, registry } = createManager({
-			spawner: {
-				spawnBroadcastSteering: async () => {
-					spawned += 1;
-					return makeAgent("steering-broadcast", { role: "steering", taskId: null, rpc: makeRpc() });
-				},
-				spawnSteering: async (taskId: string) => makeAgent(`steering:${taskId}`, { role: "steering", taskId }),
-				spawnFinisher: async (taskId: string) => makeAgent(`finisher:${taskId}`, { role: "finisher", taskId }),
-			},
-		});
-		registry.register(makeAgent("worker-1", { role: "worker", rpc: makeRpc() }));
-
-		await manager.broadcastToWorkers("   ");
-		expect(spawned).toBe(0);
 	});
 
 	test("spawnFinisherAfterStoppingSteering marks takeover during in-flight spawn", async () => {
@@ -306,12 +251,11 @@ describe("SteeringManager", () => {
 			spawner: {
 				spawnFinisher: async (taskId: string, workerOutput: string) =>
 					makeAgent(`finisher:${taskId}`, {
-						role: "finisher",
+						agentType: "finisher",
 						taskId,
 						events: [{ type: "log", ts: Date.now(), message: workerOutput }],
 					}),
-				spawnSteering: async (taskId: string) => makeAgent(`steering:${taskId}`, { role: "steering", taskId }),
-				spawnBroadcastSteering: async () => makeAgent("steering-broadcast", { role: "steering", taskId: null }),
+				spawnSteering: async (taskId: string) => makeAgent(`steering:${taskId}`, { agentType: "steering", taskId }),
 			},
 		});
 		(manager as unknown as { stopSteeringForFinisher: (taskId: string) => Promise<void> }).stopSteeringForFinisher =
@@ -323,13 +267,13 @@ describe("SteeringManager", () => {
 		expect(manager.hasFinisherTakeover("task-77")).toBe(true);
 		release();
 		const finisher = await pending;
-		expect(finisher.role).toBe("finisher");
+		expect(finisher.agentType).toBe("finisher");
 		expect(manager.hasFinisherTakeover("task-77")).toBe(false);
 	});
 
 	test("maybeSteerWorkers avoids duplicate in-flight steering per worker", async () => {
 		const { manager, registry } = createManager();
-		registry.register(makeAgent("worker-1", { role: "worker", taskId: "task-1", spawnedAt: 0 }));
+		registry.register(makeAgent("worker-1", { agentType: "worker", taskId: "task-1", spawnedAt: 0 }));
 
 		const calls: string[] = [];
 		let release: () => void = () => {};
@@ -357,10 +301,9 @@ describe("SteeringManager", () => {
 		const { manager: managerSteer } = createManager({
 			spawner: {
 				spawnIssuer: async (taskId: string) =>
-					makeAgent(`issuer:${taskId}`, { role: "issuer", taskId, rpc: steeringRpcSteer }),
-				spawnSteering: async (taskId: string) => makeAgent(`steering:${taskId}`, { role: "steering", taskId }),
-				spawnFinisher: async (taskId: string) => makeAgent(`finisher:${taskId}`, { role: "finisher", taskId }),
-				spawnBroadcastSteering: async () => makeAgent("steering-broadcast", { role: "steering", taskId: null }),
+					makeAgent(`issuer:${taskId}`, { agentType: "issuer", taskId, rpc: steeringRpcSteer }),
+				spawnSteering: async (taskId: string) => makeAgent(`steering:${taskId}`, { agentType: "steering", taskId }),
+				spawnFinisher: async (taskId: string) => makeAgent(`finisher:${taskId}`, { agentType: "finisher", taskId }),
 			},
 		});
 
@@ -374,10 +317,10 @@ describe("SteeringManager", () => {
 		const { manager: managerInterrupt } = createManager({
 			spawner: {
 				spawnIssuer: async (taskId: string) =>
-					makeAgent(`issuer:${taskId}`, { role: "issuer", taskId, rpc: steeringRpcInterrupt }),
-				spawnSteering: async (taskId: string) => makeAgent(`steering2:${taskId}`, { role: "steering", taskId }),
-				spawnFinisher: async (taskId: string) => makeAgent(`finisher:${taskId}`, { role: "finisher", taskId }),
-				spawnBroadcastSteering: async () => makeAgent("steering-broadcast", { role: "steering", taskId: null }),
+					makeAgent(`issuer:${taskId}`, { agentType: "issuer", taskId, rpc: steeringRpcInterrupt }),
+				spawnSteering: async (taskId: string) =>
+					makeAgent(`steering2:${taskId}`, { agentType: "steering", taskId }),
+				spawnFinisher: async (taskId: string) => makeAgent(`finisher:${taskId}`, { agentType: "finisher", taskId }),
 			},
 		});
 

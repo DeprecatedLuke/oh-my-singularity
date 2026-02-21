@@ -13,7 +13,7 @@ type JsonRecord = Record<string, unknown>;
 export type CrashLogAgentSnapshot = Pick<
 	AgentInfo,
 	| "id"
-	| "role"
+	| "agentType"
 	| "taskId"
 	| "tasksAgentId"
 	| "status"
@@ -206,10 +206,10 @@ export class SessionLogWriter {
 	private buildCrashContextToken(input: CrashLogInput): string {
 		const agent = input.agent;
 		if (agent) {
-			const role = sanitizeToken(agent.role, "agent", 24);
+			const agentType = sanitizeToken(agent.agentType, "agent", 24);
 			const idSource = agent.tasksAgentId?.trim() || agent.id?.trim() || "unknown";
 			const idToken = sanitizeToken(idSource, "unknown", 48);
-			return `${role}-${idToken}`;
+			return `${agentType}-${idToken}`;
 		}
 		return sanitizeToken(input.context, "oms", 72);
 	}

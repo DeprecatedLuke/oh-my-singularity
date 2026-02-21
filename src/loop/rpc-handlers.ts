@@ -1,26 +1,13 @@
 import type { AgentRegistry } from "../agents/registry";
 import { OmsRpcClient } from "../agents/rpc-wrapper";
 import { type AgentInfo, createEmptyAgentUsage } from "../agents/types";
+import { LIMIT_AGENT_MAX_RETRIES } from "../config/constants";
 import type { TaskStoreClient } from "../tasks/client";
 import { asRecord, logger } from "../utils";
+import type { LifecycleRecord } from "./pipeline";
 import * as UsageTracking from "./usage";
 
 type LogLevel = "debug" | "info" | "warn" | "error";
-type FinisherLifecycleAdvanceRecord = {
-	taskId: string;
-	action: "worker" | "issuer" | "defer";
-	message: string | null;
-	reason: string | null;
-	agentId: string | null;
-	ts: number;
-};
-
-type FinisherCloseRecord = {
-	taskId: string;
-	reason: string | null;
-	agentId: string | null;
-	ts: number;
-};
 
 function isTerminalStatus(status: string | undefined): boolean {
 	return status === "done" || status === "aborted" || status === "stopped" || status === "dead";
@@ -68,12 +55,8 @@ export class RpcHandlerManager {
 	private rpcDirtyDebounceTimer: Timer | null = null;
 
 	private readonly wake: () => void;
-	private readonly revokeComplaint: (opts: {
-		complainantAgentId?: string;
-		complainantTaskId?: string;
-		files?: string[];
-		cause?: string;
-	}) => Promise<Record<string, unknown>>;
+	private readonly addLifecycleTransitionInFlight: (taskId: string) => void;
+	private readonly removeLifecycleTransitionInFlight: (taskId: string) => void;
 	private readonly spawnFinisherAfterStoppingSteering: (
 		taskId: string,
 		workerOutput: string,
@@ -83,15 +66,31 @@ export class RpcHandlerManager {
 	private readonly logAgentStart: (startedBy: string, agent: AgentInfo, context?: string) => void;
 	private readonly logAgentFinished: (agent: AgentInfo, explicitText?: string) => Promise<void>;
 	private readonly writeAgentCrashLog: (agent: AgentInfo, reason: string, event?: unknown) => void;
-	private readonly takeFinisherLifecycleAdvance: (taskId: string) => FinisherLifecycleAdvanceRecord | null;
-	private readonly takeFinisherCloseRecord: (taskId: string) => FinisherCloseRecord | null;
+	private readonly takeLifecycleRecord: (taskId: string) => LifecycleRecord | null;
+	private readonly hasLifecycleRecord: (taskId: string) => boolean;
 	private readonly spawnWorkerFromFinisherAdvance: (
 		taskId: string,
 		kickoffMessage?: string | null,
 	) => Promise<AgentInfo>;
 	private readonly kickoffIssuerFromFinisherAdvance: (taskId: string, kickoffMessage?: string | null) => Promise<void>;
+	private readonly spawnWorkerForRetry: (agent: AgentInfo, recoveryContext: string) => Promise<AgentInfo>;
 
 	private readonly rpcHandlersAttached = new Set<string>();
+	private readonly retryAttemptsByTypeAndTask = new Map<string, number>();
+
+	private retryKey(agentType: string, taskId: string): string {
+		return `${agentType}:${taskId}`;
+	}
+	private incrementRetryAttempts(agentType: string, taskId: string): number {
+		const key = this.retryKey(agentType, taskId);
+		const count = (this.retryAttemptsByTypeAndTask.get(key) ?? 0) + 1;
+		this.retryAttemptsByTypeAndTask.set(key, count);
+		return count;
+	}
+
+	private clearRetryAttempts(agentType: string, taskId: string): void {
+		this.retryAttemptsByTypeAndTask.delete(this.retryKey(agentType, taskId));
+	}
 
 	constructor(opts: {
 		registry: AgentRegistry;
@@ -101,12 +100,8 @@ export class RpcHandlerManager {
 		isRunning: () => boolean;
 		isPaused: () => boolean;
 		wake: () => void;
-		revokeComplaint: (opts: {
-			complainantAgentId?: string;
-			complainantTaskId?: string;
-			files?: string[];
-			cause?: string;
-		}) => Promise<Record<string, unknown>>;
+		addLifecycleTransitionInFlight: (taskId: string) => void;
+		removeLifecycleTransitionInFlight: (taskId: string) => void;
 		spawnFinisherAfterStoppingSteering: (
 			taskId: string,
 			workerOutput: string,
@@ -116,10 +111,11 @@ export class RpcHandlerManager {
 		logAgentStart: (startedBy: string, agent: AgentInfo, context?: string) => void;
 		logAgentFinished: (agent: AgentInfo, explicitText?: string) => Promise<void>;
 		writeAgentCrashLog: (agent: AgentInfo, reason: string, event?: unknown) => void;
-		takeFinisherLifecycleAdvance: (taskId: string) => FinisherLifecycleAdvanceRecord | null;
-		takeFinisherCloseRecord: (taskId: string) => FinisherCloseRecord | null;
+		takeLifecycleRecord: (taskId: string) => LifecycleRecord | null;
+		hasLifecycleRecord: (taskId: string) => boolean;
 		spawnWorkerFromFinisherAdvance: (taskId: string, kickoffMessage?: string | null) => Promise<AgentInfo>;
 		kickoffIssuerFromFinisherAdvance: (taskId: string, kickoffMessage?: string | null) => Promise<void>;
+		spawnWorkerForRetry: (agent: AgentInfo, recoveryContext: string) => Promise<AgentInfo>;
 	}) {
 		this.registry = opts.registry;
 		this.tasksClient = opts.tasksClient;
@@ -128,16 +124,18 @@ export class RpcHandlerManager {
 		this.isRunning = opts.isRunning;
 		this.isPaused = opts.isPaused;
 		this.wake = opts.wake;
-		this.revokeComplaint = opts.revokeComplaint;
+		this.addLifecycleTransitionInFlight = opts.addLifecycleTransitionInFlight;
+		this.removeLifecycleTransitionInFlight = opts.removeLifecycleTransitionInFlight;
 		this.spawnFinisherAfterStoppingSteering = opts.spawnFinisherAfterStoppingSteering;
 		this.getLastAssistantText = opts.getLastAssistantText;
 		this.logAgentStart = opts.logAgentStart;
 		this.logAgentFinished = opts.logAgentFinished;
 		this.writeAgentCrashLog = opts.writeAgentCrashLog;
-		this.takeFinisherLifecycleAdvance = opts.takeFinisherLifecycleAdvance;
-		this.takeFinisherCloseRecord = opts.takeFinisherCloseRecord;
+		this.takeLifecycleRecord = opts.takeLifecycleRecord;
+		this.hasLifecycleRecord = opts.hasLifecycleRecord;
 		this.spawnWorkerFromFinisherAdvance = opts.spawnWorkerFromFinisherAdvance;
 		this.kickoffIssuerFromFinisherAdvance = opts.kickoffIssuerFromFinisherAdvance;
+		this.spawnWorkerForRetry = opts.spawnWorkerForRetry;
 	}
 	private debounceRpcDirty(): void {
 		if (!this.onDirty) return;
@@ -274,111 +272,231 @@ export class RpcHandlerManager {
 			return;
 		}
 
-		if (agent.role === "worker" || agent.role === "designer-worker") {
-			if (!agent.taskId) return;
-
-			const workerOutput = await this.getLastAssistantText(agent);
-			await this.logAgentFinished(agent, workerOutput);
+		if (agent.agentType === "worker" || agent.agentType === "designer") {
+			const taskId = typeof agent.taskId === "string" ? agent.taskId.trim() : "";
+			if (!taskId) return;
+			// Hold lifecycle transition flag for the entire onAgentEnd processing.
+			// Without this, a periodic tick can see the task as in_progress with no
+			// active agent (after finishAgent but before finisher spawn) and start
+			// a resume pipeline (issuer) instead of advancing to finisher.
+			this.addLifecycleTransitionInFlight(taskId);
 			try {
-				const finisher = await this.spawnFinisherAfterStoppingSteering(agent.taskId, workerOutput);
-				this.attachRpcHandlers(finisher);
-				this.logAgentStart(agent.id, finisher, workerOutput);
-			} catch {
-				// Finisher spawn is best-effort.
-			}
+				const workerOutput = await this.getLastAssistantText(agent);
+				const workerSessionId =
+					typeof current?.sessionId === "string" && current.sessionId.trim()
+						? current.sessionId.trim()
+						: typeof agent.sessionId === "string" && agent.sessionId.trim()
+							? agent.sessionId.trim()
+							: undefined;
+				await this.logAgentFinished(agent, workerOutput);
+				await this.finishAgent(agent, "done");
+				const advance = this.takeLifecycleRecord(taskId);
+				if (advance) {
+					this.clearRetryAttempts("worker", taskId);
+					try {
+						const finisher = await this.spawnFinisherAfterStoppingSteering(taskId, workerOutput);
+						this.attachRpcHandlers(finisher);
+						this.logAgentStart(agent.id, finisher, workerOutput);
+						this.loopLog(`Worker lifecycle advanced ${taskId} to finisher`, "info", {
+							taskId,
+							action: advance.action,
+							reason: advance.reason,
+						});
+					} catch (err) {
+						const msg = err instanceof Error ? err.message : String(err);
+						this.loopLog(`Finisher spawn failed after worker advance for ${taskId}: ${msg}`, "warn", {
+							taskId,
+							error: msg,
+						});
+						// Block the task so the resume pipeline doesn't start an issuer loop.
+						try {
+							await this.tasksClient.updateStatus(taskId, "blocked");
+							await this.tasksClient.comment(
+								taskId,
+								`Blocked: finisher spawn failed after worker advance. ${msg}`,
+							);
+						} catch {
+							// best-effort
+						}
+					}
+					this.wake();
+					return;
+				}
+				const failedAttempts = this.incrementRetryAttempts("worker", taskId);
+				this.loopLog(
+					`Worker/designer exited without lifecycle signal for ${taskId}; attempt ${failedAttempts}/${LIMIT_AGENT_MAX_RETRIES}`,
+					"warn",
+					{
+						taskId,
+						attempt: failedAttempts,
+						maxRetries: LIMIT_AGENT_MAX_RETRIES,
+					},
+				);
+				if (failedAttempts >= LIMIT_AGENT_MAX_RETRIES) {
+					this.loopLog(`Worker/designer retries exhausted for ${taskId}; blocking task`, "warn", {
+						taskId,
+						attempt: failedAttempts,
+						maxRetries: LIMIT_AGENT_MAX_RETRIES,
+					});
+					await this.blockTaskFromWorkerRetry(
+						taskId,
+						`Worker/designer retries exhausted after ${LIMIT_AGENT_MAX_RETRIES} attempts without advance_lifecycle signal`,
+						`Worker/designer exited without advance_lifecycle ${failedAttempts} consecutive times.`,
+					);
+					this.clearRetryAttempts("worker", taskId);
+					this.wake();
+					return;
+				}
 
-			await this.finishAgent(agent, "done");
-			this.wake();
+				try {
+					const recoveryContext = this.buildWorkerRecoveryContext(workerOutput, workerSessionId);
+					const retried = await this.spawnWorkerForRetry(agent, recoveryContext);
+					this.attachRpcHandlers(retried);
+					this.logAgentStart(agent.id, retried, "worker retry: exited without advance_lifecycle");
+					this.loopLog(`Worker/designer exited without lifecycle signal for ${taskId}; respawned worker`, "warn", {
+						taskId,
+						attempt: failedAttempts,
+						maxRetries: LIMIT_AGENT_MAX_RETRIES,
+					});
+				} catch (err) {
+					this.loopLog(
+						`Worker/designer retry spawn failed for ${taskId}: ${err instanceof Error ? err.message : String(err)}`,
+						"warn",
+						{ taskId, attempt: failedAttempts, maxRetries: LIMIT_AGENT_MAX_RETRIES },
+					);
+				}
+				this.wake();
+			} finally {
+				this.removeLifecycleTransitionInFlight(taskId);
+			}
 			return;
 		}
 
-		if (agent.role === "finisher") {
+		if (agent.agentType === "finisher") {
 			const taskId = typeof agent.taskId === "string" ? agent.taskId.trim() : "";
-			const finisherOutput = await this.getLastAssistantText(agent);
-			const finisherSessionId =
-				typeof current?.sessionId === "string" && current.sessionId.trim()
-					? current.sessionId.trim()
-					: typeof agent.sessionId === "string" && agent.sessionId.trim()
-						? agent.sessionId.trim()
-						: undefined;
-			await this.logAgentFinished(agent, finisherOutput);
-			await this.finishAgent(agent, "done");
-			if (!taskId) {
-				this.wake();
-				return;
-			}
-			const advance = this.takeFinisherLifecycleAdvance(taskId);
-			const closeRecord = this.takeFinisherCloseRecord(taskId);
-			const closeTs = closeRecord?.ts ?? -1;
-			const advanceTs = advance?.ts ?? -1;
-			if (closeRecord && closeTs >= advanceTs) {
-				this.loopLog(`Finisher exit for ${taskId}: close marker consumed`, "info", {
-					taskId,
-					agentId: closeRecord.agentId,
-				});
-				this.wake();
-				return;
-			}
-			if (advance) {
-				if (advance.action === "worker") {
-					try {
-						const worker = await this.spawnWorkerFromFinisherAdvance(taskId, advance.message);
-						this.logAgentStart(agent.id, worker, advance.message ?? undefined);
-						this.loopLog(`Finisher lifecycle advanced ${taskId} to worker`, "info", {
-							taskId,
-							reason: advance.reason,
-						});
-					} catch (err) {
-						this.loopLog(
-							`Finisher lifecycle worker spawn failed for ${taskId}: ${err instanceof Error ? err.message : String(err)}`,
-							"warn",
-							{ taskId },
-						);
-					}
-					this.wake();
-					return;
-				}
-				if (advance.action === "issuer") {
-					try {
-						await this.kickoffIssuerFromFinisherAdvance(taskId, advance.message);
-						this.loopLog(`Finisher lifecycle advanced ${taskId} to issuer`, "info", {
-							taskId,
-							reason: advance.reason,
-						});
-					} catch (err) {
-						this.loopLog(
-							`Finisher lifecycle issuer kickoff failed for ${taskId}: ${err instanceof Error ? err.message : String(err)}`,
-							"warn",
-							{ taskId },
-						);
-					}
-					this.wake();
-					return;
-				}
-				const deferReason = advance.reason || "Deferred by finisher";
-				await this.blockTaskFromFinisherAdvance(taskId, deferReason, advance.message);
-				this.wake();
-				return;
-			}
-
+			if (taskId) this.addLifecycleTransitionInFlight(taskId);
 			try {
-				const recoveryContext = finisherSessionId
-					? await this.buildFinisherResumeKickoffContext(taskId, finisherOutput, finisherSessionId)
-					: this.buildFinisherRecoveryContext(finisherOutput);
-				const finisher = await this.spawnFinisherAfterStoppingSteering(taskId, recoveryContext, finisherSessionId);
-				this.attachRpcHandlers(finisher);
-				this.logAgentStart(agent.id, finisher, "finisher retry: exited without close_task or advance_lifecycle");
-				this.loopLog(`Finisher exited without lifecycle signal for ${taskId}; respawned finisher`, "warn", {
-					taskId,
-				});
-			} catch (err) {
+				const finisherOutput = await this.getLastAssistantText(agent);
+				const finisherSessionId =
+					typeof current?.sessionId === "string" && current.sessionId.trim()
+						? current.sessionId.trim()
+						: typeof agent.sessionId === "string" && agent.sessionId.trim()
+							? agent.sessionId.trim()
+							: undefined;
+				await this.logAgentFinished(agent, finisherOutput);
+				await this.finishAgent(agent, "done");
+				if (!taskId) {
+					this.wake();
+					return;
+				}
+				const record = this.takeLifecycleRecord(taskId);
+				if (record && record.action === "close") {
+					this.clearRetryAttempts("finisher", taskId);
+					this.loopLog(`Finisher exit for ${taskId}: close marker consumed`, "info", {
+						taskId,
+						agentId: record.agentId,
+					});
+					this.wake();
+					return;
+				}
+				if (record && record.action === "advance") {
+					this.clearRetryAttempts("finisher", taskId);
+					if (record.target === "worker") {
+						try {
+							const worker = await this.spawnWorkerFromFinisherAdvance(taskId, record.message);
+							this.logAgentStart(agent.id, worker, record.message ?? undefined);
+							this.loopLog(`Finisher lifecycle advanced ${taskId} to worker`, "info", {
+								taskId,
+								reason: record.reason,
+							});
+						} catch (err) {
+							this.loopLog(
+								`Finisher lifecycle worker spawn failed for ${taskId}: ${err instanceof Error ? err.message : String(err)}`,
+								"warn",
+								{ taskId },
+							);
+						}
+						this.wake();
+						return;
+					}
+					if (record.target === "issuer") {
+						try {
+							await this.kickoffIssuerFromFinisherAdvance(taskId, record.message);
+							this.loopLog(`Finisher lifecycle advanced ${taskId} to issuer`, "info", {
+								taskId,
+								reason: record.reason,
+							});
+						} catch (err) {
+							this.loopLog(
+								`Finisher lifecycle issuer kickoff failed for ${taskId}: ${err instanceof Error ? err.message : String(err)}`,
+								"warn",
+								{ taskId },
+							);
+						}
+						this.wake();
+						return;
+					}
+				}
+				if (record && record.action === "block") {
+					this.clearRetryAttempts("finisher", taskId);
+					const blockReason = record.reason || "Blocked by finisher";
+					await this.blockTaskFromFinisherAdvance(taskId, blockReason, record.message);
+					this.wake();
+					return;
+				}
+				const failedAttempts = this.incrementRetryAttempts("finisher", taskId);
 				this.loopLog(
-					`Finisher sticky respawn failed for ${taskId}: ${err instanceof Error ? err.message : String(err)}`,
+					`Finisher exited without lifecycle signal for ${taskId}; attempt ${failedAttempts}/${LIMIT_AGENT_MAX_RETRIES}`,
 					"warn",
-					{ taskId },
+					{
+						taskId,
+						attempt: failedAttempts,
+						maxRetries: LIMIT_AGENT_MAX_RETRIES,
+					},
 				);
+				if (failedAttempts >= LIMIT_AGENT_MAX_RETRIES) {
+					this.loopLog(`Finisher retries exhausted for ${taskId}; blocking task`, "warn", {
+						taskId,
+						attempt: failedAttempts,
+						maxRetries: LIMIT_AGENT_MAX_RETRIES,
+					});
+					await this.blockTaskFromFinisherAdvance(
+						taskId,
+						`Finisher retries exhausted after ${LIMIT_AGENT_MAX_RETRIES} attempts without lifecycle signal`,
+						`Finisher exited without advance_lifecycle ${failedAttempts} consecutive times.`,
+					);
+					this.clearRetryAttempts("finisher", taskId);
+					this.wake();
+					return;
+				}
+
+				try {
+					const recoveryContext = finisherSessionId
+						? await this.buildFinisherResumeKickoffContext(taskId, finisherOutput, finisherSessionId)
+						: this.buildFinisherRecoveryContext(finisherOutput);
+					const finisher = await this.spawnFinisherAfterStoppingSteering(
+						taskId,
+						recoveryContext,
+						finisherSessionId,
+					);
+					this.attachRpcHandlers(finisher);
+					this.logAgentStart(agent.id, finisher, "finisher retry: exited without advance_lifecycle");
+					this.loopLog(`Finisher exited without lifecycle signal for ${taskId}; respawned finisher`, "warn", {
+						taskId,
+						attempt: failedAttempts,
+						maxRetries: LIMIT_AGENT_MAX_RETRIES,
+					});
+				} catch (err) {
+					this.loopLog(
+						`Finisher sticky respawn failed for ${taskId}: ${err instanceof Error ? err.message : String(err)}`,
+						"warn",
+						{ taskId, attempt: failedAttempts, maxRetries: LIMIT_AGENT_MAX_RETRIES },
+					);
+				}
+				this.wake();
+			} finally {
+				if (taskId) this.removeLifecycleTransitionInFlight(taskId);
 			}
-			this.wake();
 			return;
 		}
 	}
@@ -427,11 +545,11 @@ export class RpcHandlerManager {
 
 		const lines = [
 			"[SYSTEM RESUME]",
-			"Your previous finisher process exited without calling close_task or advance_lifecycle.",
+			"Your previous finisher process exited without calling advance_lifecycle.",
 			"Continue from the previous session history for this task.",
 			`Session: ${finisherSessionId}`,
-			"If complete, call close_task.",
-			"If more work is needed, call advance_lifecycle with action worker, issuer, or defer.",
+			'If complete, call advance_lifecycle with action="close".',
+			'If more work is needed, call advance_lifecycle with action="advance" (target="worker" or "issuer") or action="block".',
 			"Then stop.",
 		];
 
@@ -509,15 +627,59 @@ export class RpcHandlerManager {
 	private buildFinisherRecoveryContext(previousOutput: string): string {
 		const lines = [
 			"[SYSTEM RECOVERY]",
-			"Your previous finisher process exited without calling close_task or advance_lifecycle.",
+			"Your previous finisher process exited without calling advance_lifecycle.",
 			"Resume lifecycle handling for this task.",
-			"If complete, call close_task.",
-			"If more work is needed, call advance_lifecycle with action worker, issuer, or defer.",
+			'If complete, call advance_lifecycle with action="close".',
+			'If more work is needed, call advance_lifecycle with action="advance" (target="worker" or "issuer") or action="block".',
 			"Then stop.",
 		];
 		const trimmedOutput = previousOutput.trim();
 		if (trimmedOutput) {
 			lines.push("", "Previous finisher output:", trimmedOutput);
+		}
+		return lines.join("\n");
+	}
+
+	private async blockTaskFromWorkerRetry(taskId: string, reason: string, message: string | null): Promise<void> {
+		try {
+			await this.tasksClient.updateStatus(taskId, "blocked");
+		} catch (err) {
+			this.loopLog(
+				`Failed to set blocked status for ${taskId}: ${err instanceof Error ? err.message : String(err)}`,
+				"warn",
+				{ taskId },
+			);
+		}
+
+		try {
+			await this.tasksClient.comment(
+				taskId,
+				`Blocked by worker advance_lifecycle. ${reason}${message ? `\nmessage: ${message}` : ""}`,
+			);
+		} catch (err) {
+			logger.debug("loop/rpc-handlers.ts: failed to post worker retry exhaustion comment (non-fatal)", { err });
+		}
+
+		this.loopLog(`Worker/designer retry exhausted ${taskId}: ${reason}`, "warn", {
+			taskId,
+			reason,
+		});
+	}
+
+	private buildWorkerRecoveryContext(previousOutput: string, sessionId?: string): string {
+		const lines = [
+			"[SYSTEM RECOVERY]",
+			"Your previous worker process exited without calling advance_lifecycle.",
+			"Resume your work for this task.",
+			'When implementation is complete, call advance_lifecycle with action="advance", target="finisher".',
+			"Then stop.",
+		];
+		if (sessionId) {
+			lines.push(`Session: ${sessionId}`);
+		}
+		const trimmedOutput = previousOutput.trim();
+		if (trimmedOutput) {
+			lines.push("", "Previous worker output:", trimmedOutput);
 		}
 		return lines.join("\n");
 	}
@@ -532,6 +694,27 @@ export class RpcHandlerManager {
 			return;
 		}
 
+		// Safety net: if the process crashed after the agent called advance_lifecycle
+		// but before agent_end could fire, the lifecycle record would be orphaned.
+		// Delegate to onAgentEnd so the record is consumed and the next agent spawns.
+		const taskId = typeof agent.taskId === "string" ? agent.taskId.trim() : "";
+		if (
+			taskId &&
+			(agent.agentType === "worker" || agent.agentType === "designer" || agent.agentType === "finisher") &&
+			this.hasLifecycleRecord(taskId)
+		) {
+			this.loopLog(
+				`rpc_exit for ${agent.agentType} ${agent.id} with pending lifecycle record; delegating to onAgentEnd`,
+				"debug",
+				{
+					taskId,
+					agentId: agent.id,
+					exitCode,
+				},
+			);
+			void this.onAgentEnd(agent);
+			return;
+		}
 		const nextStatus = exitCode === 0 && !rpcExitError ? "done" : "dead";
 		await this.finishAgent(
 			agent,
@@ -562,15 +745,6 @@ export class RpcHandlerManager {
 
 		if (status === "dead") {
 			this.writeAgentCrashLog(agent, opts?.crashReason ?? "agent marked dead", opts?.crashEvent);
-		}
-
-		try {
-			await this.revokeComplaint({
-				complainantAgentId: agent.id,
-				cause: `auto-revoke on agent exit (${status})`,
-			});
-		} catch (err) {
-			logger.debug("loop/rpc-handlers.ts: best-effort failure after });", { err });
 		}
 
 		if (agent.tasksAgentId?.trim()) {

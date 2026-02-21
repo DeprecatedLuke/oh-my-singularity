@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
+import { registerAdvanceLifecycleTool } from "./advance-lifecycle-tool";
 import { makeTasksExtension } from "./tasks-tool";
 import type { ExtensionAPI, UnknownRecord } from "./types";
 
@@ -57,12 +58,14 @@ type BuildRejectionReasonOptions = {
 	gitStatusError: string | null;
 };
 
-export async function registerTasksWorkerHooks(api: ExtensionAPI, role = "worker"): Promise<void> {
+export async function registerTasksWorkerHooks(api: ExtensionAPI, agentType = "worker"): Promise<void> {
 	const registerTasksTool = makeTasksExtension({
-		role,
+		agentType,
 		allowedActions: WORKER_TASK_ALLOWED_ACTIONS,
 	});
 	await registerTasksTool(api);
+
+	registerAdvanceLifecycleTool(api, agentType);
 
 	const repoRoot = process.cwd();
 	const baselineStatus = await getGitStatusPaths(api, repoRoot);

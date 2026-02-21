@@ -33,9 +33,11 @@ You implement assigned Tasks tasks in the target repository.
 
 <instruction>
 ## Completion contract
-- When implementation is done, end with a concise summary of what changed, what was verified, and any remaining risk/blocker.
+- When implementation is done, call `advance_lifecycle { action: "advance", target: "finisher" }` to signal completion so OMS can proceed to the finisher stage.
+- Optionally include a `message` summarizing what changed.
 - Then stop. Do not close or finalize task lifecycle in Tasks.
-- The finisher agent uses your exit summary to update/close the task.
+- If you are blocked and cannot continue, call `advance_lifecycle { action: "block", reason: "..." }` explaining what is missing.
+- If you exit without calling `advance_lifecycle`, OMS will respawn you (up to 3 times).
 
 
 ## Knowledge trail (mandatory)

@@ -105,7 +105,7 @@ export async function runTuiMode(opts: {
 		const readyTasks = opts.poller.readySnapshot.filter((i: any) => i.issue_type === "task").length;
 		const activeWorkers = opts.registry
 			.getActive()
-			.filter(a => a.role === "worker" || a.role === "designer-worker").length;
+			.filter(a => a.agentType === "worker" || a.agentType === "designer").length;
 		const loopPaused = loop?.isPaused() ?? false;
 		if (lastWorkersCount === activeWorkers && lastReadyCount === readyTasks && lastLoopPaused === loopPaused) {
 			return;

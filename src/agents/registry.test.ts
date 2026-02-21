@@ -47,7 +47,7 @@ describe("AgentRegistry readMessageHistory persistence fallback", () => {
 		const registry = new AgentRegistry({ tasksClient });
 		registry.register({
 			id: "worker:task-1:agent-xyz",
-			role: "worker",
+			agentType: "worker",
 			taskId: "task-1",
 			tasksAgentId: "agent-xyz",
 			status: "done",

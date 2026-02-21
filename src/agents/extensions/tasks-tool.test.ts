@@ -70,7 +70,7 @@ async function startMockIpcServer(onRequest: (payload: unknown) => unknown | Pro
 	};
 }
 
-async function registerTasksTool(opts: { role: string; allowedActions: string[] }): Promise<RegisteredTool> {
+async function registerTasksTool(opts: { agentType: string; allowedActions: string[] }): Promise<RegisteredTool> {
 	let registeredTool: RegisteredTool | null = null;
 	const extension = makeTasksExtension(opts);
 	await extension({
@@ -112,7 +112,7 @@ describe("tasks tool extension", () => {
 
 		try {
 			let registeredTool: RegisteredTool | null = null;
-			const extension = makeTasksExtension({ role: "worker", allowedActions: ["list"] });
+			const extension = makeTasksExtension({ agentType: "worker", allowedActions: ["list"] });
 			await extension({
 				typebox: { Type: createMockTypebox() },
 				registerTool: (tool: RegisteredTool) => {
@@ -170,7 +170,7 @@ describe("tasks tool extension", () => {
 
 		try {
 			let registeredTool: RegisteredTool | null = null;
-			const extension = makeTasksExtension({ role: "agent", allowedActions: ["update"] });
+			const extension = makeTasksExtension({ agentType: "agent", allowedActions: ["update"] });
 			await extension({
 				typebox: { Type: createMockTypebox() },
 				registerTool: (tool: RegisteredTool) => {
@@ -218,7 +218,7 @@ describe("tasks tool extension", () => {
 	});
 
 	test("renderResult includes scope in create card output", async () => {
-		const tool = await registerTasksTool({ role: "worker", allowedActions: ["create"] });
+		const tool = await registerTasksTool({ agentType: "worker", allowedActions: ["create"] });
 		if (!tool.renderResult) throw new Error("tasks tool renderResult was not registered");
 
 		const lines = tool
@@ -246,7 +246,7 @@ describe("tasks tool extension", () => {
 	});
 
 	test("renderResult includes scope in list rows", async () => {
-		const tool = await registerTasksTool({ role: "worker", allowedActions: ["list"] });
+		const tool = await registerTasksTool({ agentType: "worker", allowedActions: ["list"] });
 		if (!tool.renderResult) throw new Error("tasks tool renderResult was not registered");
 
 		const lines = tool

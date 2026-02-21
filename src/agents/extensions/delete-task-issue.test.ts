@@ -114,7 +114,7 @@ describe("delete_task_issue extension", () => {
 		}
 	});
 
-	test("returns success message when show and delete succeed", async () => {
+	test("returns success message when show, close, and delete succeed", async () => {
 		const observedPayloads: UnknownRecord[] = [];
 		const server = await startMockIpcServer(payload => {
 			observedPayloads.push(payload);
@@ -130,14 +130,14 @@ describe("delete_task_issue extension", () => {
 					},
 				};
 			}
+			if (payload.action === "close") {
+				return { ok: true, data: { id: "task-existing", status: "closed" } };
+			}
 			if (payload.action === "stop_agents_for_task") {
 				return { ok: true, data: { stopped: true } };
 			}
 			if (payload.action === "delete") {
 				return { ok: true, data: { id: "task-existing" } };
-			}
-			if (payload.action === "close") {
-				return { ok: false, error: "close should not be called when delete succeeds" };
 			}
 			return { ok: false, error: `unexpected action ${String(payload.action)}` };
 		});
@@ -176,6 +176,7 @@ describe("delete_task_issue extension", () => {
 			});
 			expect(observedPayloads.map(item => item.action ?? item.type)).toEqual([
 				"show",
+				"close",
 				"stop_agents_for_task",
 				"delete",
 			]);

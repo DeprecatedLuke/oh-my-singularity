@@ -20,8 +20,8 @@ const TASKS_BACKING_STORE_RE =
 // Read-only commands (log, diff, status, show, blame, branch) are allowed.
 const GIT_WRITE_RE = /\bgit\s+(?:\S+\s+)*?(commit|add|push|stash|checkout|reset|rebase|merge|cherry-pick)\b/;
 
-// If OMS_ROLE is set, this is a spawned (non-singularity) agent.
-const isManagedAgent = !!process.env.OMS_ROLE;
+// If OMS_AGENT_TYPE is set, this is a spawned (non-singularity) agent.
+const isManagedAgent = !!process.env.OMS_AGENT_TYPE;
 
 export default async function tasksBashGuardExtension(api: ExtensionAPI): Promise<void> {
 	api.on("tool_call", async event => {

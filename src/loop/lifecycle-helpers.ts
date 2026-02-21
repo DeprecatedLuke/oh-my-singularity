@@ -48,7 +48,7 @@ export class LifecycleHelpers {
 		this.loopLog(message, "info", {
 			startedBy,
 			agentId: agent.id,
-			role: agent.role,
+			agentType: agent.agentType,
 			taskId: agent.taskId,
 			lifecycle: "started",
 		});
@@ -63,7 +63,7 @@ export class LifecycleHelpers {
 
 		this.loopLog(message, "info", {
 			agentId: agent.id,
-			role: agent.role,
+			agentType: agent.agentType,
 			taskId: agent.taskId,
 			lifecycle: "finished",
 		});
@@ -80,10 +80,10 @@ export class LifecycleHelpers {
 		const stderrTail = rpc && rpc instanceof OmsRpcClient ? rpc.getStderr().trim() : "";
 		const crashPath = this.crashLogWriter.writeCrashLog({
 			context: reason,
-			error: eventError || event || new Error(`Agent ${current.id} (${current.role}) marked dead`),
+			error: eventError || event || new Error(`Agent ${current.id} (${current.agentType}) marked dead`),
 			agent: {
 				id: current.id,
-				role: current.role,
+				agentType: current.agentType,
 				taskId: current.taskId,
 				tasksAgentId: current.tasksAgentId,
 				status: current.status,

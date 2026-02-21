@@ -47,7 +47,7 @@ export default async function steeringReplaceAgentExtension(api: ExtensionAPI): 
 
 			const payload = {
 				type: "replace_agent",
-				role: "worker",
+				agent: "worker",
 				taskId,
 				context: context || undefined,
 				ts: Date.now(),

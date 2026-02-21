@@ -1,6 +1,7 @@
 import type { AgentRegistry } from "../../agents/registry";
 import type { AgentInfo } from "../../agents/types";
 import {
+	AGENT_CONFIGS,
 	HOURS_PER_DAY,
 	MS_PER_SECOND,
 	SECONDS_PER_DAY,
@@ -45,7 +46,7 @@ type PersistedAgentUsage = {
 
 type PersistedAgentSnapshot = {
 	id: string;
-	role: string;
+	agentType: string;
 	status: string;
 	spawnedAt: number;
 	lastActivity: number;
@@ -436,7 +437,7 @@ function formatPersistedAgentCostBreakdown(agent: PersistedAgentSnapshot): strin
 	const tk = (n: number) => formatTokens(n).padStart(4);
 	const runtimeMs = Math.max(0, agent.lastActivity - agent.spawnedAt);
 	return (
-		`${agent.role.padEnd(10)} |${centerPad(String(agent.status), 8)}|` +
+		`${agent.agentType.padEnd(10)} |${centerPad(String(agent.status), 8)}|` +
 		` ↓${tk(usage.input)} ↑${tk(usage.output)} R${tk(usage.cacheRead)} W${tk(usage.cacheWrite)} T${tk(total)} ${formatUsd(usage.cost)}` +
 		` T${formatCompactDuration(runtimeMs)}`
 	);
@@ -463,7 +464,7 @@ async function loadPersistedTaskAgents(
 				).trim();
 				return {
 					id: issue.id,
-					role: inferPersistedAgentRole(issue),
+					agentType: inferPersistedAgentType(issue),
 					status: status || "unknown",
 					spawnedAt: spawnedAt || lastActivity,
 					lastActivity,
@@ -487,16 +488,11 @@ function getIssueTaskBinding(issue: TaskIssue): string | null {
 	return hookSlot || null;
 }
 
-function inferPersistedAgentRole(issue: TaskIssue): string {
+function inferPersistedAgentType(issue: TaskIssue): string {
 	const title = typeof issue.title === "string" ? issue.title.trim().toLowerCase() : "";
-	if (title.startsWith("designer-worker-")) return "designer";
-	if (title.startsWith("worker-")) return "worker";
-	if (title.startsWith("issuer-")) return "issuer";
-	if (title.startsWith("finisher-")) return "finisher";
-	if (title.startsWith("steering-") || title.startsWith("resolver-") || title.startsWith("broadcast-steering-")) {
-		return "steering";
+	for (const key of Object.keys(AGENT_CONFIGS)) {
+		if (title.startsWith(`${key}-`)) return key;
 	}
-	if (title.startsWith("singularity-")) return "singularity";
 	return "worker";
 }
 
@@ -523,12 +519,12 @@ function toNonNegativeNumber(value: unknown): number {
 }
 
 function formatAgentCostBreakdown(agent: AgentInfo): string {
-	const roleLabel = agent.role === "designer-worker" ? "designer" : agent.role;
+	const typeLabel = agent.agentType;
 	const usage = agent.usage;
 	const total = usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
 	const tk = (n: number) => formatTokens(n).padStart(4);
 	let line =
-		`${roleLabel.padEnd(10)} |${centerPad(String(agent.status), 8)}|` +
+		`${typeLabel.padEnd(10)} |${centerPad(String(agent.status), 8)}|` +
 		` ↓${tk(usage.input)} ↑${tk(usage.output)} R${tk(usage.cacheRead)} W${tk(usage.cacheWrite)} T${tk(total)} ${formatUsd(usage.cost)}`;
 
 	const ctxWindow = agent.contextWindow ?? 0;

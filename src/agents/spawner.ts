@@ -1,21 +1,18 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { DEFAULT_CONFIG, type OmsConfig } from "../config";
 import {
-	DEFAULT_CONFIG,
-	FINISHER_TOOLS,
-	ISSUER_TOOLS,
-	MERGER_TOOLS,
-	type OmsConfig,
-	STEERING_TOOLS,
-	WORKER_TOOLS,
-} from "../config";
-import { AGENT_EXTENSION_FILENAMES } from "../config/constants";
+	AGENT_EXTENSION_FILENAMES,
+	type AgentBehaviorConfig,
+	getAgentSpawnConfig,
+	type SpawnGuardAgent,
+} from "../config/constants";
 import type { ReplicaManager } from "../replica/manager";
 import type { TaskStoreClient } from "../tasks/client";
 import { logger } from "../utils";
 import type { AgentRegistry } from "./registry";
 import { OmsRpcClient } from "./rpc-wrapper";
-import { type AgentInfo, type AgentRole, createEmptyAgentUsage } from "./types";
+import { type AgentInfo, type AgentType, createEmptyAgentUsage } from "./types";
 
 function getImportMetaDir(): string {
 	const maybe = (import.meta as unknown as { dir?: unknown }).dir;
@@ -160,7 +157,7 @@ async function formatReferencedTaskComments(tasksClient: TaskStoreClient, refere
 }
 
 function buildTaskPrompt(opts: {
-	role: AgentRole;
+	agentType: AgentType;
 	task: {
 		id: string;
 		title: string;
@@ -207,10 +204,6 @@ function isActiveStatus(status: AgentInfo["status"]): boolean {
 	);
 }
 
-type SpawnGuardRole = "worker" | "issuer" | "finisher";
-
-type WorkerKind = "worker" | "designer-worker";
-
 export class AgentSpawner {
 	private readonly tasksClient: TaskStoreClient;
 	private readonly registry: AgentRegistry;
@@ -223,32 +216,6 @@ export class AgentSpawner {
 	private readonly promptsDir: string;
 	private readonly extensionsDir: string;
 
-	private readonly workerPromptPath: string;
-	private readonly fastWorkerPromptPath: string;
-	private readonly designerWorkerPromptPath: string;
-	private readonly finisherPromptPath: string;
-	private readonly mergerPromptPath: string;
-	private readonly steeringPromptPath: string;
-	private readonly issuerPromptPath: string;
-	private readonly broadcastSteeringPromptPath: string;
-	private readonly resolverPromptPath: string;
-
-	private readonly workerExtensionPath: string;
-	private readonly fastWorkerExtensionPath: string;
-	private readonly designerWorkerExtensionPath: string;
-	private readonly finisherExtensionPath: string;
-	private readonly mergerExtensionPath: string;
-	private readonly steeringExtensionPath: string;
-	private readonly issuerExtensionPath: string;
-	private readonly broadcastExtensionPath: string;
-	private readonly complainExtensionPath: string;
-	private readonly waitForAgentExtensionPath: string;
-	private readonly readMessageHistoryExtensionPath: string;
-	private readonly readTaskMessageHistoryExtensionPath: string;
-	private readonly steerAgentExtensionPath: string;
-	private readonly steeringReplaceAgentExtensionPath: string;
-	private readonly tasksBashGuardExtensionPath: string;
-	private readonly ompCrashLoggerExtensionPath: string;
 	private readonly spawnInFlight = new Map<string, Promise<AgentInfo>>();
 
 	private buildExtensionPath(filename: string): string {
@@ -273,35 +240,6 @@ export class AgentSpawner {
 		const baseDir = getImportMetaDir();
 		this.promptsDir = path.resolve(baseDir, "prompts");
 		this.extensionsDir = path.resolve(baseDir, "extensions");
-
-		this.workerPromptPath = path.resolve(this.promptsDir, "worker.md");
-		this.fastWorkerPromptPath = path.resolve(this.promptsDir, "fast-worker.md");
-		this.designerWorkerPromptPath = path.resolve(this.promptsDir, "designer-worker.md");
-		this.finisherPromptPath = path.resolve(this.promptsDir, "finisher.md");
-		this.mergerPromptPath = path.resolve(this.promptsDir, "merger.md");
-		this.steeringPromptPath = path.resolve(this.promptsDir, "steering.md");
-		this.issuerPromptPath = path.resolve(this.promptsDir, "issuer.md");
-		this.broadcastSteeringPromptPath = path.resolve(this.promptsDir, "broadcast-steering.md");
-		this.resolverPromptPath = path.resolve(this.promptsDir, "resolver.md");
-
-		this.workerExtensionPath = this.buildExtensionPath(AGENT_EXTENSION_FILENAMES.worker);
-		this.fastWorkerExtensionPath = this.buildExtensionPath(AGENT_EXTENSION_FILENAMES.fastWorker);
-		this.designerWorkerExtensionPath = this.buildExtensionPath(AGENT_EXTENSION_FILENAMES.designerWorker);
-		this.finisherExtensionPath = this.buildExtensionPath(AGENT_EXTENSION_FILENAMES.finisher);
-		this.mergerExtensionPath = this.buildExtensionPath(AGENT_EXTENSION_FILENAMES.merger);
-		this.steeringExtensionPath = this.buildExtensionPath(AGENT_EXTENSION_FILENAMES.steering);
-		this.issuerExtensionPath = this.buildExtensionPath(AGENT_EXTENSION_FILENAMES.issuer);
-		this.broadcastExtensionPath = this.buildExtensionPath(AGENT_EXTENSION_FILENAMES.broadcast);
-		this.complainExtensionPath = this.buildExtensionPath(AGENT_EXTENSION_FILENAMES.complain);
-		this.waitForAgentExtensionPath = this.buildExtensionPath(AGENT_EXTENSION_FILENAMES.waitForAgent);
-		this.readMessageHistoryExtensionPath = this.buildExtensionPath(AGENT_EXTENSION_FILENAMES.readMessageHistory);
-		this.readTaskMessageHistoryExtensionPath = this.buildExtensionPath(
-			AGENT_EXTENSION_FILENAMES.readTaskMessageHistory,
-		);
-		this.steerAgentExtensionPath = this.buildExtensionPath(AGENT_EXTENSION_FILENAMES.steerAgent);
-		this.steeringReplaceAgentExtensionPath = this.buildExtensionPath(AGENT_EXTENSION_FILENAMES.steeringReplaceAgent);
-		this.tasksBashGuardExtensionPath = this.buildExtensionPath(AGENT_EXTENSION_FILENAMES.tasksBashGuard);
-		this.ompCrashLoggerExtensionPath = this.buildExtensionPath(AGENT_EXTENSION_FILENAMES.ompCrashLogger);
 	}
 
 	isTasksAvailable(): boolean {
@@ -312,27 +250,28 @@ export class AgentSpawner {
 		return this.#replicaManager;
 	}
 
-	private spawnGuardKey(role: SpawnGuardRole, taskId: string): string {
-		return `${role}:${taskId}`;
+	private spawnGuardKey(agentType: SpawnGuardAgent, taskId: string): string {
+		return `${agentType}:${taskId}`;
 	}
 
-	private getActiveSpawnMatch(role: SpawnGuardRole, taskId: string): AgentInfo | null {
+	private getActiveSpawnMatch(agentType: SpawnGuardAgent, taskId: string): AgentInfo | null {
 		const active = this.registry.getByTask(taskId).filter(agent => isActiveStatus(agent.status));
 
-		if (role === "worker") {
+		if (agentType === "worker") {
 			return (
 				active.find(
-					agent => agent.role === "worker" || agent.role === "fast-worker" || agent.role === "designer-worker",
+					agent => agent.agentType === "worker" || agent.agentType === "speedy" || agent.agentType === "designer",
 				) ?? null
 			);
 		}
 
-		return active.find(agent => agent.role === role) ?? null;
+		return active.find(agent => agent.agentType === agentType) ?? null;
 	}
 
 	#getRegisteredWorkerReplicaDir(taskId: string): string | undefined {
 		const workerWithReplica = this.registry.getByTask(taskId).find(agent => {
-			if (agent.role !== "worker" && agent.role !== "fast-worker" && agent.role !== "designer-worker") return false;
+			if (agent.agentType !== "worker" && agent.agentType !== "speedy" && agent.agentType !== "designer")
+				return false;
 			return typeof agent.replicaDir === "string" && agent.replicaDir.trim().length > 0;
 		});
 		return workerWithReplica?.replicaDir;
@@ -358,19 +297,19 @@ export class AgentSpawner {
 	}
 
 	private async withSpawnGuard(
-		role: SpawnGuardRole,
+		agentType: SpawnGuardAgent,
 		taskId: string,
 		spawn: () => Promise<AgentInfo>,
 	): Promise<AgentInfo> {
-		const existing = this.getActiveSpawnMatch(role, taskId);
+		const existing = this.getActiveSpawnMatch(agentType, taskId);
 		if (existing) return existing;
 
-		const key = this.spawnGuardKey(role, taskId);
+		const key = this.spawnGuardKey(agentType, taskId);
 		const inFlight = this.spawnInFlight.get(key);
 		if (inFlight) return await inFlight;
 
 		const guarded = (async () => {
-			const active = this.getActiveSpawnMatch(role, taskId);
+			const active = this.getActiveSpawnMatch(agentType, taskId);
 			if (active) return active;
 			return await spawn();
 		})();
@@ -390,362 +329,222 @@ export class AgentSpawner {
 		return typeof sessionId === "string" && sessionId.trim() ? sessionId : undefined;
 	}
 
-	async spawnWorker(taskId: string, opts?: { claim?: boolean; kickoffMessage?: string }): Promise<AgentInfo> {
-		return await this.withSpawnGuard("worker", taskId, async () => {
-			return await this.spawnImplementationWorker("worker", taskId, opts);
-		});
+	private resolveExtensionPath(key: string): string {
+		const filename = (AGENT_EXTENSION_FILENAMES as Record<string, string | undefined>)[key];
+		if (!filename) throw new Error(`Unknown extension key: ${key}`);
+		return this.buildExtensionPath(filename);
 	}
 
-	async spawnDesignerWorker(taskId: string, opts?: { claim?: boolean; kickoffMessage?: string }): Promise<AgentInfo> {
-		return await this.withSpawnGuard("worker", taskId, async () => {
-			return await this.spawnImplementationWorker("designer-worker", taskId, opts);
-		});
-	}
-
-	async spawnFastWorker(
-		taskId: string,
-		opts?: { claim?: boolean; kickoffMessage?: string; resumeSessionId?: string },
+	/**
+	 * Generic spawn method for all agent types.
+	 *
+	 * Driven by AGENT_CONFIGS — adding a new agent type means adding a config
+	 * entry + prompt file, not touching this method.
+	 */
+	async spawnAgent(
+		configKey: string,
+		taskId: string | null,
+		opts?: {
+			claim?: boolean;
+			resumeSessionId?: string;
+			kickoffMessage?: string;
+			/** Pre-built extra text appended to the task prompt (e.g. worker output for finisher). */
+			promptExtra?: string;
+			/** Async builder for extra text; receives the task. Overrides promptExtra when provided. */
+			buildPromptExtra?: (task: Record<string, unknown>) => Promise<string> | string;
+			/** Extra env vars merged into the agent process env. */
+			extraEnv?: Record<string, string | undefined>;
+			/** Custom agent ID builder. Receives tasksAgentId. */
+			agentIdBuilder?: (tasksAgentId: string) => string;
+			/** Override model from agent model config. */
+			modelOverride?: string;
+			/** Override thinking level from agent model config. */
+			thinkingOverride?: string;
+			/** Raw prompt text, bypasses task fetch + buildTaskPrompt. */
+			rawPrompt?: string;
+			/** Override agent name prefix for tasksClient.createAgent. */
+			agentNamePrefix?: string;
+			/** Override replicaDir in AgentInfo (e.g., merger uses worker's replica). */
+			replicaDirOverride?: string;
+		},
 	): Promise<AgentInfo> {
-		return await this.withSpawnGuard("worker", taskId, async () => {
-			const normalizedResumeSessionId =
-				typeof opts?.resumeSessionId === "string" && opts.resumeSessionId.trim()
-					? opts.resumeSessionId.trim()
-					: undefined;
-			const normalizedKickoffMessage =
-				typeof opts?.kickoffMessage === "string" && opts.kickoffMessage.trim() ? opts.kickoffMessage.trim() : "";
-			const spawnedAt = Date.now();
-			let tasksAgentId: string | null = null;
-			let rpc: OmsRpcClient | null = null;
+		const spawnConfig = getAgentSpawnConfig(configKey);
+		if (!spawnConfig) throw new Error(`No agent config for key "${configKey}"`);
 
-			try {
-				if (opts?.claim !== false) {
-					await this.tasksClient.claim(taskId);
-				} else {
-					const current = await this.tasksClient.show(taskId);
-					const status = (typeof current.status === "string" ? current.status : "").toLowerCase();
-					if (status === "blocked" || status === "closed" || status === "deferred") {
-						throw new Error(`Task ${taskId} status is '${status}'; refusing to spawn fast-worker`);
-					}
-				}
+		if (spawnConfig.spawnGuard != null && taskId != null) {
+			return await this.withSpawnGuard(spawnConfig.spawnGuard, taskId, async () => {
+				return await this.#spawnAgentInternal(configKey, taskId, spawnConfig, opts);
+			});
+		}
 
-				tasksAgentId = await this.tasksClient.createAgent(`fast-worker-${taskId}`);
-				await this.tasksClient.setAgentState(tasksAgentId, "spawning");
-				const agentId = `fast-worker:${taskId}:${tasksAgentId}`;
-				const roleCfg = this.config.roles["fast-worker"];
-				const toolsBase = normalizeTools(roleCfg.tools ?? WORKER_TOOLS, WORKER_TOOLS, {
-					stripBash: false,
-				});
-				const tools = toolsBase;
-				const args: string[] = [
-					"--thinking",
-					roleCfg.thinking,
-					...(roleCfg.model ? ["--model", roleCfg.model] : []),
-					"--no-pty",
-					...(normalizedResumeSessionId ? ["--resume", normalizedResumeSessionId] : []),
-					"--extension",
-					this.ompCrashLoggerExtensionPath,
-					"--extension",
-					this.fastWorkerExtensionPath,
-					"--extension",
-					this.tasksBashGuardExtensionPath,
-					"--tools",
-					tools,
-					"--append-system-prompt",
-					this.fastWorkerPromptPath,
-				];
-
-				let replicaDir: string | undefined;
-				let workerCwd = this.tasksClient.workingDir;
-				if (this.config.enableReplicas && this.#replicaManager) {
-					try {
-						replicaDir = await this.#replicaManager.createReplica(taskId);
-						workerCwd = replicaDir;
-					} catch (err) {
-						logger.warn(
-							"agents/spawner.ts: failed to create fast-worker replica directory, falling back to root cwd",
-							{
-								taskId,
-								err,
-							},
-						);
-					}
-				}
-
-				rpc = new OmsRpcClient({
-					ompCli: this.config.ompCli,
-					cwd: workerCwd,
-					env: buildEnv({
-						TASKS_ACTOR: "oms-fast-worker",
-						OMS_ROLE: "fast-worker",
-						OMS_TASK_ID: taskId,
-						OMS_AGENT_ID: agentId,
-						OMS_SINGULARITY_SOCK: this.ipcSockPath,
-					}),
-					args,
-				});
-
-				rpc.start();
-
-				let promptText: string | null = null;
-				if (normalizedResumeSessionId) {
-					if (normalizedKickoffMessage) {
-						promptText = normalizedKickoffMessage;
-						await rpc.prompt(promptText);
-					}
-				} else {
-					const task = await this.tasksClient.show(taskId);
-					const dependsOnIds = Array.isArray(task.depends_on_ids)
-						? task.depends_on_ids
-								.filter(
-									(dependencyId): dependencyId is string =>
-										typeof dependencyId === "string" && dependencyId.trim().length > 0,
-								)
-								.map(dependencyId => dependencyId.trim())
-						: [];
-					const parentComments = dependsOnIds.length
-						? await formatParentTaskComments(this.tasksClient, dependsOnIds)
-						: "";
-					const referenceIds = Array.isArray(task.references)
-						? task.references
-								.filter(
-									(referenceId): referenceId is string =>
-										typeof referenceId === "string" && referenceId.trim().length > 0,
-								)
-								.map(referenceId => referenceId.trim())
-						: [];
-					const referencedTaskComments = referenceIds.length
-						? await formatReferencedTaskComments(this.tasksClient, referenceIds)
-						: "";
-					const kickoffGuidance = normalizedKickoffMessage
-						? `## Implementation Guidance\n\n${normalizedKickoffMessage}`
-						: "";
-					const extra = [parentComments, referencedTaskComments, kickoffGuidance].filter(Boolean).join("\n\n");
-					promptText = buildTaskPrompt({
-						role: "fast-worker",
-						task: {
-							id: task.id,
-							title: task.title,
-							description: task.description,
-							acceptance: task.acceptance_criteria,
-							issueType: task.issue_type,
-							labels: task.labels,
-						},
-						extra: extra || undefined,
-					});
-					await rpc.prompt(promptText);
-				}
-
-				await this.tasksClient.setSlot(tasksAgentId, "callbackHandler", taskId);
-				await this.tasksClient.setAgentState(tasksAgentId, "working");
-				const info: AgentInfo = {
-					id: agentId,
-					role: "fast-worker",
-					taskId,
-					replicaDir,
-					tasksAgentId,
-					status: "working",
-					usage: createEmptyAgentUsage(),
-					events: [],
-					spawnedAt,
-					lastActivity: Date.now(),
-					rpc,
-					model: roleCfg.model,
-					thinking: roleCfg.thinking,
-					sessionId: this.getAgentSessionId(rpc) ?? normalizedResumeSessionId,
-				};
-				this.registry.register(info);
-				if (promptText?.trim()) {
-					this.registry.pushEvent(info.id, { type: "initial_prompt", text: promptText, ts: Date.now() });
-				}
-				return info;
-			} catch (err) {
-				const message = err instanceof Error ? err.message : String(err);
-
-				if (tasksAgentId) {
-					try {
-						const action = normalizedResumeSessionId ? "resume" : "spawn";
-						await this.tasksClient.comment(
-							taskId,
-							`Failed to ${action} fast-worker RPC agent for task ${taskId}.\n` +
-								`tasksAgentId: ${tasksAgentId}\n` +
-								`sessionId: ${normalizedResumeSessionId ?? "(none)"}\n` +
-								`error: ${message}`,
-						);
-					} catch (err) {
-						logger.debug("agents/spawner.ts: failed to record fast-worker spawn-failure comment (non-fatal)", {
-							err,
-						});
-					}
-
-					try {
-						await this.tasksClient.setAgentState(tasksAgentId, "failed");
-					} catch (err) {
-						logger.debug(
-							'agents/spawner.ts: best-effort failure after await this.tasksClient.setAgentState(tasksAgentId, "failed");',
-							{ err },
-						);
-					}
-
-					try {
-						await this.tasksClient.close(tasksAgentId, "spawn failed");
-					} catch (err) {
-						logger.debug(
-							'agents/spawner.ts: best-effort failure after await this.tasksClient.close(tasksAgentId, "spawn failed");',
-							{ err },
-						);
-					}
-				}
-
-				if (rpc) {
-					try {
-						await rpc.stop();
-					} catch (err) {
-						logger.debug("agents/spawner.ts: best-effort failure after await rpc.stop();", { err });
-					}
-				}
-
-				throw err;
-			}
-		});
+		return await this.#spawnAgentInternal(configKey, taskId, spawnConfig, opts);
 	}
 
-	private async spawnImplementationWorker(
-		kind: WorkerKind,
-		taskId: string,
-		opts?: { claim?: boolean; kickoffMessage?: string },
+	async #spawnAgentInternal(
+		configKey: string,
+		taskId: string | null,
+		spawnConfig: AgentBehaviorConfig,
+		opts?: {
+			claim?: boolean;
+			resumeSessionId?: string;
+			kickoffMessage?: string;
+			promptExtra?: string;
+			buildPromptExtra?: (task: Record<string, unknown>) => Promise<string> | string;
+			extraEnv?: Record<string, string | undefined>;
+			agentIdBuilder?: (tasksAgentId: string) => string;
+			modelOverride?: string;
+			thinkingOverride?: string;
+			rawPrompt?: string;
+			agentNamePrefix?: string;
+			replicaDirOverride?: string;
+		},
 	): Promise<AgentInfo> {
+		const normalizedResumeSessionId =
+			typeof opts?.resumeSessionId === "string" && opts.resumeSessionId.trim()
+				? opts.resumeSessionId.trim()
+				: undefined;
+		const normalizedKickoffMessage =
+			typeof opts?.kickoffMessage === "string" && opts.kickoffMessage.trim() ? opts.kickoffMessage.trim() : "";
 		const spawnedAt = Date.now();
 		let tasksAgentId: string | null = null;
 		let rpc: OmsRpcClient | null = null;
+		const agentType = (spawnConfig.agentType ?? configKey) as AgentType;
+		const tasksActorName = spawnConfig.tasksActorName ?? `oms-${configKey}`;
 
 		try {
-			if (opts?.claim !== false) {
-				await this.tasksClient.claim(taskId);
-			} else {
-				// claim:false means caller already owns this task (resume path).
-				// Re-check status to guard against races where the task was
-				// blocked/closed between scheduler snapshot and worker spawn.
-				const current = await this.tasksClient.show(taskId);
-				const status = (typeof current.status === "string" ? current.status : "").toLowerCase();
-				if (status === "blocked" || status === "closed" || status === "deferred") {
-					throw new Error(`Task ${taskId} status is '${status}'; refusing to spawn ${kind}`);
+			// Claim handling (only when taskId is non-null)
+			if (taskId != null) {
+				if (opts?.claim === true) {
+					await this.tasksClient.claim(taskId);
+				} else if (opts?.claim === false) {
+					// claim:false means caller already owns this task (resume path).
+					// Re-check status to guard against races where the task was
+					// blocked/closed between scheduler snapshot and worker spawn.
+					const current = await this.tasksClient.show(taskId);
+					const status = (typeof current.status === "string" ? current.status : "").toLowerCase();
+					if (status === "blocked" || status === "closed" || status === "deferred") {
+						throw new Error(`Task ${taskId} status is '${status}'; refusing to spawn ${configKey}`);
+					}
 				}
 			}
-
-			tasksAgentId = await this.tasksClient.createAgent(`${kind}-${taskId}`);
+			// claim:undefined means no claim behavior (finisher/issuer paths).
+			const agentName = opts?.agentNamePrefix ?? (taskId ? `${configKey}-${taskId}` : `${configKey}-${spawnedAt}`);
+			tasksAgentId = await this.tasksClient.createAgent(agentName);
 			await this.tasksClient.setAgentState(tasksAgentId, "spawning");
-			const agentId = `${kind}:${taskId}:${tasksAgentId}`;
-
-			const roleCfg = this.config.roles[kind];
-			const toolsBase = normalizeTools(roleCfg.tools ?? WORKER_TOOLS, WORKER_TOOLS, {
-				stripBash: false,
+			const agentId = opts?.agentIdBuilder
+				? opts.agentIdBuilder(tasksAgentId)
+				: taskId
+					? `${agentType}:${taskId}:${tasksAgentId}`
+					: `${agentType}:${tasksAgentId}`;
+			const agentCfg = (this.config.agents as Record<string, { model?: string; thinking: string; tools?: string }>)[
+				agentType
+			];
+			const model = opts?.modelOverride ?? agentCfg?.model;
+			const thinking = opts?.thinkingOverride ?? agentCfg?.thinking ?? "medium";
+			const toolsBase = normalizeTools(agentCfg?.tools ?? spawnConfig.defaultTools, spawnConfig.defaultTools, {
+				stripBash: spawnConfig.stripBash,
 			});
-			const tools = toolsBase;
+			// Build extension args from config
+			const extensionArgs: string[] = [];
+			for (const key of spawnConfig.extensionKeys) {
+				extensionArgs.push("--extension", this.resolveExtensionPath(key));
+			}
 
-			const extensionPath = kind === "designer-worker" ? this.designerWorkerExtensionPath : this.workerExtensionPath;
-			const promptPath = kind === "designer-worker" ? this.designerWorkerPromptPath : this.workerPromptPath;
-
+			const promptFile = spawnConfig.promptFile ?? `${configKey}.md`;
+			const promptPath = path.resolve(this.promptsDir, promptFile);
 			const args: string[] = [
 				"--thinking",
-				roleCfg.thinking,
-				...(roleCfg.model ? ["--model", roleCfg.model] : []),
+				thinking,
+				...(model ? ["--model", model] : []),
 				"--no-pty",
-				"--extension",
-				this.ompCrashLoggerExtensionPath,
-				"--extension",
-				extensionPath,
-				"--extension",
-				this.tasksBashGuardExtensionPath,
-				"--extension",
-				this.broadcastExtensionPath,
-				"--extension",
-				this.complainExtensionPath,
-				"--extension",
-				this.waitForAgentExtensionPath,
+				...(normalizedResumeSessionId ? ["--resume", normalizedResumeSessionId] : []),
+				...extensionArgs,
 				"--tools",
-				tools,
+				toolsBase,
 				"--append-system-prompt",
 				promptPath,
 			];
-
+			// Handle replicas
 			let replicaDir: string | undefined;
-			let workerCwd = this.tasksClient.workingDir;
-			if (this.config.enableReplicas && this.#replicaManager) {
+			let agentCwd = this.tasksClient.workingDir;
+			if (spawnConfig.replica === "create" && this.config.enableReplicas && this.#replicaManager && taskId) {
 				try {
 					replicaDir = await this.#replicaManager.createReplica(taskId);
-					workerCwd = replicaDir;
+					agentCwd = replicaDir;
 				} catch (err) {
-					logger.warn("agents/spawner.ts: failed to create worker replica directory, falling back to root cwd", {
-						taskId,
-						kind,
-						err,
-					});
+					logger.warn(
+						`agents/spawner.ts: failed to create ${configKey} replica directory, falling back to root cwd`,
+						{ taskId, err },
+					);
 				}
+			} else if (spawnConfig.replica === "resolve" && taskId) {
+				replicaDir = await this.#resolveFinisherReplicaDir(taskId);
+				if (replicaDir) agentCwd = replicaDir;
 			}
 
+			const envBase: Record<string, string | undefined> = {
+				TASKS_ACTOR: tasksActorName,
+				OMS_AGENT_TYPE: agentType,
+				...(taskId != null ? { OMS_TASK_ID: taskId } : {}),
+				OMS_AGENT_ID: agentId,
+				OMS_SINGULARITY_SOCK: this.ipcSockPath,
+				...opts?.extraEnv,
+			};
 			rpc = new OmsRpcClient({
 				ompCli: this.config.ompCli,
-				cwd: workerCwd,
-				env: buildEnv({
-					TASKS_ACTOR: `oms-${kind}`,
-					OMS_ROLE: kind,
-					OMS_TASK_ID: taskId,
-					OMS_AGENT_ID: agentId,
-					OMS_SINGULARITY_SOCK: this.ipcSockPath,
-				}),
+				cwd: agentCwd,
+				env: buildEnv(envBase),
 				args,
 			});
 
 			rpc.start();
 
-			const task = await this.tasksClient.show(taskId);
-			const dependsOnIds = Array.isArray(task.depends_on_ids)
-				? task.depends_on_ids
-						.filter(
-							(dependencyId): dependencyId is string =>
-								typeof dependencyId === "string" && dependencyId.trim().length > 0,
-						)
-						.map(dependencyId => dependencyId.trim())
-				: [];
-			const parentComments = dependsOnIds.length
-				? await formatParentTaskComments(this.tasksClient, dependsOnIds)
-				: "";
-			const referenceIds = Array.isArray(task.references)
-				? task.references
-						.filter(
-							(referenceId): referenceId is string =>
-								typeof referenceId === "string" && referenceId.trim().length > 0,
-						)
-						.map(referenceId => referenceId.trim())
-				: [];
-			const referencedTaskComments = referenceIds.length
-				? await formatReferencedTaskComments(this.tasksClient, referenceIds)
-				: "";
-			const kickoffGuidance = opts?.kickoffMessage?.trim()
-				? `## Implementation Guidance\n\n${opts.kickoffMessage.trim()}`
-				: "";
-			const extra = [parentComments, referencedTaskComments, kickoffGuidance].filter(Boolean).join("\n\n");
-			const promptText = buildTaskPrompt({
-				role: kind,
-				task: {
-					id: task.id,
-					title: task.title,
-					description: task.description,
-					acceptance: task.acceptance_criteria,
-					issueType: task.issue_type,
-					labels: task.labels,
-				},
-				extra: extra || undefined,
-			});
-			await rpc.prompt(promptText);
+			// Build and send prompt
+			let promptText: string | null = null;
+			if (normalizedResumeSessionId) {
+				if (normalizedKickoffMessage) {
+					promptText = normalizedKickoffMessage;
+					await rpc.prompt(promptText);
+				}
+			} else if (opts?.rawPrompt) {
+				promptText = opts.rawPrompt;
+				await rpc.prompt(promptText);
+			} else if (taskId != null) {
+				const task = await this.tasksClient.show(taskId);
+				let extra: string;
+				if (opts?.buildPromptExtra) {
+					extra = await opts.buildPromptExtra(task as unknown as Record<string, unknown>);
+				} else if (opts?.promptExtra) {
+					extra = opts.promptExtra;
+				} else {
+					extra = normalizedKickoffMessage ? `## Implementation Guidance\n\n${normalizedKickoffMessage}` : "";
+				}
+				promptText = buildTaskPrompt({
+					agentType,
+					task: {
+						id: task.id,
+						title: task.title,
+						description: task.description,
+						acceptance: task.acceptance_criteria,
+						issueType: task.issue_type,
+						labels: task.labels,
+					},
+					extra: extra || undefined,
+				});
+				await rpc.prompt(promptText);
+			}
 
-			await this.tasksClient.setSlot(tasksAgentId, "callbackHandler", taskId);
+			// Set slot (unless config says skip or taskId is null)
+			if (spawnConfig.setSlot !== false && taskId != null) {
+				await this.tasksClient.setSlot(tasksAgentId, "callbackHandler", taskId);
+			}
 			await this.tasksClient.setAgentState(tasksAgentId, "working");
+
 			const info: AgentInfo = {
 				id: agentId,
-				role: kind,
+				agentType,
 				taskId,
-				replicaDir,
+				replicaDir: opts?.replicaDirOverride ?? replicaDir,
 				tasksAgentId,
 				status: "working",
 				usage: createEmptyAgentUsage(),
@@ -753,28 +552,32 @@ export class AgentSpawner {
 				spawnedAt,
 				lastActivity: Date.now(),
 				rpc,
-				model: roleCfg.model,
-				thinking: roleCfg.thinking,
-				sessionId: this.getAgentSessionId(rpc),
+				model,
+				thinking,
+				sessionId: this.getAgentSessionId(rpc) ?? normalizedResumeSessionId,
 			};
 			this.registry.register(info);
-			this.registry.pushEvent(info.id, { type: "initial_prompt", text: promptText, ts: Date.now() });
+			if (promptText?.trim()) {
+				this.registry.pushEvent(info.id, { type: "initial_prompt", text: promptText, ts: Date.now() });
+			}
 			return info;
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
-
 			if (tasksAgentId) {
-				try {
-					await this.tasksClient.comment(
-						taskId,
-						`Failed to spawn ${kind} RPC agent for task ${taskId}.\n` +
-							`tasksAgentId: ${tasksAgentId}\n` +
-							`error: ${message}`,
-					);
-				} catch (err) {
-					logger.debug("agents/spawner.ts: failed to record spawn-failure comment (non-fatal)", { err });
+				if (taskId != null) {
+					try {
+						const action = normalizedResumeSessionId ? "resume" : "spawn";
+						await this.tasksClient.comment(
+							taskId,
+							`Failed to ${action} ${configKey} RPC agent for task ${taskId}.\n` +
+								`tasksAgentId: ${tasksAgentId}\n` +
+								`sessionId: ${normalizedResumeSessionId ?? "(none)"}\n` +
+								`error: ${message}`,
+						);
+					} catch (err) {
+						logger.debug("agents/spawner.ts: failed to record spawn-failure comment (non-fatal)", { err });
+					}
 				}
-
 				try {
 					await this.tasksClient.setAgentState(tasksAgentId, "failed");
 				} catch (err) {
@@ -783,7 +586,6 @@ export class AgentSpawner {
 						{ err },
 					);
 				}
-
 				try {
 					await this.tasksClient.close(tasksAgentId, "spawn failed");
 				} catch (err) {
@@ -793,7 +595,6 @@ export class AgentSpawner {
 					);
 				}
 			}
-
 			if (rpc) {
 				try {
 					await rpc.stop();
@@ -801,718 +602,63 @@ export class AgentSpawner {
 					logger.debug("agents/spawner.ts: best-effort failure after await rpc.stop();", { err });
 				}
 			}
-
-			throw err;
-		}
-	}
-
-	async spawnMerger(taskId: string, replicaDir: string): Promise<AgentInfo> {
-		const normalizedTaskId = taskId.trim();
-		if (!normalizedTaskId) throw new Error("spawnMerger requires a non-empty taskId");
-
-		const normalizedReplicaDir = replicaDir.trim();
-		if (!normalizedReplicaDir) throw new Error("spawnMerger requires a non-empty replicaDir");
-
-		const spawnedAt = Date.now();
-		let tasksAgentId: string | null = null;
-		let rpc: OmsRpcClient | null = null;
-
-		try {
-			tasksAgentId = await this.tasksClient.createAgent(`merger-${normalizedTaskId}`);
-			await this.tasksClient.setAgentState(tasksAgentId, "spawning");
-			const agentId = `merger:${normalizedTaskId}:${tasksAgentId}`;
-			const roleCfg = this.config.roles.merger;
-			const toolsBase = normalizeTools(roleCfg.tools ?? MERGER_TOOLS, MERGER_TOOLS, {
-				stripBash: false,
-			});
-			const tools = toolsBase;
-			const args: string[] = [
-				"--thinking",
-				roleCfg.thinking,
-				...(roleCfg.model ? ["--model", roleCfg.model] : []),
-				"--no-pty",
-				"--extension",
-				this.ompCrashLoggerExtensionPath,
-				"--extension",
-				this.mergerExtensionPath,
-				"--extension",
-				this.tasksBashGuardExtensionPath,
-				"--tools",
-				tools,
-				"--append-system-prompt",
-				this.mergerPromptPath,
-			];
-
-			rpc = new OmsRpcClient({
-				ompCli: this.config.ompCli,
-				cwd: this.tasksClient.workingDir,
-				env: buildEnv({
-					TASKS_ACTOR: "oms-merger",
-					OMS_ROLE: "merger",
-					OMS_TASK_ID: normalizedTaskId,
-					OMS_AGENT_ID: agentId,
-					OMS_REPLICA_DIR: normalizedReplicaDir,
-					OMS_SINGULARITY_SOCK: this.ipcSockPath,
-				}),
-				args,
-			});
-
-			rpc.start();
-
-			const task = await this.tasksClient.show(normalizedTaskId);
-			const mergerExtra =
-				`Replica directory: ${normalizedReplicaDir}\n` + `Project root: ${this.tasksClient.workingDir}`;
-			const promptText = buildTaskPrompt({
-				role: "merger",
-				task: {
-					id: task.id,
-					title: task.title,
-					description: task.description,
-					acceptance: task.acceptance_criteria,
-					issueType: task.issue_type,
-					labels: task.labels,
-				},
-				extra: mergerExtra,
-			});
-			await rpc.prompt(promptText);
-
-			await this.tasksClient.setSlot(tasksAgentId, "callbackHandler", normalizedTaskId);
-			await this.tasksClient.setAgentState(tasksAgentId, "working");
-			const info: AgentInfo = {
-				id: agentId,
-				role: "merger",
-				taskId: normalizedTaskId,
-				replicaDir: normalizedReplicaDir,
-				tasksAgentId,
-				status: "working",
-				usage: createEmptyAgentUsage(),
-				events: [],
-				spawnedAt,
-				lastActivity: Date.now(),
-				rpc,
-				model: roleCfg.model,
-				thinking: roleCfg.thinking,
-				sessionId: this.getAgentSessionId(rpc),
-			};
-
-			this.registry.register(info);
-			this.registry.pushEvent(info.id, { type: "initial_prompt", text: promptText, ts: Date.now() });
-			return info;
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-
-			if (tasksAgentId) {
-				try {
-					await this.tasksClient.comment(
-						normalizedTaskId,
-						`Failed to spawn merger RPC agent for task ${normalizedTaskId}.\n` +
-							`tasksAgentId: ${tasksAgentId}\n` +
-							`replicaDir: ${normalizedReplicaDir}\n` +
-							`error: ${message}`,
-					);
-				} catch (err) {
-					logger.debug("agents/spawner.ts: failed to record merger spawn-failure comment (non-fatal)", {
-						err,
-					});
-				}
-
-				try {
-					await this.tasksClient.setAgentState(tasksAgentId, "failed");
-				} catch (err) {
-					logger.debug(
-						'agents/spawner.ts: best-effort failure after await this.tasksClient.setAgentState(tasksAgentId, "failed");',
-						{ err },
-					);
-				}
-			}
-
-			if (rpc) {
-				try {
-					await rpc.stop();
-				} catch (err) {
-					logger.debug("agents/spawner.ts: best-effort failure after await rpc.stop();", { err });
-				}
-			}
-
 			throw err;
 		}
 	}
 
 	async spawnFinisher(taskId: string, workerOutput: string): Promise<AgentInfo> {
-		return await this.withSpawnGuard("finisher", taskId, async () => {
-			return await this.spawnFinisherInternal(taskId, workerOutput);
+		const trimmedOutput = workerOutput?.trim() || "(none)";
+		return await this.spawnAgent("finisher", taskId, {
+			promptExtra: `Implementation output:\n\n${trimmedOutput}`,
 		});
 	}
-
-	async spawnFinisherWithResume(taskId: string, sessionId: string, kickoffMessage?: string): Promise<AgentInfo> {
-		return await this.withSpawnGuard("finisher", taskId, async () => {
-			return await this.spawnFinisherInternal(taskId, "", sessionId, kickoffMessage);
-		});
-	}
-
-	private async spawnFinisherInternal(
-		taskId: string,
-		workerOutput: string,
-		resumeSessionId?: string,
-		kickoffMessage?: string,
-	): Promise<AgentInfo> {
-		const normalizedResumeSessionId =
-			typeof resumeSessionId === "string" && resumeSessionId.trim() ? resumeSessionId.trim() : undefined;
-		const normalizedKickoffMessage =
-			typeof kickoffMessage === "string" && kickoffMessage.trim() ? kickoffMessage.trim() : "";
-		const spawnedAt = Date.now();
-		const tasksAgentId = await this.tasksClient.createAgent(`finisher-${taskId}`);
-		await this.tasksClient.setAgentState(tasksAgentId, "spawning");
-		const agentId = `finisher:${taskId}:${tasksAgentId}`;
-		const roleCfg = this.config.roles.finisher;
-		const toolsBase = normalizeTools(roleCfg.tools ?? FINISHER_TOOLS, FINISHER_TOOLS);
-		const tools = toolsBase;
-		const args: string[] = [
-			"--thinking",
-			roleCfg.thinking,
-			...(roleCfg.model ? ["--model", roleCfg.model] : []),
-			"--no-pty",
-			...(normalizedResumeSessionId ? ["--resume", normalizedResumeSessionId] : []),
-			"--extension",
-			this.ompCrashLoggerExtensionPath,
-			"--extension",
-			this.finisherExtensionPath,
-			"--extension",
-			this.tasksBashGuardExtensionPath,
-			"--extension",
-			this.broadcastExtensionPath,
-			"--tools",
-			tools,
-			"--append-system-prompt",
-			this.finisherPromptPath,
-		];
-
-		const replicaDir = await this.#resolveFinisherReplicaDir(taskId);
-		const finisherCwd = replicaDir ?? this.tasksClient.workingDir;
-		const rpc = new OmsRpcClient({
-			ompCli: this.config.ompCli,
-			cwd: finisherCwd,
-			env: buildEnv({
-				TASKS_ACTOR: "oms-finisher",
-				OMS_ROLE: "finisher",
-				OMS_TASK_ID: taskId,
-				OMS_AGENT_ID: agentId,
-				OMS_SINGULARITY_SOCK: this.ipcSockPath,
-			}),
-			args,
-		});
-
-		try {
-			rpc.start();
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			const action = normalizedResumeSessionId ? "resume" : "spawn";
-			await this.tasksClient.comment(
-				taskId,
-				`Failed to ${action} finisher RPC agent for task ${taskId}.\n` +
-					`tasksAgentId: ${tasksAgentId}\n` +
-					`sessionId: ${normalizedResumeSessionId ?? "(none)"}\n` +
-					`error: ${message}`,
-			);
-			await this.tasksClient.setAgentState(tasksAgentId, "failed");
-			throw err;
-		}
-
-		let promptText: string | null = null;
-		if (normalizedResumeSessionId) {
-			if (normalizedKickoffMessage) {
-				promptText = normalizedKickoffMessage;
-				await rpc.prompt(promptText);
-			}
-		} else {
-			const task = await this.tasksClient.show(taskId);
-			const finisherExtra = `Implementation output:\n\n${workerOutput?.trim() ? workerOutput.trim() : "(none)"}`;
-			promptText = buildTaskPrompt({
-				role: "finisher",
-				task: {
-					id: task.id,
-					title: task.title,
-					description: task.description,
-					acceptance: task.acceptance_criteria,
-					issueType: task.issue_type,
-					labels: task.labels,
-				},
-				extra: finisherExtra,
-			});
-			await rpc.prompt(promptText);
-		}
-		await this.tasksClient.setSlot(tasksAgentId, "callbackHandler", taskId);
-		await this.tasksClient.setAgentState(tasksAgentId, "working");
-		const info: AgentInfo = {
-			id: agentId,
-			role: "finisher",
-			taskId,
-			replicaDir,
-			tasksAgentId,
-			status: "working",
-			usage: createEmptyAgentUsage(),
-			events: [],
-			spawnedAt,
-			lastActivity: Date.now(),
-			rpc,
-			model: roleCfg.model,
-			thinking: roleCfg.thinking,
-			sessionId: this.getAgentSessionId(rpc) ?? normalizedResumeSessionId,
-		};
-		this.registry.register(info);
-		if (promptText) {
-			this.registry.pushEvent(info.id, { type: "initial_prompt", text: promptText, ts: Date.now() });
-		}
-		return info;
-	}
-
-	// Legacy compatibility
-	async spawnOrchestrator(taskId: string, workerOutput: string): Promise<AgentInfo> {
-		return await this.spawnFinisher(taskId, workerOutput);
-	}
-
 	async spawnIssuer(taskId: string, kickoffMessage?: string): Promise<AgentInfo> {
-		return await this.withSpawnGuard("issuer", taskId, async () => {
-			return await this.spawnIssuerInternal(taskId, undefined, kickoffMessage);
+		const tasksClient = this.tasksClient;
+		return await this.spawnAgent("issuer", taskId, {
+			kickoffMessage,
+			buildPromptExtra: async task => {
+				const dependsOnIds = Array.isArray(task.depends_on_ids)
+					? (task.depends_on_ids as unknown[])
+							.filter(
+								(dependencyId): dependencyId is string =>
+									typeof dependencyId === "string" && dependencyId.trim().length > 0,
+							)
+							.map(dependencyId => dependencyId.trim())
+					: [];
+				const parentComments = dependsOnIds.length ? await formatParentTaskComments(tasksClient, dependsOnIds) : "";
+				const referenceIds = Array.isArray(task.references)
+					? (task.references as unknown[])
+							.filter(
+								(referenceId): referenceId is string =>
+									typeof referenceId === "string" && referenceId.trim().length > 0,
+							)
+							.map(referenceId => referenceId.trim())
+					: [];
+				const referencedTaskComments = referenceIds.length
+					? await formatReferencedTaskComments(tasksClient, referenceIds)
+					: "";
+				const kickoffContext = kickoffMessage?.trim() ? `## Kickoff Context\n\n${kickoffMessage.trim()}` : "";
+				return [parentComments, referencedTaskComments, kickoffContext].filter(Boolean).join("\n\n");
+			},
 		});
 	}
-
 	async resumeAgent(taskId: string, sessionId: string, kickoffMessage?: string): Promise<AgentInfo> {
-		return await this.withSpawnGuard("issuer", taskId, async () => {
-			return await this.spawnIssuerInternal(taskId, sessionId, kickoffMessage);
+		return await this.spawnAgent("issuer", taskId, { resumeSessionId: sessionId, kickoffMessage });
+	}
+	async spawnMerger(taskId: string, replicaDir: string): Promise<AgentInfo> {
+		const normalizedTaskId = taskId.trim();
+		if (!normalizedTaskId) throw new Error("spawnMerger requires a non-empty taskId");
+		const normalizedReplicaDir = replicaDir.trim();
+		if (!normalizedReplicaDir) throw new Error("spawnMerger requires a non-empty replicaDir");
+		return await this.spawnAgent("merger", normalizedTaskId, {
+			promptExtra: `Replica directory: ${normalizedReplicaDir}\nProject root: ${this.tasksClient.workingDir}`,
+			extraEnv: { OMS_REPLICA_DIR: normalizedReplicaDir },
+			replicaDirOverride: normalizedReplicaDir,
 		});
 	}
-
-	private async spawnIssuerInternal(
-		taskId: string,
-		resumeSessionId?: string,
-		kickoffMessage?: string,
-	): Promise<AgentInfo> {
-		const normalizedResumeSessionId =
-			typeof resumeSessionId === "string" && resumeSessionId.trim() ? resumeSessionId.trim() : undefined;
-		const spawnedAt = Date.now();
-		const tasksAgentId = await this.tasksClient.createAgent(`issuer-${taskId}`);
-		await this.tasksClient.setAgentState(tasksAgentId, "spawning");
-		const agentId = `issuer:${taskId}:${tasksAgentId}`;
-		const roleCfg = this.config.roles.issuer;
-		const toolsBase = normalizeTools(roleCfg.tools ?? ISSUER_TOOLS, ISSUER_TOOLS);
-		const tools = toolsBase;
-		const args: string[] = [
-			"--thinking",
-			roleCfg.thinking,
-			...(roleCfg.model ? ["--model", roleCfg.model] : []),
-			"--no-pty",
-			...(normalizedResumeSessionId ? ["--resume", normalizedResumeSessionId] : []),
-			"--extension",
-			this.ompCrashLoggerExtensionPath,
-			"--extension",
-			this.issuerExtensionPath,
-			"--extension",
-			this.tasksBashGuardExtensionPath,
-			"--tools",
-			tools,
-			"--append-system-prompt",
-			this.issuerPromptPath,
-		];
-		const rpc = new OmsRpcClient({
-			ompCli: this.config.ompCli,
-			cwd: this.tasksClient.workingDir,
-			env: buildEnv({
-				TASKS_ACTOR: "oms-issuer",
-				OMS_ROLE: "issuer",
-				OMS_TASK_ID: taskId,
-				OMS_AGENT_ID: agentId,
-				OMS_SINGULARITY_SOCK: this.ipcSockPath,
-			}),
-			args,
-		});
-
-		try {
-			rpc.start();
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			const action = normalizedResumeSessionId ? "resume" : "spawn";
-			await this.tasksClient.comment(
-				taskId,
-				`Failed to ${action} issuer RPC agent for task ${taskId}.\n` +
-					`tasksAgentId: ${tasksAgentId}\n` +
-					`sessionId: ${normalizedResumeSessionId ?? "(none)"}\n` +
-					`error: ${message}`,
-			);
-			await this.tasksClient.setAgentState(tasksAgentId, "failed");
-			throw err;
-		}
-		let promptText: string | null = null;
-		if (normalizedResumeSessionId) {
-			if (typeof kickoffMessage === "string" && kickoffMessage.trim()) {
-				promptText = kickoffMessage;
-				await rpc.prompt(promptText);
-			}
-		} else {
-			const task = await this.tasksClient.show(taskId);
-			const dependsOnIds = Array.isArray(task.depends_on_ids)
-				? task.depends_on_ids
-						.filter(
-							(dependencyId): dependencyId is string =>
-								typeof dependencyId === "string" && dependencyId.trim().length > 0,
-						)
-						.map(dependencyId => dependencyId.trim())
-				: [];
-			const parentComments = dependsOnIds.length
-				? await formatParentTaskComments(this.tasksClient, dependsOnIds)
-				: "";
-			const referenceIds = Array.isArray(task.references)
-				? task.references
-						.filter(
-							(referenceId): referenceId is string =>
-								typeof referenceId === "string" && referenceId.trim().length > 0,
-						)
-						.map(referenceId => referenceId.trim())
-				: [];
-			const referencedTaskComments = referenceIds.length
-				? await formatReferencedTaskComments(this.tasksClient, referenceIds)
-				: "";
-			const kickoffContext = kickoffMessage?.trim() ? `## Kickoff Context\n\n${kickoffMessage.trim()}` : "";
-			const extra = [parentComments, referencedTaskComments, kickoffContext].filter(Boolean).join("\n\n");
-			promptText = buildTaskPrompt({
-				role: "issuer",
-				task: {
-					id: task.id,
-					title: task.title,
-					description: task.description,
-					acceptance: task.acceptance_criteria,
-					issueType: task.issue_type,
-					labels: task.labels,
-				},
-				extra: extra || undefined,
-			});
-			await rpc.prompt(promptText);
-		}
-		await this.tasksClient.setSlot(tasksAgentId, "callbackHandler", taskId);
-		await this.tasksClient.setAgentState(tasksAgentId, "working");
-		const info: AgentInfo = {
-			id: agentId,
-			role: "issuer",
-			taskId,
-			tasksAgentId,
-			status: "working",
-			usage: createEmptyAgentUsage(),
-			events: [],
-			spawnedAt,
-			lastActivity: Date.now(),
-			rpc,
-			model: roleCfg.model,
-			thinking: roleCfg.thinking,
-			sessionId: this.getAgentSessionId(rpc) ?? normalizedResumeSessionId,
-		};
-		this.registry.register(info);
-		if (promptText?.trim()) {
-			this.registry.pushEvent(info.id, { type: "initial_prompt", text: promptText, ts: Date.now() });
-		}
-		return info;
-	}
-
 	async spawnSteering(taskId: string, recentMessages: string): Promise<AgentInfo> {
-		const spawnedAt = Date.now();
-
-		const tasksAgentId = await this.tasksClient.createAgent(`steering-${taskId}`);
-		await this.tasksClient.setAgentState(tasksAgentId, "spawning");
-		const agentId = `steering:${taskId}:${tasksAgentId}`;
-
-		const roleCfg = this.config.roles.steering;
-		const toolsBase = normalizeTools(roleCfg.tools ?? STEERING_TOOLS, STEERING_TOOLS);
-		const tools = toolsBase;
-
-		const args: string[] = [
-			"--thinking",
-			roleCfg.thinking,
-			...(roleCfg.model ? ["--model", roleCfg.model] : []),
-			"--no-pty",
-			"--extension",
-			this.ompCrashLoggerExtensionPath,
-			"--extension",
-			this.steeringExtensionPath,
-			"--extension",
-			this.readTaskMessageHistoryExtensionPath,
-			"--extension",
-			this.steeringReplaceAgentExtensionPath,
-			"--extension",
-			this.tasksBashGuardExtensionPath,
-			"--tools",
-			tools,
-			"--append-system-prompt",
-			this.steeringPromptPath,
-		];
-
-		const rpc = new OmsRpcClient({
-			ompCli: this.config.ompCli,
-			cwd: this.tasksClient.workingDir,
-			env: buildEnv({
-				TASKS_ACTOR: "oms-steering",
-				OMS_ROLE: "steering",
-				OMS_TASK_ID: taskId,
-				OMS_AGENT_ID: agentId,
-				OMS_SINGULARITY_SOCK: this.ipcSockPath,
-			}),
-			args,
+		return await this.spawnAgent("steering", taskId, {
+			promptExtra: `Recent messages (for steering context):\n\n${recentMessages?.trim() ? recentMessages.trim() : "(none)"}`,
 		});
-
-		try {
-			rpc.start();
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			await this.tasksClient.comment(
-				taskId,
-				`Failed to spawn steering RPC agent for task ${taskId}.\n` +
-					`tasksAgentId: ${tasksAgentId}\n` +
-					`error: ${message}`,
-			);
-			await this.tasksClient.setAgentState(tasksAgentId, "failed");
-			throw err;
-		}
-
-		const task = await this.tasksClient.show(taskId);
-
-		const promptText = buildTaskPrompt({
-			role: "steering",
-			task: {
-				id: task.id,
-				title: task.title,
-				description: task.description,
-				acceptance: task.acceptance_criteria,
-				labels: task.labels,
-			},
-			extra: `Recent messages (for steering context):\n\n${recentMessages?.trim() ? recentMessages.trim() : "(none)"}`,
-		});
-		await rpc.prompt(promptText);
-
-		await this.tasksClient.setSlot(tasksAgentId, "hook", taskId);
-		await this.tasksClient.setAgentState(tasksAgentId, "working");
-
-		const info: AgentInfo = {
-			id: agentId,
-			role: "steering",
-			taskId,
-			tasksAgentId,
-			status: "working",
-			usage: createEmptyAgentUsage(),
-			events: [],
-			spawnedAt,
-			lastActivity: Date.now(),
-			rpc,
-			model: roleCfg.model,
-			thinking: roleCfg.thinking,
-			sessionId: this.getAgentSessionId(rpc),
-		};
-
-		this.registry.register(info);
-		this.registry.pushEvent(info.id, { type: "initial_prompt", text: promptText, ts: Date.now() });
-		return info;
-	}
-
-	async spawnResolver(opts: {
-		complaintId: string;
-		complainantAgentId: string;
-		complainantTaskId: string;
-		files: string[];
-		reason: string;
-		activeAgents: Array<{
-			id: string;
-			role: AgentRole;
-			taskId: string | null;
-			status: string;
-			lastActivity: number;
-		}>;
-	}): Promise<AgentInfo> {
-		const spawnedAt = Date.now();
-		const complaintTag = opts.complaintId.replace(/[^a-zA-Z0-9_-]+/g, "-").slice(0, 40) || "complaint";
-		const tasksAgentId = await this.tasksClient.createAgent(`resolver-${complaintTag}`);
-		await this.tasksClient.setAgentState(tasksAgentId, "spawning");
-		const agentId = `steering:resolver:${opts.complaintId}:${tasksAgentId}`;
-		const tools = normalizeTools(STEERING_TOOLS, STEERING_TOOLS);
-		const args: string[] = [
-			"--thinking",
-			"medium",
-			"--model",
-			"sonnet",
-			"--no-pty",
-			"--extension",
-			this.ompCrashLoggerExtensionPath,
-			"--extension",
-			this.readMessageHistoryExtensionPath,
-			"--extension",
-			this.steerAgentExtensionPath,
-			"--extension",
-			this.tasksBashGuardExtensionPath,
-			"--tools",
-			tools,
-			"--append-system-prompt",
-			this.resolverPromptPath,
-		];
-		const rpc = new OmsRpcClient({
-			ompCli: this.config.ompCli,
-			cwd: this.tasksClient.workingDir,
-			env: buildEnv({
-				TASKS_ACTOR: "oms-resolver",
-				OMS_ROLE: "steering",
-				OMS_TASK_ID: opts.complainantTaskId,
-				OMS_AGENT_ID: agentId,
-				OMS_SINGULARITY_SOCK: this.ipcSockPath,
-			}),
-			args,
-		});
-
-		try {
-			rpc.start();
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			await this.tasksClient.comment(
-				opts.complainantTaskId,
-				`Failed to spawn resolver RPC agent for complaint ${opts.complaintId}.\n` +
-					`tasksAgentId: ${tasksAgentId}\n` +
-					`error: ${message}`,
-			);
-			await this.tasksClient.setAgentState(tasksAgentId, "failed");
-			throw err;
-		}
-
-		const task = await this.tasksClient.show(opts.complainantTaskId);
-		const payload = {
-			complaint: {
-				id: opts.complaintId,
-				complainantAgentId: opts.complainantAgentId,
-				complainantTaskId: opts.complainantTaskId,
-				files: opts.files,
-				reason: opts.reason,
-			},
-			activeAgents: opts.activeAgents,
-		};
-
-		const promptText = buildTaskPrompt({
-			role: "steering",
-			task: {
-				id: task.id,
-				title: task.title,
-				description: task.description,
-				acceptance: task.acceptance_criteria,
-				labels: task.labels,
-			},
-			extra: `Conflict complaint:\n\n${JSON.stringify(payload, null, 2)}`,
-		});
-		await rpc.prompt(promptText);
-
-		await this.tasksClient.setSlot(tasksAgentId, "hook", opts.complainantTaskId);
-		await this.tasksClient.setAgentState(tasksAgentId, "working");
-
-		const info: AgentInfo = {
-			id: agentId,
-			role: "steering",
-			taskId: opts.complainantTaskId,
-			tasksAgentId,
-			status: "working",
-			usage: createEmptyAgentUsage(),
-			events: [],
-			spawnedAt,
-			lastActivity: Date.now(),
-			rpc,
-			model: "sonnet",
-			thinking: "medium",
-			sessionId: this.getAgentSessionId(rpc),
-		};
-
-		this.registry.register(info);
-		this.registry.pushEvent(info.id, { type: "initial_prompt", text: promptText, ts: Date.now() });
-		return info;
-	}
-
-	async spawnBroadcastSteering(opts: {
-		message: string;
-		urgency?: "normal" | "critical";
-		workers: Array<{
-			id: string;
-			taskId: string | null;
-			status: string;
-			lastActivity: number;
-		}>;
-	}): Promise<AgentInfo> {
-		const spawnedAt = Date.now();
-
-		const tasksAgentId = await this.tasksClient.createAgent(`broadcast-steering-${spawnedAt}`);
-		await this.tasksClient.setAgentState(tasksAgentId, "spawning");
-		const agentId = `steering:broadcast:${tasksAgentId}`;
-
-		const roleCfg = this.config.roles.steering;
-		const toolsBase = normalizeTools(roleCfg.tools ?? STEERING_TOOLS, STEERING_TOOLS);
-		const tools = toolsBase;
-
-		const args: string[] = [
-			"--thinking",
-			roleCfg.thinking,
-			...(roleCfg.model ? ["--model", roleCfg.model] : []),
-			"--no-pty",
-			"--extension",
-			this.ompCrashLoggerExtensionPath,
-			"--extension",
-			this.steeringExtensionPath,
-			"--extension",
-			this.tasksBashGuardExtensionPath,
-			"--tools",
-			tools,
-			"--append-system-prompt",
-			this.broadcastSteeringPromptPath,
-		];
-
-		const rpc = new OmsRpcClient({
-			ompCli: this.config.ompCli,
-			cwd: this.tasksClient.workingDir,
-			env: buildEnv({
-				TASKS_ACTOR: "oms-broadcast-steering",
-				OMS_ROLE: "steering",
-				OMS_AGENT_ID: agentId,
-				OMS_SINGULARITY_SOCK: this.ipcSockPath,
-			}),
-			args,
-		});
-
-		try {
-			rpc.start();
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			await this.tasksClient.setAgentState(tasksAgentId, "failed");
-			throw new Error(`Failed to spawn broadcast steering agent: ${message}`);
-		}
-
-		const payload = {
-			broadcast: {
-				message: opts.message,
-				urgency: opts.urgency ?? "normal",
-			},
-			workers: opts.workers,
-		};
-
-		const promptText = `Broadcast request:\n\n${JSON.stringify(payload, null, 2)}`;
-		await rpc.prompt(promptText);
-
-		await this.tasksClient.setAgentState(tasksAgentId, "working");
-
-		const info: AgentInfo = {
-			id: agentId,
-			role: "steering",
-			taskId: null,
-			tasksAgentId,
-			status: "working",
-			usage: createEmptyAgentUsage(),
-			events: [],
-			spawnedAt,
-			lastActivity: Date.now(),
-			rpc,
-			model: roleCfg.model,
-			thinking: roleCfg.thinking,
-			sessionId: this.getAgentSessionId(rpc),
-		};
-
-		this.registry.register(info);
-		this.registry.pushEvent(info.id, { type: "initial_prompt", text: promptText, ts: Date.now() });
-		return info;
 	}
 }

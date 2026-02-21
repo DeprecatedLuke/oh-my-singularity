@@ -75,7 +75,7 @@ describe("Scheduler", () => {
 		const { scheduler, registry } = createFixture({ ready: [task] });
 		registry.register({
 			id: "worker:task-active:1",
-			role: "worker",
+			agentType: "worker",
 			taskId: "task-active",
 			tasksAgentId: "agent-1",
 			status: "running",
@@ -143,7 +143,7 @@ describe("Scheduler", () => {
 		const { scheduler, registry } = createFixture({ inProgress: [taskA, taskB] });
 		registry.register({
 			id: "worker:task-a:1",
-			role: "worker",
+			agentType: "worker",
 			taskId: "task-a",
 			tasksAgentId: "agent-task-a",
 			status: "running",
