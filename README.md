@@ -150,6 +150,7 @@ Scope levels: `tiny` | `small` | `medium` | `large` | `xlarge`. Only `tiny` uses
 
 **Resume Flow** — When tasks are in_progress but have no active agents:
 
+```
 ┌──────────────┐
 │ Resume       │  Evaluate → decide: start | defer
 │ Steering     │
