@@ -299,23 +299,17 @@ export class OmsTuiApp {
 
 	readonly #onResize = (width?: number, height?: number) => {
 		try {
-			const cols = sanitizeTermSize(width, 80);
-			const rows = sanitizeTermSize(height, 24);
-
-			this.#lastCols = cols;
-			this.#lastRows = rows;
-
-			this.#layout = computeLayout(cols, rows, this.#layoutOpts);
-			this.#fullClearPending = true;
-			this.#bordersDirty = true;
-
-			// Resize singularity pane content (PTY, etc).
-			const singularityInner = innerRegion(this.#layout.singularity);
-			this.#panes.singularity?.resize?.(singularityInner.width, singularityInner.height);
-
-			this.#redraw();
+			this.#reconcileTerminalSize(width, height);
 		} catch {
 			// Never crash on resize; best-effort.
+		}
+	};
+
+	readonly #onSigwinch = () => {
+		try {
+			this.#reconcileTerminalSize();
+		} catch {
+			// Never crash on SIGWINCH; best-effort.
 		}
 	};
 
@@ -513,6 +507,7 @@ export class OmsTuiApp {
 		this.#term.on("key", this.#onKey);
 		this.#term.on("mouse", this.#onMouse);
 		this.#term.on("resize", this.#onResize);
+		process.on("SIGWINCH", this.#onSigwinch);
 
 		// Some environments miss resize events; poll size as a backstop.
 		if (!this.#sizePoller) {
@@ -569,6 +564,16 @@ export class OmsTuiApp {
 			logger.debug('tui/app.ts: best-effort failure after detachListener(this.#term, "resize", this.#onResize);', {
 				err,
 			});
+		}
+
+		try {
+			if (typeof process.off === "function") {
+				process.off("SIGWINCH", this.#onSigwinch);
+			} else {
+				process.removeListener("SIGWINCH", this.#onSigwinch);
+			}
+		} catch (err) {
+			logger.debug('tui/app.ts: best-effort failure after process.off("SIGWINCH", this.#onSigwinch);', { err });
 		}
 
 		if (this.#sizePoller) {
@@ -732,16 +737,16 @@ export class OmsTuiApp {
 		this.#profiler.endFrame(buf ? buf.length : 0);
 	}
 
-	#pollSize(): void {
-		if (!this.#running) return;
-
-		let cols = sanitizeTermSize(this.#term.width, 80);
-		let rows = sanitizeTermSize(this.#term.height, 24);
-
+	#reconcileTerminalSize(widthHint?: number, heightHint?: number): void {
+		let cols = sanitizeTermSize(this.#term.width, this.#lastCols);
+		let rows = sanitizeTermSize(this.#term.height, this.#lastRows);
+		cols = sanitizeTermSize(widthHint, cols);
+		rows = sanitizeTermSize(heightHint, rows);
 		// Prefer querying the underlying tty stream (realTerminal) if available.
 		try {
 			const out = (this.#term as any).stdout;
 			if (out && typeof out.getWindowSize === "function") {
+				if (typeof out._refreshSize === "function") out._refreshSize();
 				const size = out.getWindowSize();
 				if (Array.isArray(size) && size.length >= 2) {
 					cols = sanitizeTermSize(size[0], cols);
@@ -752,27 +757,62 @@ export class OmsTuiApp {
 			logger.debug("tui/app.ts: best-effort failure after rows = sanitizeTermSize(size[1], rows);", { err });
 		}
 
-		// Extra fallback: some terminals update process.stdout columns/rows even when term.width isn't.
+		let hasProcessWindowSize = false;
 		try {
-			cols = sanitizeTermSize((process.stdout as any).columns, cols);
-			rows = sanitizeTermSize((process.stdout as any).rows, rows);
+			if (typeof (process.stdout as any).getWindowSize === "function") {
+				if (typeof (process.stdout as any)._refreshSize === "function") (process.stdout as any)._refreshSize();
+				const size = (process.stdout as any).getWindowSize();
+				if (Array.isArray(size) && size.length >= 2) {
+					cols = sanitizeTermSize(size[0], cols);
+					rows = sanitizeTermSize(size[1], rows);
+					hasProcessWindowSize = true;
+				}
+			}
 		} catch (err) {
-			logger.debug(
-				"tui/app.ts: best-effort failure after rows = sanitizeTermSize((process.stdout as any).rows, rows);",
-				{ err },
-			);
+			logger.debug("tui/app.ts: best-effort failure after rows = sanitizeTermSize(size[1], rows);", { err });
 		}
 
+		try {
+			if (typeof (process.stderr as any).getWindowSize === "function") {
+				if (typeof (process.stderr as any)._refreshSize === "function") (process.stderr as any)._refreshSize();
+				const size = (process.stderr as any).getWindowSize();
+				if (Array.isArray(size) && size.length >= 2) {
+					cols = sanitizeTermSize(size[0], cols);
+					rows = sanitizeTermSize(size[1], rows);
+					hasProcessWindowSize = true;
+				}
+			}
+		} catch (err) {
+			logger.debug("tui/app.ts: best-effort failure after rows = sanitizeTermSize(size[1], rows);", { err });
+		}
+
+		if (!hasProcessWindowSize) {
+			// Extra fallback: some terminals update process stdout/stderr columns/rows even when getWindowSize isn't present.
+			try {
+				cols = sanitizeTermSize((process.stdout as any).columns, cols);
+				rows = sanitizeTermSize((process.stdout as any).rows, rows);
+				cols = sanitizeTermSize((process.stderr as any).columns, cols);
+				rows = sanitizeTermSize((process.stderr as any).rows, rows);
+			} catch (err) {
+				logger.debug(
+					"tui/app.ts: best-effort failure after rows = sanitizeTermSize((process.stderr as any).rows, rows);",
+					{ err },
+				);
+			}
+		}
 		if (cols === this.#lastCols && rows === this.#lastRows) return;
 		this.#lastCols = cols;
 		this.#lastRows = rows;
-
 		this.#layout = computeLayout(cols, rows, this.#layoutOpts);
 		this.#fullClearPending = true;
 		this.#bordersDirty = true;
 		const singularityInner = innerRegion(this.#layout.singularity);
 		this.#panes.singularity?.resize?.(singularityInner.width, singularityInner.height);
 		this.#redraw();
+	}
+	#pollSize(): void {
+		if (!this.#running) return;
+		this.#reconcileTerminalSize();
 	}
 }
 
