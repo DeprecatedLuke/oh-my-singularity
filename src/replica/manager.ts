@@ -3,16 +3,9 @@ import * as path from "node:path";
 import { $ } from "bun";
 import { logger } from "../utils";
 
-export const DEFAULT_REPLICA_EXCLUDES = [".oms/", "node_modules/", ".git/", "out/", "dist/"] as const;
-
 export interface ReplicaManagerOptions {
 	projectRoot: string;
 	replicaRootDir?: string;
-	excludes?: string[];
-}
-
-function normalizeRelativePath(value: string): string {
-	return value.replace(/\\/g, "/").replace(/^\.\//, "").replace(/^\/+/, "").replace(/\/+/g, "/").replace(/\/+$/, "");
 }
 
 function isNotFoundError(err: unknown): err is NodeJS.ErrnoException {
@@ -28,24 +21,65 @@ export function sanitizeReplicaTaskId(taskId: string): string {
 	return sanitized || "task";
 }
 
+/**
+ * Check whether a given path is an active overlay mount by parsing `/proc/mounts`.
+ * Returns `true` only if there is an overlay-type entry whose mountpoint matches exactly.
+ */
+async function isOverlayMounted(mountpoint: string): Promise<boolean> {
+	if (process.platform !== "linux") return false;
+	try {
+		const mounts = await Bun.file("/proc/mounts").text();
+		const resolved = path.resolve(mountpoint);
+		for (const line of mounts.split("\n")) {
+			// Format: device mountpoint fstype options dump pass
+			const parts = line.split(" ");
+			if (parts.length < 3) continue;
+			if (parts[2] === "fuse.fuse-overlayfs" && path.resolve(parts[1]) === resolved) {
+				return true;
+			}
+		}
+		return false;
+	} catch {
+		return false;
+	}
+}
+
 export class ReplicaManager {
 	#projectRoot: string;
 	#replicaRootDir: string;
-	#excludePrefixes: string[];
 	#createInFlight = new Map<string, Promise<string>>();
+	#mergeLock: Promise<void> = Promise.resolve();
 
 	constructor(options: ReplicaManagerOptions) {
 		this.#projectRoot = path.resolve(options.projectRoot);
 		this.#replicaRootDir = path.resolve(options.replicaRootDir ?? path.join(this.#projectRoot, ".oms", "replica"));
-		this.#excludePrefixes = this.#normalizeExcludes(options.excludes ?? [...DEFAULT_REPLICA_EXCLUDES]);
 	}
 
 	getReplicaDir(taskId: string): string {
 		const sanitizedTaskId = sanitizeReplicaTaskId(taskId);
-		return this.#replicaDirFromSanitizedTaskId(sanitizedTaskId);
+		return path.join(this.#replicaRootDir, sanitizedTaskId, "merged");
+	}
+
+	/**
+	 * Return the upper dir path for a replica. This is where OverlayFS stores
+	 * changed files — useful for the merger to know exactly what was modified.
+	 */
+	getReplicaUpperDir(taskId: string): string {
+		const sanitizedTaskId = sanitizeReplicaTaskId(taskId);
+		return path.join(this.#replicaRootDir, sanitizedTaskId, "upper");
 	}
 
 	async createReplica(taskId: string): Promise<string> {
+		if (process.platform !== "linux") {
+			throw new Error("fuse-overlayfs replicas are only supported on Linux");
+		}
+
+		if (!Bun.which("fuse-overlayfs")) {
+			throw new Error(
+				"fuse-overlayfs binary not found. Install it (e.g. `apt install fuse-overlayfs` or `pacman -S fuse-overlayfs`) to use replicas.",
+			);
+		}
+
 		const sanitizedTaskId = sanitizeReplicaTaskId(taskId);
 		const inFlight = this.#createInFlight.get(sanitizedTaskId);
 		if (inFlight) return await inFlight;
@@ -59,11 +93,27 @@ export class ReplicaManager {
 	}
 
 	async destroyReplica(taskId: string): Promise<void> {
-		await fs.rm(this.getReplicaDir(taskId), { recursive: true, force: true });
+		const sanitizedTaskId = sanitizeReplicaTaskId(taskId);
+		const taskBaseDir = path.join(this.#replicaRootDir, sanitizedTaskId);
+		const mergedDir = path.join(taskBaseDir, "merged");
+
+		// Attempt unmount first; swallow errors if not mounted (crash recovery case)
+		if (process.platform === "linux") {
+			const result = await $`fusermount -u ${mergedDir}`.quiet().nothrow();
+			if (result.exitCode !== 0) {
+				logger.debug("replica/manager.ts: fusermount returned non-zero (may not be mounted)", {
+					exitCode: result.exitCode,
+					mergedDir,
+				});
+			}
+		}
+
+		await fs.rm(taskBaseDir, { recursive: true, force: true });
 	}
 
 	async replicaExists(taskId: string): Promise<boolean> {
-		return await this.#replicaExistsByPath(this.getReplicaDir(taskId));
+		const mergedDir = this.getReplicaDir(taskId);
+		return await isOverlayMounted(mergedDir);
 	}
 
 	async listReplicas(): Promise<string[]> {
@@ -79,113 +129,57 @@ export class ReplicaManager {
 		}
 	}
 
-	#normalizeExcludes(excludes: readonly string[]): string[] {
-		const seen = new Set<string>();
-		const normalized: string[] = [];
-		for (const exclude of excludes) {
-			const normalizedExclude = normalizeRelativePath(exclude);
-			if (!normalizedExclude || seen.has(normalizedExclude)) continue;
-			seen.add(normalizedExclude);
-			normalized.push(normalizedExclude);
-		}
-		return normalized;
-	}
-
-	#replicaDirFromSanitizedTaskId(sanitizedTaskId: string): string {
-		return path.join(this.#replicaRootDir, sanitizedTaskId);
-	}
-
-	async #createReplicaInternal(sanitizedTaskId: string): Promise<string> {
-		const replicaDir = this.#replicaDirFromSanitizedTaskId(sanitizedTaskId);
-		if (await this.#replicaExistsByPath(replicaDir)) return replicaDir;
-
-		await fs.mkdir(this.#replicaRootDir, { recursive: true });
-		await fs.mkdir(replicaDir, { recursive: true });
-
-		await this.#copyProjectRoot(replicaDir);
-		await Promise.all([
-			this.#ensureAbsoluteSymlink(
-				path.join(this.#projectRoot, "node_modules"),
-				path.join(replicaDir, "node_modules"),
-			),
-			this.#ensureAbsoluteSymlink(path.join(this.#projectRoot, ".git"), path.join(replicaDir, ".git")),
-		]);
-
-		return replicaDir;
-	}
-
-	async #replicaExistsByPath(replicaDir: string): Promise<boolean> {
+	/**
+	 * Serialize merge operations. Only one merge into the root worktree
+	 * can happen at a time. Returns a promise that resolves when the
+	 * provided merge function completes.
+	 */
+	async withMergeLock<T>(fn: () => Promise<T>): Promise<T> {
+		const { promise, resolve, reject } = Promise.withResolvers<T>();
+		const previousLock = this.#mergeLock;
+		this.#mergeLock = promise.then(
+			() => {},
+			() => {},
+		);
+		await previousLock;
 		try {
-			const stat = await fs.stat(replicaDir);
-			return stat.isDirectory();
+			const result = await fn();
+			resolve(result);
+			return result;
 		} catch (err) {
-			if (isNotFoundError(err)) return false;
+			reject(err);
 			throw err;
 		}
 	}
 
-	async #copyProjectRoot(replicaDir: string): Promise<void> {
-		const rsyncBinary = Bun.which("rsync");
-		if (rsyncBinary) {
-			const sourceDir = `${this.#projectRoot}${path.sep}`;
-			const destinationDir = `${replicaDir}${path.sep}`;
-			const excludeArgs = this.#excludePrefixes.map(exclude => `--exclude=${exclude}/`);
-			const result = await $`${rsyncBinary} -a --delete ${excludeArgs} ${sourceDir} ${destinationDir}`
+	async #createReplicaInternal(sanitizedTaskId: string): Promise<string> {
+		const taskBaseDir = path.join(this.#replicaRootDir, sanitizedTaskId);
+		const upperDir = path.join(taskBaseDir, "upper");
+		const workDir = path.join(taskBaseDir, "work");
+		const mergedDir = path.join(taskBaseDir, "merged");
+
+		// If already mounted, return early
+		if (await isOverlayMounted(mergedDir)) return mergedDir;
+
+		// Clean up any leftover state from a crashed previous attempt
+		await fs.rm(taskBaseDir, { recursive: true, force: true });
+
+		await fs.mkdir(upperDir, { recursive: true });
+		await fs.mkdir(workDir, { recursive: true });
+		await fs.mkdir(mergedDir, { recursive: true });
+
+		const result =
+			await $`fuse-overlayfs -o lowerdir=${this.#projectRoot},upperdir=${upperDir},workdir=${workDir} ${mergedDir}`
 				.quiet()
 				.nothrow();
-			if (result.exitCode === 0) return;
 
-			logger.warn("replica/manager.ts: rsync copy failed, using recursive-copy fallback", {
-				exitCode: result.exitCode,
-				replicaDir,
-			});
+		if (result.exitCode !== 0) {
+			const stderr = result.stderr.toString().trim();
+			// Clean up dirs on mount failure
+			await fs.rm(taskBaseDir, { recursive: true, force: true });
+			throw new Error(`fuse-overlayfs mount failed (exit ${result.exitCode}): ${stderr}`);
 		}
 
-		await this.#copyDirectoryRecursive(this.#projectRoot, replicaDir, "");
-	}
-
-	#shouldExclude(relativePath: string): boolean {
-		const normalizedRelativePath = normalizeRelativePath(relativePath);
-		if (!normalizedRelativePath) return false;
-		return this.#excludePrefixes.some(
-			exclude => normalizedRelativePath === exclude || normalizedRelativePath.startsWith(`${exclude}/`),
-		);
-	}
-
-	async #copyDirectoryRecursive(sourceDir: string, destinationDir: string, relativePath: string): Promise<void> {
-		const entries = await fs.readdir(sourceDir, { withFileTypes: true });
-		for (const entry of entries) {
-			const nextRelativePath = relativePath ? `${relativePath}/${entry.name}` : entry.name;
-			if (this.#shouldExclude(nextRelativePath)) continue;
-
-			const sourcePath = path.join(sourceDir, entry.name);
-			const destinationPath = path.join(destinationDir, entry.name);
-
-			if (entry.isDirectory()) {
-				await fs.mkdir(destinationPath, { recursive: true });
-				await this.#copyDirectoryRecursive(sourcePath, destinationPath, nextRelativePath);
-				continue;
-			}
-
-			if (entry.isSymbolicLink()) {
-				const target = await fs.readlink(sourcePath);
-				await fs.symlink(target, destinationPath);
-				continue;
-			}
-
-			if (!entry.isFile()) {
-				logger.debug("replica/manager.ts: skipping unsupported filesystem entry while copying replica", {
-					entry: nextRelativePath,
-				});
-				continue;
-			}
-
-			await fs.cp(sourcePath, destinationPath, { force: true });
-		}
-	}
-
-	async #ensureAbsoluteSymlink(targetPath: string, symlinkPath: string): Promise<void> {
-		await fs.rm(symlinkPath, { recursive: true, force: true });
-		await fs.symlink(path.resolve(targetPath), symlinkPath);
+		return mergedDir;
 	}
 }
